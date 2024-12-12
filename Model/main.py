@@ -13,7 +13,7 @@ import signal
 import traceback
 import logging
 
-from metacommunity import Metacommunity  # Assuming the Metacommunity class and related classes are already implemented.
+from metacommunity import Metacommunity  # Metacommunity class and related classes are already implemented.
 from lvmcm_rng import LVMCM_rng
 from topography import Topography
 from species import Species
