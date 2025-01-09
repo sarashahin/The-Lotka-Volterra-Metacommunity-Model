@@ -511,9 +511,8 @@ def final_bookkeeping(meta):
         traceback.print_exc()
 
 
-# Example modification for meta_c_dynamics method to use Assimulo
-# This should be placed in metacommunity.py or wherever meta_c_dynamics is defined.
-# Here we show how to implement it inline for demonstration purposes.
+#  meta_c_dynamics method to use Assimulo
+
 def meta_c_dynamics(self, t_end):
     """
     Integrate the metacommunity dynamics up to time t_end using Assimulo.
