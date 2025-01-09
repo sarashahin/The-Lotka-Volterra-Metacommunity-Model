@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """CommunityDynamics.py
 
-Updated and completed version to ensure it runs the model without missing parts.
 """
 
 import numpy as np
