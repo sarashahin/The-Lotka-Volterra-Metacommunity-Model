@@ -290,66 +290,117 @@ if __name__ == "__main__":
 ##########################################################################
 # PSD scheme for smaller patch
 ##########################################################################
+import os
 import numpy as np
+import time
+import traceback
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
+from pathlib import Path
+from metacommunity import Metacommunity  #  Metacommunity class is implemented
+from topography import Topography
+from species import Species
 
-class Simulation:
-    def __init__(self):
-        pass
+# Constants for configuration
+FIX_SEED = 42
+OUTPUT_DIR = "output_figures/"
 
-    def classify_outcome(self, m1, m2, alpha):
-        if m1 > m2 * alpha:
-            return 1  # "1 wins"
-        elif m2 > m1 * alpha:
-            return 2  # "2 wins"
-        elif abs(m1 - m2) < alpha * 0.1:
-            return 3  # "Coexist"
-        else:
-            return 4  # "Founder control"
+def set_random_seed(fixed_seed=0):
+    if fixed_seed > 0:
+        np.random.seed(fixed_seed)
+    else:
+        np.random.seed(np.random.randint(1, 1000000))
 
-    def run_and_plot(self, alphas, m1_range, m2_range):
-        results = {alpha: np.zeros((len(m1_range), len(m2_range))) for alpha in alphas}
+def classify_outcome(m1, m2, alpha):
+    """
+    Classify outcomes based on ecological rules:
+    - "1 wins" if m1 dominates
+    - "2 wins" if m2 dominates
+    - "Coexist" if conditions favor coexistence
+    - "Founder control" for intermediate cases
+    """
+    if m1 > m2 * alpha:
+        return 1  # "1 wins"
+    elif m2 > m1 * alpha:
+        return 2  # "2 wins"
+    elif abs(m1 - m2) < alpha * 0.1:
+        return 3  # "Coexist"
+    else:
+        return 4  # "Founder control"
 
-        for alpha in alphas:
-            for i, m1 in enumerate(m1_range):
-                for j, m2 in enumerate(m2_range):
-                    outcome = self.classify_outcome(m1, m2, alpha)
-                    results[alpha][i, j] = outcome
+def simulate_psd_scheme(alphas, m1_range, m2_range):
+    """
+    Test the PSD scheme by reproducing Figures 10 and 11.
+    """
+    results = {alpha: np.zeros((len(m1_range), len(m2_range))) for alpha in alphas}
 
-        # Custom colormap for distinct regions
-        cmap = ListedColormap(['blue', 'red', 'purple', 'orange'])
-        region_labels = ["1 wins", "2 wins", "Coexist", "Founder control"]
+    for alpha in alphas:
+        for i, m1 in enumerate(m1_range):
+            for j, m2 in enumerate(m2_range):
+                results[alpha][i, j] = classify_outcome(m1, m2, alpha)
 
-        fig, axes = plt.subplots(1, len(alphas), figsize=(15, 5))
+    return results
 
-        for idx, alpha in enumerate(alphas):
-            ax = axes[idx]
-            im = ax.imshow(
-                results[alpha],
-                origin='lower',
-                extent=(np.log10(m1_range[0]), np.log10(m1_range[-1]),
-                        np.log10(m2_range[0]), np.log10(m2_range[-1])),
-                aspect='auto',
-                cmap=cmap,
-                vmin=1,
-                vmax=4
-            )
-            ax.set_title(f"\u03B1 = {alpha}")
-            ax.set_xlabel("log10(m1)")
-            ax.set_ylabel("log10(m2)")
+def plot_results(results, alphas, m1_range, m2_range):
+    """
+    Visualize the simulation results to match Figures 10 and 11.
+    """
+    cmap = plt.cm.get_cmap("tab10", 4)  # Custom colormap
+    region_labels = ["1 wins", "2 wins", "Coexist", "Founder control"]
 
-        # Shared colorbar with labels
-        cbar = fig.colorbar(im, ax=axes, orientation='vertical', ticks=[1, 2, 3, 4])
-        cbar.ax.set_yticklabels(region_labels)
+    fig, axes = plt.subplots(1, len(alphas), figsize=(15, 5))
 
-        plt.tight_layout()
-        plt.show()
+    for idx, alpha in enumerate(alphas):
+        ax = axes[idx]
+        im = ax.imshow(
+            results[alpha],
+            origin='lower',
+            extent=(np.log10(m1_range[0]), np.log10(m1_range[-1]),
+                    np.log10(m2_range[0]), np.log10(m2_range[-1])),
+            aspect='auto',
+            cmap=cmap,
+            vmin=1,
+            vmax=4
+        )
+        ax.set_title(f"\u03B1 = {alpha}")
+        ax.set_xlabel("log10(m1)")
+        ax.set_ylabel("log10(m2)")
 
-# Test the refined code
-alphas = [0.9, 0.99, 1.0, 1.1, 1.5]
-m1_range = np.logspace(-3, 2, 50)  # Increased resolution
-m2_range = np.logspace(-3, 2, 50)
+    # Add shared colorbar
+    cbar = fig.colorbar(im, ax=axes, orientation='vertical', ticks=[1, 2, 3, 4])
+    cbar.ax.set_yticklabels(region_labels)
+    cbar.set_label("Outcome")
 
-simulation = Simulation()
-simulation.run_and_plot(alphas, m1_range, m2_range)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, "figure_10_11_test.png"))
+    plt.show()
+
+def main():
+    try:
+        # Start the timer
+        start_time = time.time()
+        print("Starting PSD scheme testing...")
+
+        # Ensure output directory exists
+        Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+
+        # Parameter ranges for Figures 10 and 11
+        alphas = [0.9, 0.99, 1.0, 1.1, 1.5]  # α values
+        m1_range = np.logspace(-3, 2, 50)  # m1 values
+        m2_range = np.logspace(-3, 2, 50)  # m2 values
+
+        # Run simulation
+        results = simulate_psd_scheme(alphas, m1_range, m2_range)
+
+        # Visualize results
+        plot_results(results, alphas, m1_range, m2_range)
+
+        # End the simulation
+        elapsed_time = time.time() - start_time
+        print(f"Simulation completed successfully in {elapsed_time / 60:.2f} minutes.")
+
+    except Exception as e:
+        print("An error occurred during the simulation:")
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
