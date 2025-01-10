@@ -258,10 +258,6 @@
 
 
 
-
-
-
-
 import os
 import numpy as np
 import random
@@ -280,7 +276,7 @@ import logging
 from assimulo.problem import Explicit_Problem
 from assimulo.solvers import CVode
 
-from metacommunity import Metacommunity  # Assuming the Metacommunity class and related classes are already implemented.
+from metacommunity import Metacommunity  
 from lvmcm_rng import LVMCM_rng
 from topography import Topography
 from species import Species
@@ -511,8 +507,7 @@ def final_bookkeeping(meta):
         traceback.print_exc()
 
 
-#  meta_c_dynamics method to use Assimulo
-
+# Example modification for meta_c_dynamics method to use Assimulo
 def meta_c_dynamics(self, t_end):
     """
     Integrate the metacommunity dynamics up to time t_end using Assimulo.
@@ -529,7 +524,7 @@ def meta_c_dynamics(self, t_end):
 
     problem = Explicit_Problem(rhs, y0, 0.0)
     solver = CVode(problem)
-    # Set solver options as needed
+    # Set solver options 
     solver.atol = 1e-6
     solver.rtol = 1e-6
     solver.maxsteps = 10000
