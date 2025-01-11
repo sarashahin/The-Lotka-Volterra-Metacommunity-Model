@@ -273,50 +273,6 @@ class Metacommunity:
                 return
 
         logger.info("Simulation completed without reaching equilibrium.")
-
-
-
-    # def remove_species(self, indices):
-    #     """
-    #     Helper function to remove species from all matrices.
-
-    #     Parameters:
-    #     indices (list[int]): List of species indices to remove.
-    #     """
-    #     logger.debug(f"Removing species at indices: {indices}")
-
-    #     # Sort indices in descending order to avoid shifting issues during deletion
-    #     indices = sorted(indices, reverse=True)
-
-    #     for idx in indices:
-    #         if idx >= self.spp.xMat.shape[0]:
-    #             logger.warning(f"Index {idx} is out of bounds for xMat with shape {self.spp.xMat.shape}. Skipping.")
-    #             continue
-
-    #         # Update producer and consumer counts
-    #         if idx < self.spp.S_p:  # Producer index
-    #             self.spp.S_p -= 1
-    #         else:  # Consumer index
-    #             self.spp.S_c -= 1
-
-    #         # Remove species from core matrices
-    #         self.spp.xMat = np.delete(self.spp.xMat, idx, axis=0)
-    #         if self.spp.cMat is not None and self.spp.cMat.shape[0] > 0:
-    #             self.spp.cMat = np.delete(self.spp.cMat, idx, axis=0)
-    #             self.spp.cMat = np.delete(self.spp.cMat, idx, axis=1)
-    #         if self.spp.rMat is not None and self.spp.rMat.shape[0] > 0:
-    #             self.spp.rMat = np.delete(self.spp.rMat, idx, axis=0)
-
-    #         # Remove species from optional matrices
-    #         optional_matrices = {'sMat': self.spp.sMat, 'tMat': self.spp.tMat, 'emMat': self.spp.emMat}
-    #         for mat_name, mat in optional_matrices.items():
-    #             if mat is not None:
-    #                 if mat.shape[0] > idx:
-    #                     setattr(self.spp, mat_name, np.delete(mat, idx, axis=0))
-    #                 else:
-    #                     logger.warning(f"Index {idx} is out of bounds for {mat_name}. Skipping.")
-
-    #     logger.debug(f"Species removal complete. Producers: {self.spp.S_p}, Consumers: {self.spp.S_c}")
         
      
     def remove_species(self, indices):
@@ -369,69 +325,6 @@ class Metacommunity:
                     setattr(self.spp, mat_name, new_mat)
 
         logger.debug(f"Species removal complete. Producers: {self.spp.S_p}, Consumers: {self.spp.S_c}")
-
-        
-
-    # def invader_sample(self, trophLev, no_invaders):
-    #     """
-    #     Introduce new random species and test for positive growth rates.
-    #     """
-    #     min_b = 1e-6
-    #     invExcess = 3  # Excess invaders to ensure success
-    #     suc_inv = 0
-
-    #     while suc_inv < no_invaders:
-    #         logger.debug(f"Attempting to invade. Successful so far: {suc_inv}/{no_invaders}")
-
-    #         for _ in range(invExcess * no_invaders):
-    #             self.spp.invade(trophLev)
-    #             # Synchronize optional matrices
-    #             # Ensure additional matrices (e.g., efMat, emMat) are updated
-    #             for mat_name in ['efMat', 'emMat']:
-    #                 mat = getattr(self.spp, mat_name, None)
-    #                 if mat is not None and mat.size > 0:
-    #                     setattr(self.spp, mat_name, np.vstack([mat, np.zeros((1, mat.shape[1]))]))
-    #                 elif mat is not None:
-    #                     setattr(self.spp, mat_name, np.zeros((self.spp.xMat.shape[0], self.spp.xMat.shape[1])))
-    #                 else:
-    #                     logger.warning(f"{mat_name} is not initialized. Skipping update.")
-
-    #         B = np.maximum(0, self.spp.xMat[:self.spp.S_p] if trophLev == 1 else self.spp.xMat)
-    #         indices = np.arange(self.spp.S_p, self.spp.xMat.shape[0])
-
-    #         try:
-    #             if trophLev == 0:  # Producers
-    #                 bInv = self.spp.rMat[self.spp.S_p:] - (self.spp.cMat[self.spp.S_p:, :] @ B)
-    #             else:  # Consumers
-    #                 bInv = self.spp.rho * (self.spp.cMat[indices, :self.spp.S_p] @ B - 1)
-    #         except ValueError as e:
-    #             logger.error(f"Error in growth rate calculation: {e}")
-    #             raise
-
-    #         logger.debug(f"Calculated growth rates: {bInv}")
-
-    #         if bInv.size == 0 or np.all(bInv <= 0):
-    #             logger.warning("No positive growth rates found. Adjusting parameters may be necessary.")
-    #             break
-
-    #         bInv_max = bInv.max(axis=1) if len(bInv.shape) > 1 else bInv
-    #         posGrowth = np.where(bInv_max >= min_b)[0][: no_invaders - suc_inv]
-    #         negGrowth = np.setdiff1d(indices, posGrowth)
-
-    #         logger.debug(f"Positive Growth Indices: {posGrowth}, Negative Growth Indices: {negGrowth}")
-
-    #         suc_inv += len(posGrowth)
-    #         for idx in reversed(negGrowth):
-    #             self.remove_species([idx])
-
-    #         logger.debug(f"State after removal - Producers: {self.spp.S_p}, Consumers: {self.spp.S_c}")
-
-    #     if trophLev == 0:
-    #         self.spp.S_p = self.spp.xMat.shape[0] - self.spp.S_c
-    #     else:
-    #         self.spp.S_c = self.spp.xMat.shape[0] - self.spp.S_p
-
-    #     logger.info(f"Invader sampling complete. Producers: {self.spp.S_p}, Consumers: {self.spp.S_c}")
     
     
     def invader_sample(self, trophLev, no_invaders):
@@ -632,7 +525,6 @@ class Metacommunity:
             res (int): Number of steps per unit time.
             time (int): Total time for warming simulation.
         """
-        import os
 
         # Define path to save outputs
         pos1 = self.bMatFileName.rfind("/")
