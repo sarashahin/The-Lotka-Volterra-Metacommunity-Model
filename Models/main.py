@@ -10,7 +10,6 @@ import time
 import sys
 import scipy.io as sio
 from pathlib import Path
-# Remove solve_ivp import
 # from scipy.integrate import solve_ivp
 from datetime import datetime
 import signal
