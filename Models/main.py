@@ -80,7 +80,7 @@ def main():
             gabriel=True,
             T_int=25.0,
             network_file="",
-            scVec=np.array([0.05])  # Adjust if necessary
+            scVec=np.array([0.05])  
         )
         
         # Explicitly generate the network
