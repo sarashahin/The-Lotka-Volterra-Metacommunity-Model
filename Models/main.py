@@ -15,18 +15,24 @@ from datetime import datetime
 import signal
 import traceback
 import logging
+import cProfile
 
 # Import Assimulo classes for ODE solving
 from assimulo.problem import Explicit_Problem
 from assimulo.solvers import CVode
 
-from metacommunity import Metacommunity  
+from metacommunity import Metacommunity  # Assuming the Metacommunity class and related classes are already implemented.
 from lvmcm_rng import LVMCM_rng
 from topography import Topography
 from species import Species
 
 # Configure logging for debugging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO,  # Set to INFO to reduce verbosity
+                    format='%(asctime)s - %(levelname)s - %(message)s',
+                    handlers=[
+                        logging.FileHandler("simulation.log"),
+                        logging.StreamHandler(sys.stdout)
+                    ])
 logger = logging.getLogger(__name__)
 
 # Constants for configuration
@@ -41,6 +47,19 @@ FLUCTUATE = False
 WARMING = False
 LONGDISTDISP = False
 NODE_REMOVAL = False
+
+# New Constants to Prevent Overproduction
+MAX_SPECIES = 2000       # Maximum total species allowed
+MAX_PRODUCERS = 1500     # Maximum number of producers allowed
+MAX_ITERATIONS = 120     # Maximum number of assembly iterations
+MAX_CONSUMERS = 500      # Maximum number of consumers allowed
+
+# Controlled invasion rates
+INVADERS_PER_ITERATION = {
+    0: 1,  # Producers
+    1: 1   # Consumers
+}
+
 
 def set_random_seed(fixed_seed=0):
     if fixed_seed > 0:
@@ -59,8 +78,8 @@ def main():
         print("Starting metacommunity simulation...")
 
         # Initialize simulation parameters
-        a_init = 1
-        a_invMax = 10
+        a_init = True
+        a_invMax = 1000
         a_tMax = 500
         a_outputDirectory = "output/"
 
@@ -80,7 +99,7 @@ def main():
             gabriel=True,
             T_int=25.0,
             network_file="",
-            scVec=np.array([0.05])  
+            scVec=np.array([0.05]) 
         )
         
         # Explicitly generate the network
@@ -93,13 +112,13 @@ def main():
             c2=0.3,
             c3=0.1,
             emRate=0.2,
-            dispL=0.7,
-            pProducer=0.7,
+            dispL=0.6,
+            pProducer=0.4,
             prodComp=True,
             symComp=True,
             alpha=0.02,
             sigma=1.5,
-            sigma_t=0.3,
+            sigma_t=0.2,
             rho=0.1,
             comp_dist=1,
             omega=0.9,
@@ -124,9 +143,9 @@ def main():
         meta = Metacommunity(
             spp=spp,
             a_init=a_init,
-            a_bMat="",
-            a_xMat="",
-            a_scMat="",
+            a_bMat="/Users/sarashahin/Desktop/model/SimulationData/N=32/normDiscrTraj04_experiment/2021-3-1/2021-3-1_normDiscrTraj04(10000)1bMat0.mat",
+            a_xMat="/Users/sarashahin/Desktop/model/SimulationData/N=32/normDiscrTraj04_experiment/2021-3-1/2021-3-1_normDiscrTraj04(10000)1network0.mat",
+            a_scMat="/Users/sarashahin/Desktop/model/SimulationData/N=32/normDiscrTraj04_experiment/2021-3-1/2021-3-1_normDiscrTraj04(10000)1params0.mat",
             a_invMax=a_invMax,
             a_tMax=a_tMax,
             a_outputDirectory=a_outputDirectory,
@@ -134,7 +153,7 @@ def main():
             a_c2=0.3,
             a_c3=0.1,
             a_emRate=0.2,
-            a_dispL=0.7,
+            a_dispL=0.6,
             a_pProducer=0.4,
             a_prodComp=True,
             a_symComp=True,
@@ -155,12 +174,12 @@ def main():
             a_randGraph=False,
             a_gabriel=True,
             a_T_int=25.0,
-            a_envMat="",
+            a_envMat="/Users/sarashahin/Desktop/model/SimulationData/N=32/normDiscrTraj04_experiment/2021-3-1/2021-3-1_normDiscrTraj04(10000)1rMat0.mat",
             a_parOut=1.0,
-            a_experiment="",
+            a_experiment="/Users/sarashahin/Desktop/model/SimulationData/autonomous_turnover_example_pars.txt",
             a_rep=1,
             storeTraj=1,
-            bMatFileName="",
+            bMatFileName="/Users/sarashahin/Desktop/model/output",
             g_block_transitions=False
         )
 
@@ -200,26 +219,94 @@ def assemble_metacommunity(meta):
     and removing extinct species in each iteration.
     """
     try:
-        g_seed = set_random_seed(FIX_SEED)
-        print(f"Assembly process started with Seed: {g_seed}")
+        set_random_seed(FIX_SEED)
+        logger.info("Assembly process started.")
+        
+        # Initialize lists to store trajectory data
+        trajectory_producers = []
+        trajectory_consumers = []
+        trajectory_iterations = []
+        trajectory_xMat = []  # To store species abundances per node
+        trajectory_rMat = []  # To store species growth rates per node
 
+        max_species = meta.spp.xMat.shape[0] # Initialize with initial number of species
+        
         iteration = 0
-        while True:
+        while iteration < MAX_ITERATIONS:
             iteration += 1
-            print(f"Starting iteration {iteration} of assembly...")
+            logger.info(f"Starting iteration {iteration} of assembly...")
 
-            # Invader Testing
-            print("Invading producers and consumers...")
-            meta.invader_sample(0, 5)  # Invade producers
-            meta.invader_sample(1, 5)  # Invade consumers
+            # Check for maximum species limit
+            current_species = meta.spp.S_p + meta.spp.S_c  # Calculate total species
+            current_producers = meta.spp.S_p
+            current_consumers = meta.spp.S_c
+            
+            # Update max_species if needed
+            if current_species > max_species:
+                max_species = current_species
+            
+            trajectory_iterations.append(iteration)
+            trajectory_producers.append(current_producers)
+            trajectory_consumers.append(current_consumers)
+            trajectory_xMat.append(meta.spp.xMat.copy())  # xMat holds species abundances per node
+            trajectory_rMat.append(meta.spp.rMat.copy())  # rMat holds species growth rates per node
+
+            if current_species >= MAX_SPECIES:
+                print(f"Maximum species limit of {MAX_SPECIES} reached. Stopping assembly.")
+                break
+
+            # Check for maximum producers
+            if current_producers >= MAX_PRODUCERS:
+                logger.info(f"Maximum producers limit of {MAX_PRODUCERS} reached.")
+                producers_to_invade = 0
+            else:
+                producers_to_invade = INVADERS_PER_ITERATION.get(0, 0)
+                # Ensure we don't exceed MAX_SPECIES
+                producers_to_invade = min(producers_to_invade, MAX_SPECIES - current_species)
+
+            # Check for maximum consumers
+            if current_consumers >= MAX_CONSUMERS:
+                logger.info(f"Maximum consumers limit of {MAX_CONSUMERS} reached.")
+                consumers_to_invade = 0
+            else:
+                consumers_to_invade = INVADERS_PER_ITERATION.get(1, 0)
+                # Ensure we don't exceed MAX_SPECIES
+                consumers_to_invade = min(consumers_to_invade, MAX_SPECIES - current_species)
+
+            # Invade producers if allowed
+            if producers_to_invade > 0:
+                logger.info(f"Invading {producers_to_invade} producer(s).")
+                meta.invader_sample(0, producers_to_invade)
+            else:
+                logger.info("No producers invaded this iteration.")
+
+            # Invade consumers if allowed
+            if consumers_to_invade > 0:
+                logger.info(f"Invading {consumers_to_invade} consumer(s).")
+                meta.invader_sample(1, consumers_to_invade)
+            else:
+                logger.info("No consumers invaded this iteration.")
 
             # Simulate Dynamics with Assimulo
-            print("Simulating dynamics...")
+            logger.info("Simulating dynamics...")
             meta.meta_c_dynamics(meta.tMax)
 
             # Extinction Step
-            print("Removing extinct species...")
+            logger.info("Removing extinct species...")
             meta.spp.extinct()
+            
+            # Record current state after dynamics and extinction
+            current_producers = meta.spp.S_p
+            current_consumers = meta.spp.S_c
+            trajectory_iterations.append(iteration + 0.5)  # To represent state after dynamics
+            trajectory_producers.append(current_producers)
+            trajectory_consumers.append(current_consumers)
+            trajectory_xMat.append(meta.spp.xMat.copy())
+            trajectory_rMat.append(meta.spp.rMat.copy())
+            
+            # Update max_species if needed
+            if current_species > max_species:
+                max_species = current_species
 
             # Stop condition: All invasions complete or all species extinct
             if meta.spp.invasion >= meta.invMax:
@@ -231,6 +318,55 @@ def assemble_metacommunity(meta):
 
             print(f"Iteration {iteration} complete.\n")
 
+        else:
+            print(f"Reached maximum iterations ({MAX_ITERATIONS}) without meeting stop conditions.")
+            
+        
+        # Determine the maximum number of species across all iterations
+        max_species = max(max_species, max(trajectory_producers) + max(trajectory_consumers))
+
+        # Pad xMat matrices to have the same number of species
+        for i in range(len(trajectory_xMat)):
+            current_xMat = trajectory_xMat[i]
+            current_num_species, num_nodes = current_xMat.shape
+            if current_num_species < max_species:
+                # Create a padded xMat with zeros for new species
+                padding = np.zeros((max_species - current_num_species, num_nodes))
+                trajectory_xMat[i] = np.vstack((current_xMat, padding))
+            elif current_num_species > max_species:
+                # This shouldn't happen, but handle just in case
+                padding = np.zeros((current_num_species - max_species, num_nodes))
+                trajectory_xMat[i] = np.vstack((trajectory_xMat[i], padding))
+        
+        # Pad rMat matrices to have the same number of species
+        for i in range(len(trajectory_rMat)):
+            current_rMat = trajectory_rMat[i]
+            current_num_species, num_nodes = current_rMat.shape
+            if current_num_species < max_species:
+                # Create a padded rMat with zeros for new species
+                padding = np.zeros((max_species - current_num_species, num_nodes))
+                trajectory_rMat[i] = np.vstack((current_rMat, padding))
+            elif current_num_species > max_species:
+                # This shouldn't happen, but handle just in case
+                padding = np.zeros((current_num_species - max_species, num_nodes))
+                trajectory_rMat[i] = np.vstack((trajectory_rMat[i], padding))
+        
+        # Convert the lists to 3D NumPy arrays
+        trajectory_xMat = np.array(trajectory_xMat)
+        trajectory_rMat = np.array(trajectory_rMat)
+
+        # Save trajectory data to a file for visualization
+        trajectory_data = {
+            'iteration': np.array(trajectory_iterations),
+            'producers': np.array(trajectory_producers),
+            'consumers': np.array(trajectory_consumers),
+            'xMat': trajectory_xMat,  # Shape: (num_records, max_species, nodes)
+            'rMat': trajectory_rMat   # Shape: (num_records, max_species, nodes)
+        }
+        trajectory_file = os.path.join(meta.outputDirectory, 'trajectory_data.npz')
+        np.savez(trajectory_file, **trajectory_data)
+        logger.info(f"Trajectory data saved to {trajectory_file}")
+
     except Exception as e:
         print("An error occurred during the assembly process:")
         traceback.print_exc()
@@ -241,47 +377,63 @@ def final_bookkeeping(meta):
     Perform final bookkeeping steps after the simulation.
     """
     try:
-        print("Final bookkeeping...")
+        logger.info("Final bookkeeping...")
         meta.meta_c_dynamics(1000)  # Final dynamics relaxation
         meta.spp.extinct()  # Remove extinct species
         meta.saveMC()
-        print("Bookkeeping complete.")
+        logger.info("Bookkeeping complete.")
     except Exception as e:
-        print("An error occurred during final bookkeeping:")
-        traceback.print_exc()
+        logger.error("An error occurred during final bookkeeping:")
+        logger.error(traceback.format_exc())
 
 
-# meta_c_dynamics method to use Assimulo
+#  meta_c_dynamics method to use Assimulo
+
 def meta_c_dynamics(self, t_end):
     """
     Integrate the metacommunity dynamics up to time t_end using Assimulo.
     """
-    # Initial state
-    y0 = self.spp.xMat.flatten()
+    try:
+        # Initial state
+        y0 = self.spp.xMat.flatten()
 
-    def rhs(t, y):
-        # Reshape state
-        state = y.reshape(self.spp.xMat.shape)
-        # meta.dynamics(t, state) should return dX/dt as a 2D array matching xMat
-        dXdt = self.dynamics(t, state)
-        return dXdt.flatten()
+        def rhs(t, y):
+            # Reshape state
+            state = y.reshape(self.spp.xMat.shape)
+            # meta.dynamics(t, state) should return dX/dt as a 2D array matching xMat
+            dXdt = self.dynamics(t, state)
+            return dXdt.flatten()
 
-    problem = Explicit_Problem(rhs, y0, 0.0)
-    solver = CVode(problem)
-    # Set solver options 
-    solver.atol = 1e-6
-    solver.rtol = 1e-6
-    solver.maxsteps = 10000
+        problem = Explicit_Problem(rhs, y0, 0.0)
+        solver = CVode(problem)
+        # Set solver options as needed
+        solver.atol = 1e-6
+        solver.rtol = 1e-6
+        solver.maxsteps = 10000
 
-    # Integrate until t_end
-    solver.simulate(t_end)
+        # Integrate until t_end
+        solver.simulate(t_end)
 
-    # Update state at the end of integration
-    self.spp.xMat = solver.y.reshape(self.spp.xMat.shape)
+        # Update state at the end of integration
+        self.spp.xMat = solver.y.reshape(self.spp.xMat.shape)
+        logger.debug(f"Dynamics simulated up to time {t_end}.")
+        
+        # **Compute and Update rMat Based on the New xMat**
+        self.spp.rMat = self.spp.compute_intrinsic_growth_rates(self.spp.xMat)
+        logger.debug(f"rMat updated based on new xMat.")
+        
+        
+    except Exception as e:
+        logger.error("An error occurred during dynamics simulation:")
+        logger.error(traceback.format_exc())
 
+# Attach the meta_c_dynamics method to Metacommunity class if not already present
+if not hasattr(Metacommunity, 'meta_c_dynamics'):
+    setattr(Metacommunity, 'meta_c_dynamics', meta_c_dynamics)
 
 if __name__ == "__main__":
-    main()
+    # Profile the main function and save the profile to 'simulation_profile.prof'
+    cProfile.run('main()', 'simulation_profile.prof')
 
 
 
