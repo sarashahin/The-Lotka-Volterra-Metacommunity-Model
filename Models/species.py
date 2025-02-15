@@ -940,7 +940,7 @@ class Species:
             plt.legend()
             plt.grid(True)
             if save_fig:
-                plt.savefig('/Users/model/Species_plots_PSD_vis/species_richness_over_time.png', dpi=300)
+                plt.savefig('species_richness_over_time.png', dpi=300)
                 logger.info("Species richness plot saved as 'species_richness_over_time.png'.")
             plt.show()
         except Exception as e:
@@ -981,7 +981,7 @@ class Species:
             plt.legend(loc='upper right', fontsize='small')
             plt.grid(True)
             if save_fig:
-                plt.savefig('/Users/model/Species_plots_PSD_vis/biomass_trajectories.png', dpi=300)
+                plt.savefig('biomass_trajectories.png', dpi=300)
                 logger.info("Biomass trajectories plot saved as 'biomass_trajectories.png'.")
             plt.show()
         except Exception as e:
@@ -1005,7 +1005,7 @@ class Species:
             plt.ylabel('Number of Species')
             plt.grid(True)
             if save_fig:
-                plt.savefig('/Users/model/Species_plots_PSD_vis/biomass_distribution_final.png', dpi=300)
+                plt.savefig('biomass_distribution_final.png', dpi=300)
                 logger.info("Final biomass distribution plot saved as 'biomass_distribution_final.png'.")
             plt.show()
         except Exception as e:
@@ -1034,7 +1034,7 @@ class Species:
             plt.xlabel('Time Steps')
             plt.ylabel('Species')
             if save_fig:
-                plt.savefig('/Users/model/Species_plots_PSD_vis/biomass_heatmap.png', dpi=300)
+                plt.savefig('biomass_heatmap.png', dpi=300)
                 logger.info("PSD Biomass heatmap plot saved as 'biomass_heatmap.png'.")
             plt.show()
         except Exception as e:
@@ -1120,7 +1120,7 @@ class Species:
 
             plt.tight_layout()
             if save_fig:
-                plt.savefig('/Users/model/Species_plots_PSD_vis/invasion_extinction_events.png', dpi=300)
+                plt.savefig('invasion_extinction_events.png', dpi=300)
                 logger.info("Invasion and extinction events plot saved as 'invasion_extinction_events.png'.")
             plt.show()
 
@@ -1154,7 +1154,7 @@ class Species:
             plt.xlim(0, len(final_biomass) + 1)
             plt.grid(axis='y')
             if save_fig:
-                plt.savefig('/Users/model/Species_plots_PSD_vis/final_biomass_all_species.png', dpi=300)
+                plt.savefig('final_biomass_all_species.png', dpi=300)
                 logger.info("Final PSD biomass of all species plot saved as 'final_biomass_all_species.png'.")
             plt.show()
         except Exception as e:
@@ -1188,7 +1188,7 @@ class Species:
             plt.xlabel('Time Steps')
             plt.ylabel('Species')
             if save_fig:
-                plt.savefig('/Users/model/Species_plots_PSD_vis/PSD_Biomass_Trajectory_Heatmap.png', dpi=300)
+                plt.savefig('PSD_Biomass_Trajectory_Heatmap.png', dpi=300)
                 logger.info("PSD biomass trajectory heatmap saved as 'PSD_Biomass_Trajectory_Heatmap.png'.")
             plt.show()
         except Exception as e:
