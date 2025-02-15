@@ -772,36 +772,7 @@ def plot_histogram_of_metric(
       - a single iteration (if iteration_index is an int),
       - or all iterations combined (if iteration_index is None).
 
-    Parameters
-    ----------
-    data : dict
-        The loaded PSD data dictionary, e.g. from load_psd_data(...).
-        Must contain data[metric].
-    metric : str
-        The key in `data` that you want to plot. E.g. 'logB', 'PoissonClocks', 'i', etc.
-    iteration_index : int or None
-        Which iteration to plot:
-          - If an integer >= 0, we plot that exact iteration (0-based).
-          - If a negative integer, we interpret from the end (e.g. -1 = last iteration).
-          - If None, we gather all iterations combined into one histogram.
-    outdir : str
-        Directory to save the resulting HTML file.
-    bins : int
-        Number of bins in the histogram.
-    node_aggregation : str
-        How to handle the node dimension if the array is 3D (num_iterations, max_species, nodes).
-        One of:
-          - "flatten": Flatten across species & nodes for each iteration (default).
-          - "mean": Take the mean across the node dimension, leaving (num_iterations, max_species).
-          - "sum": Sum across the node dimension, leaving (num_iterations, max_species).
-          - "none": Leave as 3D and just flatten everything for the histogram 
-                    (i.e. flatten all three dims if iteration_index=None).
-                    Not recommended if you want a per-species quantity.
-    
-    Returns
-    -------
-    None
-        (Creates and saves an interactive histogram HTML file.)
+
     """
 
     # Check if the metric exists
