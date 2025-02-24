@@ -11,7 +11,7 @@ import sys
 def setup_logging():
     """
     Sets up Python's logging module to print to console with level=INFO.
-    Call once at the start of your program.
+    Call once at the start of the program.
     """
     logging.basicConfig(
         stream=sys.stdout,
