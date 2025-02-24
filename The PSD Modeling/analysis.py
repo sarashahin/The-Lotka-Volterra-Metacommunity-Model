@@ -37,7 +37,7 @@ def turnover_rate(trajectory, recording_step):
     rate = changes / float(recording_step)
     return rate
 
-def plot_trajectory(trajectories, labels, title, filename):
+def plot_total_biomasses(trajectories, labels, title, filename):
     """
     Multi-trajectory line plot: total biomass versus time.
     """
@@ -53,6 +53,22 @@ def plot_trajectory(trajectories, labels, title, filename):
     plt.close()
     logger.info(f"Saved figure {filename}")
 
+def plot_trajectories(trajectories, labels, title, filename_base):
+    """
+    Multi-trajectory line plots: biomasses versus time for each model.
+    """
+    for traj, label in zip(trajectories, labels):
+        plt.figure(figsize=(10,6))
+        for i in range(traj.shape[1]):
+            plt.plot(traj[:, i])
+        plt.xlabel("Time Index")
+        plt.ylabel("Total Biomass")
+        plt.title(label)
+        filename = label + "_" + filename_base
+        plt.savefig(filename)
+        plt.close()
+        logger.info(f"Saved figure {filename}")
+
 def histogram_biomass(trajectories, labels, filename):
     """
     Overlaid histograms (log10 scale) for biomass distributions.
@@ -60,7 +76,7 @@ def histogram_biomass(trajectories, labels, filename):
     plt.figure(figsize=(10,6))
     for traj, label in zip(trajectories, labels):
         data = traj.flatten()
-        data = data[data > 0]
+        data = data[data >= BODY_MASS]
         if len(data) == 0:
             continue
         plt.hist(np.log10(data), bins=50, alpha=0.4, label=label, density=True)

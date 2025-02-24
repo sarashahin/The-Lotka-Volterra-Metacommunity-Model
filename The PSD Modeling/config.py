@@ -20,6 +20,12 @@ INV = 1e-8
 # Mortality rate (for large negative growth offsets)
 MORTALITY_RATE = 0.2
 
+# Probability of non-zero interaction
+CONNECTANCE = 0.4
+
+# Strength of interaction when non-zero
+INTERACTION_STRENGTH = 0.4
+
 #: Initial number of species to aim for before the main loop
 TARGET_RICHNESS = 300
 

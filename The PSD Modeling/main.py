@@ -15,7 +15,8 @@ import numpy as np
 # Import configuration parameters and model functions
 from config import (
     TARGET_RICHNESS, BODY_MASS, INV, MORTALITY_RATE,
-    RANDOM_SEED, TMAX, STEP_SIZE, N_RECORDS, RECORDING_STEP_SIZE
+    RANDOM_SEED, TMAX, STEP_SIZE, N_RECORDS, RECORDING_STEP_SIZE,
+    CONNECTANCE, INTERACTION_STRENGTH
 )
 from utils import setup_logging as setup_utils_logging
 from models_ibm import IBMModel
@@ -25,7 +26,8 @@ from models_ode import ODEModel
 from analysis import (
     alpha_diversity,
     turnover_rate,
-    plot_trajectory,
+    plot_trajectories,
+    plot_total_biomasses,
     histogram_biomass,
     covariance_matrix_plot,
     save_model_output,
@@ -85,9 +87,9 @@ def main():
 
     # Create intrinsic growth rates and competition matrix
     r = np.random.normal(loc=1.0, scale=0.1, size=S)
-    adjacency = (np.random.rand(S, S) < 0.4).astype(float)
-    np.fill_diagonal(adjacency, 1.0)
-    C = 0.4 * adjacency
+    adjacency = (np.random.rand(S, S) < CONNECTANCE).astype(float)
+    C = INTERACTION_STRENGTH * adjacency
+    np.fill_diagonal(C, 1.0)
 
     logger.info(f"Initial growth rates (r) and competition matrix (C) set for S={S} species.")
 
@@ -104,7 +106,10 @@ def main():
 
     # RUN PSD2 Model ( with extra diagnostic outputs)
     logger.info("Running PSD2 Model...")
-    psd2_model = PSD2Model(r=r, C=C, tmax=TMAX, record_step=RECORDING_STEP_SIZE, seed=RANDOM_SEED)
+    #### Axel will look at PSD2 later, skipping this for now
+    logger.info("Axel will look at PSD2 later, skipping this for now")
+    psd2_model = PSD2Model(r=r, C=C, tmax=RECORDING_STEP_SIZE, record_step=RECORDING_STEP_SIZE, seed=RANDOM_SEED)
+    # psd2_model = PSD2Model(r=r, C=C, tmax=TMAX, record_step=RECORDING_STEP_SIZE, seed=RANDOM_SEED)
     (psd2_times, psd2_trajectory, psd2_waiting,
      psd2_poisson_clock, psd2_growth_rate, psd2_invasion_rate, psd2_est_prob) = psd2_model.run()
 
@@ -116,7 +121,14 @@ def main():
     # Basic analysis and plotting
     logger.info("Generating basic analysis plots...")
 
-    plot_trajectory(
+    plot_trajectories(
+        trajectories=[ibm_trajectory, psd_trajectory, psd2_trajectory, ode_trajectory],
+        labels=["IBM", "PSD", "PSD2", "ODE"],
+        title="Population Dynamics",
+        filename_base="Trajectory.png"
+    )
+
+    plot_total_biomasses(
         trajectories=[ibm_trajectory, psd_trajectory, psd2_trajectory, ode_trajectory],
         labels=["IBM", "PSD", "PSD2", "ODE"],
         title="Population Dynamics: Total Biomass Comparison",
