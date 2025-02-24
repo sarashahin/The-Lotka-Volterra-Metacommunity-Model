@@ -200,13 +200,13 @@ class PSD2Model:
         solver.atol = 1e-4
 
         solver.options['hmin'] = 1e-4
-        solver.options['maxh'] = 1e3
+        solver.options['maxh'] = 20
         solver.options['root_tol'] = 1e-6
         solver.options["mxhnil"] = 5
         solver.options['maxsteps'] = 300
 
         # Chunk the integration to avoid huge steps
-        chunk_size = 20
+        chunk_size = 2000
         times = np.arange(0, self.tmax + chunk_size, chunk_size)
         times = np.unique(np.clip(times, 0, self.tmax))
 
