@@ -12,12 +12,10 @@ import logging
 from logging.handlers import RotatingFileHandler
 import numpy as np
 
-# Import configuration parameters and model functions
-from config import (
-    TARGET_RICHNESS, BODY_MASS, INV, MORTALITY_RATE,
-    RANDOM_SEED, TMAX, STEP_SIZE, N_RECORDS, RECORDING_STEP_SIZE,
-    CONNECTANCE, INTERACTION_STRENGTH
-)
+# To import configuration file:
+import argparse
+import importlib
+
 from utils import setup_logging as setup_utils_logging
 from models_ibm import IBMModel
 from models_psd import PSDModel
@@ -74,10 +72,53 @@ logger.info("Logging is set up. Debug logs will be stored in the 'logs' folder."
 
 
 ############################################################
+# Handling of configuration files 
+############################################################
+def load_config(config_file_path):
+    """
+    Loads a configuration from a .py file and assigns variables to the global scope.
+    """
+    try:
+        module_name = config_file_path[:-3] if config_file_path.endswith('.py') else config_file_path
+        module_name = module_name.replace("/", ".")  # Handle paths
+
+        config_module = importlib.import_module(module_name)
+
+        # Assign variables from the config module to the global scope
+        for name, value in config_module.__dict__.items():
+            if not name.startswith("__"):  # Avoid special attributes
+                globals()[name] = value
+
+        return True  # Indicate successful loading
+
+    except (ImportError, FileNotFoundError) as e:
+        print(f"Error loading config file: {e}")
+        return False
+
+
+############################################################
 # Main Function
 ############################################################
 def main():
     logger.info("Setting up parameters and initial conditions...")
+
+    # Parse command-line arguments. Currently only for loading config file.
+    parser = argparse.ArgumentParser(description="Run the script with a configuration file.")
+    parser.add_argument("config_file",
+                        default="config.py",
+                        nargs='?', # fall back to default if not present
+                        help="Path to the configuration .py file.")
+    args = parser.parse_args()
+    config_path = args.config_file
+    config = load_config(config_path)
+    config_path = args.config_file
+
+    # Load configuration file
+    if load_config(config_path):
+        print(f"Read configuration file {config_path}")
+    else:
+        sys.exit("Could not read config file provided as parameter.")
+
 
     # Define number of species (TARGET_RICHNESS)
     S = TARGET_RICHNESS
