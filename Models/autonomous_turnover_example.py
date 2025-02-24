@@ -1,4 +1,6 @@
-# -*- coding: utf-8 -*-
+############################################
+# autonomous_turnover_example.py
+############################################
 """
 This script analyzes metacommunity simulation data.
 It computes four main metrics for each invasion:
@@ -8,22 +10,22 @@ It computes four main metrics for each invasion:
     - Spatial beta diversity (beta_s)
 
 Metric definitions:
-    1. Local Source Richness (alpha_mn):
-       Calculates the average number of active sources per location.
-       Equation: αₘₙ = (1/N) * Σᵢ Σⱼ I(b_src[j, i] == 1)
-       where N is the number of sites and I(·) is the indicator function.
+    -  Local Source Richness (alpha_mn):
+    -  Calculates the average number of active sources per location.
+    -   Equation: αₘₙ = (1/N) * Σᵢ Σⱼ I(b_src[j, i] == 1)
+       where N is the number of sites and I() is the indicator function.
     
-    2. Regional Richness (gamma):
+    - Regional Richness (gamma):
        The total number of source sites (S).
        Equation: γ = S
     
-    3. Temporal Beta Diversity (beta_t):
+    - Temporal Beta Diversity (beta_t):
        Computed using the Bray-Curtis dissimilarity over time for each site.
        Equation (per site x): βₜ₍ₓ₎ = (2/(T*(T-1))) * Σᵢ<ⱼ d(i, j)
        and averaged over all sites: βₜ = (1/N) * Σₓ βₜ₍ₓ₎
        where T is the number of time steps.
     
-    4. Spatial Beta Diversity (beta_s):
+    - Spatial Beta Diversity (beta_s):
        Computed from the first trajectorys spatial data using Bray-Curtis dissimilarity.
        Equation: βₛ = (2/(S*(S-1))) * Σᵢ<ⱼ d(i, j)
        where S is the number of sites.
@@ -80,7 +82,7 @@ def analyse_directory(dir_path, distr_name):
             # List all files in the subdirectory and sort them numerically
             b_list = sorted(os.listdir(sub_path), key=lambda x: int(re.findall(r'\d+', x)[0]))
 
-            # Retrieve the source matrix file (identified by 'src' in the filename)
+            # retrieve the source matrix file (identified by 'src' in the filename)
             try:
                 src_file = [f for f in b_list if 'src' in f][0]
                 b_src = pd.read_csv(os.path.join(sub_path, src_file), header=None).values
@@ -88,13 +90,13 @@ def analyse_directory(dir_path, distr_name):
                 print(f"No source file found in {sub_path}, skipping.")
                 continue
 
-            # Remove source file from the list to process trajectory files only
+            # remove source file from the list to process trajectory files only
             b_list = [f for f in b_list if 'src' not in f]
             if len(b_list) == 0:
                 print(f"No trajectory files found in {sub_path}, skipping.")
                 continue
 
-            # Read trajectory data for each time step and flatten the matrix into a 1D array per time
+            # read trajectory data for each time step and flatten the matrix into a 1D array per time
             b = []
             for t in b_list:
                 b_mat = pd.read_csv(os.path.join(sub_path, t), header=None).values
@@ -102,7 +104,7 @@ def analyse_directory(dir_path, distr_name):
             b = np.array(b)
             b[b <= 0] = 0  # Replace non-positive values with 0
 
-            # Metric Calculations:
+            #metric Calculations:
             N = b_src.shape[1]  # Number of sites
             S = b_src.shape[0]  # Number of source sites (regional richness)
             
@@ -115,7 +117,7 @@ def analyse_directory(dir_path, distr_name):
             gamma.append(S)
             
             # 3. Temporal Beta Diversity (beta_t)
-            # For each site x, compute the Bray-Curtis dissimilarity over time and average:
+            # for each site x, compute the Bray-Curtis dissimilarity over time and average:
             # βₜ₍ₓ₎ = (2/(T*(T-1))) * Σᵢ<ⱼ d(i, j), then βₜ = (1/N) * Σₓ βₜ₍ₓ₎
             mean_bc = []
             for x in range(N):
@@ -126,19 +128,19 @@ def analyse_directory(dir_path, distr_name):
                 mean_bc.append(np.mean(bc[np.triu_indices(len(bc), k=1)]))
             beta_t.append(np.mean(mean_bc))
             
-            # 4. Spatial Beta Diversity (beta_s)
-            # Compute Bray-Curtis dissimilarity between sites at the first time step:
+            # 4. spatial Beta Diversity (beta_s)
+            # compute Bray-Curtis dissimilarity between sites at the first time step:
             # βₛ = (2/(S*(S-1))) * Σᵢ<ⱼ d(i, j)
             b_t = pd.read_csv(os.path.join(sub_path, b_list[0]), header=None).values
             bc_spatial = pairwise_distances(b_t.T, metric='braycurtis')
             beta_s.append(np.mean(bc_spatial))
     
-    # If no valid data is found, return an empty DataFrame
+    # if no valid data is found, return an empty DataFrame
     if not alpha_mn:
         print(f"No valid data found in directory {dir_path}, skipping.")
         return pd.DataFrame()
     
-    # Create a DataFrame with the computed metrics.
+    # create a DataFrame with the computed metrics.
     # Note: The invasion numbers are sliced to match the length of the computed metrics.
     data = pd.DataFrame({
         'inv': inv_numbers[:len(alpha_mn)],
@@ -152,7 +154,7 @@ def analyse_directory(dir_path, distr_name):
     
     return data
 
-# Run analysis if required, or load precomputed data
+# run analysis if required, or load precomputed data
 if ANALYSE_DATA:
     with ProcessPoolExecutor(max_workers=cores) as executor:
         results = list(executor.map(analyse_directory, dir_list, distr))
@@ -162,14 +164,14 @@ if ANALYSE_DATA:
 else:
     dat = pd.read_csv("./SimulationData/autonomous_turnover_example.csv")
 
-# Ensure that the 'alpha.mn' column exists
+#make sure that the 'alpha.mn' column exists
 if 'alpha.mn' not in dat.columns:
     raise ValueError("Column 'alpha.mn' is missing from the data. Please check the analysis process.")
 
-# Print DataFrame columns for debugging purposes
+# print DataFrame columns for debugging purposes
 print("Columns in `dat` DataFrame:", dat.columns)
 
-# Prepare DataFrames for visualization
+#prepare DataFrames for visualization
 dat_s = pd.DataFrame({
     'inv': pd.concat([dat['inv'], dat['inv']]),
     'it': pd.concat([dat['it'], dat['it']]),
@@ -186,8 +188,8 @@ dat_b = pd.DataFrame({
     'level': ['temp'] * len(dat) + ['spat'] * len(dat)
 })
 
-# Plotting the results
-# Attempt to extract a threshold index for the 'discr' distribution where temporal beta exceeds 1e-2.
+#plotting the results
+# attempt to extract a threshold index for the 'discr' distribution where temporal beta exceeds 1e-2.
 try:
     threshold = dat_b[(dat_b['level'] == 'temp') & (dat_b['distr'] == 'discr') & (dat_b['beta'] > 1e-2)].index.min()
 except ValueError:
