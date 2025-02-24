@@ -62,7 +62,7 @@ def plot_trajectories(trajectories, labels, title, filename_base):
         for i in range(traj.shape[1]):
             plt.plot(traj[:, i])
         plt.xlabel("Time Index")
-        plt.ylabel("Total Biomass")
+        plt.ylabel("Biomass")
         plt.title(label)
         filename = label + "_" + filename_base
         plt.savefig(filename)
