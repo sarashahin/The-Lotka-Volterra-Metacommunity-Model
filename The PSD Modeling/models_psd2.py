@@ -8,12 +8,16 @@ PSD2 approach with 'chunked' assimilation, iterative solver to reduce memory usa
 and more frequent logging to avoid silent long steps that risk OS kills.
 """
 
+import sys
 import numpy as np
 import logging
 from assimulo.solvers import CVode
 from assimulo.problem import Explicit_Problem
 
 logger = logging.getLogger(__name__)
+
+def dummy_derivatives(t, y, sw):
+    return(y)
 
 class PSD2Model:
     def __init__(self, r, C, tmax=None, record_step=None, seed=123):
@@ -74,30 +78,30 @@ class PSD2Model:
             raise ValueError(f"Expected length {2*self.S}, got {flat.shape[0]}")
         return flat
 
-    def _derivatives(self, t, y):
+    def _derivatives(self, t, y, sw):
         y = self._ensure_flat_y(y) # looks rather expensive to call here
         logB = y[:self.S]
         pclock = y[self.S:2*self.S]
 
-        B = np.exp(logB) * (~self.waiting)
+        B = np.exp(logB) * np.invert(sw)
         local_growth = self.r - self.C.dot(B)
 
         dlogB = np.zeros(self.S)
-        dpclock = np.zeros(self.S)
+        dpclock = np.zeros(self.S) ## Should not be needed
 
         for i in range(self.S):
-            if not self.waiting[i]:
+            if not sw[i]:
                 # Non-waiting => normal logB derivative
                 dlogB[i] = local_growth[i] + np.exp(np.log(INV) - logB[i])
+            # Run pclock even if not waiting, so that waiting <-> pclock < 0
+            non_self_growth = local_growth[i] + B[i]*self.C[i,i]
+            denom = non_self_growth + MORTALITY_RATE
+            if non_self_growth >= 0: # implies denom > 0 
+                est_prob = non_self_growth / denom
             else:
-                # waiting => track invasion in pclock
-                denom = local_growth[i] + MORTALITY_RATE
-                if local_growth[i] >= 0: # implies denom > 0 
-                    est_prob = local_growth[i] / denom
-                else:
-                    est_prob = 0.0
-                dpclock[i] = INV * est_prob / BODY_MASS
-
+                est_prob = 0.0
+            dpclock[i] = INV * est_prob / BODY_MASS
+        
         return np.concatenate([dlogB, dpclock])
 
     def _event_fn(self, t, y, sw):
@@ -110,75 +114,77 @@ class PSD2Model:
         logB = y[:self.S]
         pclock = y[self.S:2*self.S]
 
-        B = np.exp(logB) * (~self.waiting)
+        B = np.exp(logB) * np.invert(sw)
         local_growth = self.r - self.C.dot(B)
 
-        ## This looks like it could be done more efficiently by
-        ## concatenating, but then other code could need to be changed
-        ## as well.
-        gvals = []
-        for i in range(self.S):
-            gvals.append(local_growth[i])
-            gvals.append(pclock[i])
-        return np.array(gvals, dtype=float)
+        # Remove effect of intraspecific competition
+        local_growth = local_growth + np.diag(self.C) * B 
+        return np.concatenate([local_growth, pclock])
 
-    def _handle_event_fn(self, t, y):
+    def _handle_event_fn(self, solver, event_info): #(self, t, y):
         """Event logic by sign changes in _event_fn."""
-        y = self._ensure_flat_y(y) # perhaps not needed?
+        y = self._ensure_flat_y(solver.y) # perhaps not needed?
         logB = y[:self.S].copy()
         pclock = y[self.S:2*self.S].copy()
 
-        vals = self._event_fn(t, y, None)
-        current_sw = np.sign(vals)
+        # A value +1 in state_info indicates that the state_event
+        # function crossed zero from negative to positive and a value
+        # -1 indictes that the function became negative in the
+        # respective component.
+        state_info = event_info[0]
+        changed = np.nonzero(state_info)[0]
 
-        if self.last_sw is None:
-            sys.exit("This should not happen")
-            self.last_sw = current_sw
-            return y
-
-        changed = np.where(current_sw != self.last_sw)[0]
-
-        B = np.exp(logB) * (~self.waiting)
+        B = np.exp(logB) * np.invert(solver.sw)
         local_growth = self.r - self.C.dot(B)
+        
+        # Remove effect of intraspecific competition
+        local_growth = local_growth + np.diag(self.C) * B 
 
         for idx in changed:
-            i_species = idx // 2
-            is_clock_event = (idx % 2 == 1)
-            if not is_clock_event:
-                # local_growth crogssing zero
-                if self.waiting[i_species] and local_growth[i_species] < 0:
-                    self.waiting[i_species] = False
-                    logB[i_species] = np.log(INV/10.0)
-                elif (not self.waiting[i_species]) and (local_growth[i_species] < 0):
-                    self.waiting[i_species] = True
-                    pclock[i_species] = np.log(np.random.rand())
-                    logB[i_species] = np.log(INV/10.0)
-            else:
-                # pclock crossing zero => establishment
-                if self.waiting[i_species]:
-                    denom = local_growth[i_species] + MORTALITY_RATE
-                    est_prob = (local_growth[i_species] / denom) if abs(denom) > 1e-14 else 0.0
-                    val = BODY_MASS / est_prob if est_prob > 0 else BODY_MASS
-                    if val > 1:
-                        logB[i_species] = 0.0
+            if idx < self.S: # event with local growth rate change
+                i_species = idx
+                if solver.sw[i_species]: # species was waiting?
+                    if state_info[idx] == +1:
+                        print(f"Local growth rate {local_growth[i_species]} of {i_species} was negative while waiting ({logB[i_species]}, {pclock[i_species]})!")
                     else:
-                        logB[i_species] = np.log(val)
-                    self.waiting[i_species] = False
-                pclock[i_species] = np.log(np.random.rand())
-
-        self.last_sw = current_sw
-        return np.concatenate([logB, pclock])
-
+                        print(f"{i_species} S ({local_growth[i_species]}) -> P at {solver.t}")
+                        solver.sw[i_species] = False
+                        solver.y[i_species] = np.log(INV/100.0)
+                        solver.y[i_species+self.S] = 1
+                elif state_info[idx] == +1:  # species was not waiting, goes to waiting
+                    print(f"{i_species} P ({local_growth[i_species]}) -> S at {solver.t}")
+                    solver.sw[i_species] = True
+                    solver.y[i_species+self.S] = np.log(np.random.rand())
+                    solver.y[i_species] = np.log(INV/100.0) ## should not be needed
+                else:
+                    print(f"{i_species} D -> P at {solver.t}")
+            else: # event with pclock crossing zero => establishment
+                i_species = idx - self.S
+                if state_info[idx] == -1:
+                    print(f"Poisson Clock {pclock[i_species]} declined ({solver.sw[i_species]})!")
+                else:
+                    print(f"{i_species} S ({pclock[i_species]}) -> D at {solver.t}")
+                    denom = local_growth[i_species] + MORTALITY_RATE
+                    if local_growth[i_species] >= 0: # implies denom > 0 
+                        est_prob = local_growth[i_species] / denom
+                    else:
+                        print("Local growth negative when pclock triggered!")
+                        sys.exit()
+                    val = BODY_MASS / est_prob if est_prob > 0 else BODY_MASS
+                    if val > 1: ## avoid values that are too large
+                        solver.y[i_species] = 0.0
+                    else:
+                        solver.y[i_species] = np.log(val)
+                    solver.sw[i_species] = False
+        
     def run(self):
         logger.info("Starting PSD2 simulation with Assimulo...")
 
         # Build y0
         y0 = np.concatenate([self.logB, self.poisson_clock])
-        init_vals = self._event_fn(0.0, y0, None)
-        self.last_sw = np.sign(init_vals)
-
+        
         # Problem setup
-        problem = Explicit_Problem(self._derivatives, y0, t0=0.0)
+        problem = Explicit_Problem(self._derivatives, y0, t0=0.0, sw0=self.waiting)
         problem.name = 'PSD2 Problem'
         problem.state_events = self._event_fn
         problem.handle_event = self._handle_event_fn
@@ -194,11 +200,18 @@ class PSD2Model:
         solver.atol = 1e-4
 
         solver.options['hmin'] = 1e-4
-        solver.options['maxh'] = 20
-        solver.options['root_tol'] = 1e-6
+        solver.options['maxh'] = 1000
+        solver.options['root_tol'] = 1e-1
         solver.options["mxhnil"] = 5
         solver.options['maxsteps'] = 300
 
+        # #### TESTING ####
+        # self._derivatives(0, y0, solver.sw)
+        # self._event_fn(0, y0, solver.sw)
+        # self._handle_event_fn(solver,np.random.rand(2,2*self.S)*0)
+        # print("TESTING OK")
+        # sys.exit()
+        
         # Chunk the integration to avoid huge steps
         chunk_size = 2000
         times = np.arange(0, self.tmax + chunk_size, chunk_size)
@@ -208,101 +221,52 @@ class PSD2Model:
         record_times = np.arange(0, self.tmax + self.record_step, self.record_step)
         record_times = np.unique(np.clip(record_times, 0, self.tmax))
 
-        # ---- Initial storage at time 0 ----
-        B0 = np.exp(self.logB) * (~self.waiting)
-        self.trajectory[0, :] = B0
-        self.wait_trajectory[0, :] = self.waiting.copy()
-        self.time_points[0] = 0.0
+        # Run the simulation
+        t, y = solver(self.tmax, record_times.shape[0]-1)
 
-        # Compute extra diagnostics at t = 0
-        growth0 = self.r - self.C.dot(B0)
-        inv_rate0 = np.zeros(self.S)
-        est_prob0 = np.zeros(self.S)
-        for i in range(self.S):
-            if self.waiting[i]:
-                denom = growth0[i] + MORTALITY_RATE
-                est_prob0[i] = growth0[i] / denom if abs(denom) > 1e-14 else 0.0
-                inv_rate0[i] = INV * est_prob0[i] / BODY_MASS
-            else:
-                B_val = np.exp(self.logB[i])
-                inv_rate0[i] = INV / B_val if B_val > 0 else 0
-                est_prob0[i] = float('nan')
-        self.poisson_clock_traj[0, :] = self.poisson_clock.copy()
-        self.growth_rate_traj[0, :]   = growth0
-        self.invasion_rate_traj[0, :] = inv_rate0
-        self.establishment_prob_traj[0, :] = est_prob0
-        self.record_idx = 1
-        # ------------------------------------
+        recSteps = np.where(np.remainder(t,self.record_step) == 0)[0]
+        if recSteps.shape[0] != record_times.shape[0]:
+            sys.exit("Could not localise recording time steps after simulation.")
 
-        rt_idx = 1
-        for i in range(len(times)-1):
-            t_start = times[i]
-            t_end   = times[i+1]
-
-            solver.simulate(t_end, ncp=0)
-
-            y_sol = self._ensure_flat_y(solver.y)
-            logB_sol = y_sol[:self.S]
-            pclock_sol = y_sol[self.S:2*self.S]
-            self.logB = logB_sol
-            self.poisson_clock = pclock_sol
-
-            logger.info(f"PSD2 chunk finished: from t={t_start} to t={t_end} (S={self.S})")
-            logger.debug(f"   => logB (sample): {self.logB[:5]}...")
-            logger.debug(f"   => waiting (sample): {self.waiting[:5]}...")
-            logger.debug(f"   => pclock (sample): {self.poisson_clock[:5]}...")
-
-            # Check and record at record times within the current chunk
-            while rt_idx < len(record_times) and record_times[rt_idx] <= t_end:
-                rec_time = record_times[rt_idx]
-
-                # We record the state at the current solver state
-                B = np.exp(self.logB) * (~self.waiting)
-                self.trajectory[self.record_idx, :] = B
-                self.wait_trajectory[self.record_idx, :] = self.waiting.copy()
-                self.time_points[self.record_idx] = rec_time
-
-                # ---- Compute extra diagnostics for this record ----
-                growth = self.r - self.C.dot(B)
-                inv_rate = np.zeros(self.S)
-                est_prob = np.zeros(self.S)
-                for j in range(self.S):
-                    if self.waiting[j]:
-                        denom = growth[j] + MORTALITY_RATE
-                        est_prob[j] = growth[j] / denom if abs(denom) > 1e-14 else 0.0
-                        inv_rate[j] = INV * est_prob[j] / BODY_MASS
-                    else:
-                        B_val = np.exp(self.logB[j])
-                        inv_rate[j] = INV / B_val if B_val > 0 else 0
-                        est_prob[j] = float('nan')
-                self.poisson_clock_traj[self.record_idx, :] = self.poisson_clock.copy()
-                self.growth_rate_traj[self.record_idx, :] = growth
-                self.invasion_rate_traj[self.record_idx, :] = inv_rate
-                self.establishment_prob_traj[self.record_idx, :] = est_prob
-                # -----------------------------------------------------
+        for step in range(recSteps.shape[0]):
+            pclock = y[recSteps[step],self.S:(2*self.S)]
+            waiting = pclock < 0
+            B = np.exp(y[recSteps[step],0:self.S]) * np.invert(waiting)
+            self.trajectory[step, :] = B
+            self.wait_trajectory[step, :] = waiting
+            rec_time = t[recSteps[step]]
+            self.time_points[step] = rec_time
+            # Compute extra diagnostics at t = 0
+            growth = self.r - self.C.dot(B)
+            growth = growth + np.diag(self.C) * B
+            inv_rate = np.zeros(self.S)
+            est_prob = np.zeros(self.S)
+            for j in range(self.S):
+                if growth[j] > 0:
+                    denom = growth[j] + MORTALITY_RATE
+                    est_prob[j] = growth[j] / denom
+                    inv_rate[j] = INV * est_prob[j] / BODY_MASS
+            self.poisson_clock_traj[step, :] = pclock
+            self.growth_rate_traj[step, :] = growth
+            self.invasion_rate_traj[step, :] = inv_rate
+            self.establishment_prob_traj[step, :] = est_prob
                 
-                # --- Diagnostic: Mean raw Poisson clock for waiting species ---
-                if np.any(self.waiting):
-                    mean_poisson = np.mean(np.exp(self.poisson_clock[self.waiting]))
-                    logger.info(f"At t={rec_time}, mean raw Poisson clock for waiting species: {mean_poisson:.3f}")
-                else:
-                    logger.info(f"At t={rec_time}, no species are in waiting state.")
+            # --- Diagnostic: Mean raw Poisson clock for waiting species ---
+            if np.any(waiting):
+                mean_poisson = np.mean(np.exp(pclock[waiting]))
+                logger.info(f"At t={rec_time}, mean raw Poisson clock for waiting species: {mean_poisson:.3f}")
+            else:
+                logger.info(f"At t={rec_time}, no species are in waiting state.")
                 # -------------------------------------------------------------------
-
-                logger.info(f"PSD2: recorded at t={rec_time} => record #{self.record_idx}")
-                self.record_idx += 1
-                rt_idx += 1
-
-            if t_end >= self.tmax:
-                break
+                logger.info(f"PSD2: recorded at t={rec_time} => record #{step}")
 
         logger.info("PSD2 simulation completed.")
         return (
-            self.time_points[:self.record_idx],
-            self.trajectory[:self.record_idx, :],
-            self.wait_trajectory[:self.record_idx, :],
-            self.poisson_clock_traj[:self.record_idx, :],
-            self.growth_rate_traj[:self.record_idx, :],
-            self.invasion_rate_traj[:self.record_idx, :],
-            self.establishment_prob_traj[:self.record_idx, :]
+            self.time_points,
+            self.trajectory,
+            self.wait_trajectory,
+            self.poisson_clock_traj,
+            self.growth_rate_traj,
+            self.invasion_rate_traj,
+            self.establishment_prob_traj
         )
