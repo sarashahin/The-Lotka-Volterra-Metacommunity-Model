@@ -10,15 +10,6 @@ We replicate the logic from the R code in a continuous sense.
 """
 import numpy as np
 import logging
-from config import (
-    BODY_MASS,
-    INV,
-    TMAX,
-    RECORDING_STEP_SIZE,
-    RTOL,
-    ATOL,
-    MAX_STEPS
-)
 from assimulo.solvers import CVode
 from assimulo.problem import Explicit_Problem
 

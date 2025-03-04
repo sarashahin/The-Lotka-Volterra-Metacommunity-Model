@@ -15,15 +15,16 @@ Analysis routines:
 import numpy as np
 import matplotlib.pyplot as plt
 import logging
-from config import THRESHOLD, BODY_MASS
 from utils import mav, bav, mean_se
 
 logger = logging.getLogger(__name__)
 
-def alpha_diversity(trajectory, threshold=THRESHOLD):
+def alpha_diversity(trajectory, threshold=None):
     """
     Count how many species have biomass > threshold at each time record.
     """
+    if threshold==None:
+        threshold = THRESHOLD
     return np.sum(trajectory > threshold, axis=1)
 
 def turnover_rate(trajectory, recording_step):

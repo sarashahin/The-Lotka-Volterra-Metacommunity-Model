@@ -20,17 +20,17 @@ INV = 1e-8
 # Mortality rate (for large negative growth offsets)
 MORTALITY_RATE = 0.2
 
-#: Initial number of species to aim for before the main loop
-TARGET_RICHNESS = 300
-
-#: Number of time steps for "relaxation" or "settling" in certain procedures
-T_RELAX = 300
-
 # Probability of non-zero interaction
 CONNECTANCE = 0.4
 
 # Strength of interaction when non-zero
 INTERACTION_STRENGTH = 0.4
+
+#: Initial number of species to aim for before the main loop
+TARGET_RICHNESS = 300
+
+#: Number of time steps for "relaxation" or "settling" in certain procedures
+T_RELAX = 300
 
 #: Max simulation time
 TMAX =  200000  # (like 200000 in R)

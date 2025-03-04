@@ -10,16 +10,6 @@ and more frequent logging to avoid silent long steps that risk OS kills.
 
 import numpy as np
 import logging
-from config import (
-    BODY_MASS,
-    INV,
-    MORTALITY_RATE,
-    TMAX,
-    RECORDING_STEP_SIZE,
-    RTOL,
-    ATOL,
-    MAX_STEPS
-)
 from assimulo.solvers import CVode
 from assimulo.problem import Explicit_Problem
 
@@ -85,7 +75,7 @@ class PSD2Model:
         return flat
 
     def _derivatives(self, t, y):
-        y = self._ensure_flat_y(y)
+        y = self._ensure_flat_y(y) # looks rather expensive to call here
         logB = y[:self.S]
         pclock = y[self.S:2*self.S]
 
@@ -102,7 +92,7 @@ class PSD2Model:
             else:
                 # waiting => track invasion in pclock
                 denom = local_growth[i] + MORTALITY_RATE
-                if abs(denom) > 1e-14:
+                if local_growth[i] >= 0: # implies denom > 0 
                     est_prob = local_growth[i] / denom
                 else:
                     est_prob = 0.0
@@ -116,13 +106,16 @@ class PSD2Model:
           event(2*i)   = local_growth[i]
           event(2*i+1) = pclock[i]
         """
-        y = self._ensure_flat_y(y)
+        y = self._ensure_flat_y(y) # looks rather expensive to call here
         logB = y[:self.S]
         pclock = y[self.S:2*self.S]
 
         B = np.exp(logB) * (~self.waiting)
         local_growth = self.r - self.C.dot(B)
 
+        ## This looks like it could be done more efficiently by
+        ## concatenating, but then other code could need to be changed
+        ## as well.
         gvals = []
         for i in range(self.S):
             gvals.append(local_growth[i])
@@ -131,7 +124,7 @@ class PSD2Model:
 
     def _handle_event_fn(self, t, y):
         """Event logic by sign changes in _event_fn."""
-        y = self._ensure_flat_y(y)
+        y = self._ensure_flat_y(y) # perhaps not needed?
         logB = y[:self.S].copy()
         pclock = y[self.S:2*self.S].copy()
 
@@ -139,6 +132,7 @@ class PSD2Model:
         current_sw = np.sign(vals)
 
         if self.last_sw is None:
+            sys.exit("This should not happen")
             self.last_sw = current_sw
             return y
 
@@ -151,7 +145,7 @@ class PSD2Model:
             i_species = idx // 2
             is_clock_event = (idx % 2 == 1)
             if not is_clock_event:
-                # local_growth crossing zero
+                # local_growth crogssing zero
                 if self.waiting[i_species] and local_growth[i_species] < 0:
                     self.waiting[i_species] = False
                     logB[i_species] = np.log(INV/10.0)

@@ -14,9 +14,14 @@ import numpy as np
 
 # To import configuration file:
 import argparse
-import importlib
+import config_utils
 
 from utils import setup_logging as setup_utils_logging
+import models_ibm
+import models_psd
+import models_psd2
+import models_ode
+import analysis
 from models_ibm import IBMModel
 from models_psd import PSDModel
 from models_psd2 import PSD2Model
@@ -70,32 +75,6 @@ setup_logging()
 logger = logging.getLogger(__name__)
 logger.info("Logging is set up. Debug logs will be stored in the 'logs' folder.")
 
-
-############################################################
-# Handling of configuration files 
-############################################################
-def load_config(config_file_path):
-    """
-    Loads a configuration from a .py file and assigns variables to the global scope.
-    """
-    try:
-        module_name = config_file_path[:-3] if config_file_path.endswith('.py') else config_file_path
-        module_name = module_name.replace("/", ".")  # Handle paths
-
-        config_module = importlib.import_module(module_name)
-
-        # Assign variables from the config module to the global scope
-        for name, value in config_module.__dict__.items():
-            if not name.startswith("__"):  # Avoid special attributes
-                globals()[name] = value
-
-        return True  # Indicate successful loading
-
-    except (ImportError, FileNotFoundError) as e:
-        print(f"Error loading config file: {e}")
-        return False
-
-
 ############################################################
 # Main Function
 ############################################################
@@ -110,15 +89,19 @@ def main():
                         help="Path to the configuration .py file.")
     args = parser.parse_args()
     config_path = args.config_file
-    config = load_config(config_path)
-    config_path = args.config_file
+    config_module = config_utils.load_config(config_path)
 
     # Load configuration file
-    if load_config(config_path):
+    if config_module:
         print(f"Read configuration file {config_path}")
     else:
         sys.exit("Could not read config file provided as parameter.")
 
+    config_utils.assign_all_config_variables(config_module, globals(),verbose=True)
+
+    # Configure also the following modules:
+    modules_to_configure = [models_ibm, models_psd, models_psd2, models_ode, analysis]
+    config_utils.configure_modules(config_module, modules_to_configure)
 
     # Define number of species (TARGET_RICHNESS)
     S = TARGET_RICHNESS
@@ -147,10 +130,7 @@ def main():
 
     # RUN PSD2 Model ( with extra diagnostic outputs)
     logger.info("Running PSD2 Model...")
-    #### Axel will look at PSD2 later, skipping this for now
-    logger.info("Axel will look at PSD2 later, skipping this for now")
-    psd2_model = PSD2Model(r=r, C=C, tmax=RECORDING_STEP_SIZE, record_step=RECORDING_STEP_SIZE, seed=RANDOM_SEED)
-    # psd2_model = PSD2Model(r=r, C=C, tmax=TMAX, record_step=RECORDING_STEP_SIZE, seed=RANDOM_SEED)
+    psd2_model = PSD2Model(r=r, C=C, tmax=TMAX, record_step=RECORDING_STEP_SIZE, seed=RANDOM_SEED)
     (psd2_times, psd2_trajectory, psd2_waiting,
      psd2_poisson_clock, psd2_growth_rate, psd2_invasion_rate, psd2_est_prob) = psd2_model.run()
 

@@ -7,15 +7,6 @@ PSD approach for population dynamics.
 """
 import numpy as np
 import logging
-from config import (
-    BODY_MASS,
-    INV,
-    MORTALITY_RATE,
-    STEP_SIZE,
-    TMAX,
-    N_RECORDS,
-    RECORDING_STEP_SIZE
-)
 
 logger = logging.getLogger(__name__)
 
