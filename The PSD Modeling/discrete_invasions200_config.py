@@ -32,14 +32,14 @@ TARGET_RICHNESS = 300
 #: Number of time steps for "relaxation" or "settling" in certain procedures
 T_RELAX = 300
 
+#: Recording step size
+RECORDING_STEP_SIZE = 1000  # e.g., 1000
+
 #: Max simulation time
-TMAX =  200000  # (like 200000 in R)
+TMAX =  200*RECORDING_STEP_SIZE  # (like 200000 in R)
 
 #: Step size per iteration in the simpler discrete loops
 STEP_SIZE = 1
-
-#: Recording step size
-RECORDING_STEP_SIZE = 1000  # e.g., 1000
 
 #: Number of records to keep
 N_RECORDS = TMAX // RECORDING_STEP_SIZE
