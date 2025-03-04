@@ -31,7 +31,9 @@ import plotly.graph_objects as go
 import matplotlib.pyplot as plt
 import logging
 
-from config import THRESHOLD, BODY_MASS, RECORDING_STEP_SIZE
+# To import configuration file:
+import argparse
+import config_utils
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -67,7 +69,9 @@ def load_model_data(filename="model_outputs.npz"):
         "ODE": data["ODE"]
     }
 
-def compute_alpha_diversity(trajectory, threshold=THRESHOLD):
+def compute_alpha_diversity(trajectory, threshold=None):
+    if threshold==None:
+        threshold = THRESHOLD
     return np.sum(trajectory > threshold, axis=1)
 
 def compute_turnover_rate(trajectory, recording_step):
@@ -375,6 +379,24 @@ def save_model_output(ibm_trajectory, psd_trajectory, psd2_trajectory, psd2_wait
 #############################
 
 def main():
+        # Parse command-line arguments. Currently only for loading config file.
+    parser = argparse.ArgumentParser(description="Run the script with a configuration file.")
+    parser.add_argument("config_file",
+                        default="config.py",
+                        nargs='?', # fall back to default if not present
+                        help="Path to the configuration .py file.")
+    args = parser.parse_args()
+    config_path = args.config_file
+    config_module = config_utils.load_config(config_path)
+
+    # Load configuration file
+    if config_module:
+        print(f"Read configuration file {config_path}")
+    else:
+        sys.exit("Could not read config file provided as parameter.")
+
+    config_utils.assign_all_config_variables(config_module, globals(),verbose=True)
+
     model_data = load_model_data("model_outputs.npz")
     interactive_total_biomass(model_data)
     animated_species_scatter(model_data, model_name="PSD2")
