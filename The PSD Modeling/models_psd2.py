@@ -118,7 +118,7 @@ class PSD2Model:
         local_growth = local_growth + np.diag(self.C) * B 
         return np.concatenate([local_growth, pclock])
 
-    def _handle_event_fn(self, solver, event_info): #(self, t, y):
+    def _handle_event_fn(self, solver, event_info):
         """Event logic by sign changes in _event_fn."""
         y = self._ensure_flat_y(solver.y) # perhaps not needed?
         logB = y[:self.S].copy()
@@ -209,11 +209,6 @@ class PSD2Model:
         # print("TESTING OK")
         # sys.exit()
         
-        # Chunk the integration to avoid huge steps
-        chunk_size = 2000
-        times = np.arange(0, self.tmax + chunk_size, chunk_size)
-        times = np.unique(np.clip(times, 0, self.tmax))
-
         # Recording times (for output snapshots)
         record_times = np.arange(0, self.tmax + self.record_step, self.record_step)
         record_times = np.unique(np.clip(record_times, 0, self.tmax))
