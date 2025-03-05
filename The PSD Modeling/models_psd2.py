@@ -16,6 +16,10 @@ from assimulo.problem import Explicit_Problem
 
 logger = logging.getLogger(__name__)
 
+variant_with_background_fluxes = True
+
+variant_with_P_to_D_transitions = True
+
 class PSD2Model:
     def __init__(self, r, C, tmax=None, record_step=None, seed=123):
         np.random.seed(seed)
@@ -80,16 +84,23 @@ class PSD2Model:
         logB = y[:self.S]
         pclock = y[self.S:2*self.S]
 
-        B = np.exp(logB) * np.invert(sw)
+        B = np.exp(logB) * (1 if variant_with_background_fluxes else np.invert(sw))
         local_growth = self.r - self.C.dot(B)
 
         dlogB = np.zeros(self.S)
         dpclock = np.zeros(self.S) ## Should not be needed
 
         for i in range(self.S):
-            if not sw[i]:
-                # Non-waiting => normal logB derivative
-                dlogB[i] = local_growth[i] + np.exp(np.log(INV) - logB[i])
+            if not variant_with_background_fluxes:
+                if not sw[i]:
+                    # Non-waiting => normal logB derivative
+                    dlogB[i] = local_growth[i] + np.exp(np.log(INV) - logB[i])
+            else:
+                if not sw[i]:
+                    dlogB[i] = local_growth[i] + INV/B[i]
+                else:
+                    dlogB[i] = -local_growth[i] - 2*self.C[i,i]*B[i] + INV/B[i]
+
             # Run pclock even if not waiting, so that waiting <-> pclock < 0
             non_self_growth = local_growth[i] + B[i]*self.C[i,i]
             denom = non_self_growth + MORTALITY_RATE
@@ -111,7 +122,7 @@ class PSD2Model:
         logB = y[:self.S]
         pclock = y[self.S:2*self.S]
 
-        B = np.exp(logB) * np.invert(sw)
+        B = np.exp(logB) * (1 if variant_with_background_fluxes else np.invert(sw))
         local_growth = self.r - self.C.dot(B)
 
         # Remove effect of intraspecific competition
@@ -131,7 +142,7 @@ class PSD2Model:
         state_info = event_info[0]
         changed = np.nonzero(state_info)[0]
 
-        B = np.exp(logB) * np.invert(solver.sw)
+        B = np.exp(logB) * (1 if variant_with_background_fluxes else np.invert(sw))
         local_growth = self.r - self.C.dot(B)
         
         # Remove effect of intraspecific competition
@@ -146,13 +157,35 @@ class PSD2Model:
                     else:
                         print(f"{i_species} S ({local_growth[i_species]}) -> P at {solver.t}")
                         solver.sw[i_species] = False
-                        solver.y[i_species] = np.log(INV/100.0)
-                        solver.y[i_species+self.S] = 1
+                        if not variant_with_background_fluxes:
+                            solver.y[i_species] = np.log(INV/100.0)
+                        solver.y[i_species+self.S] = 1 # make pclock > 0 if not waiting
                 elif state_info[idx] == +1:  # species was not waiting, goes to waiting
-                    print(f"{i_species} P ({local_growth[i_species]}) -> S at {solver.t}")
-                    solver.sw[i_species] = True
-                    solver.y[i_species+self.S] = np.log(np.random.rand())
-                    solver.y[i_species] = np.log(INV/100.0) ## should not be needed
+                    if not variant_with_P_to_D_transitions:
+                        transition_to_S = True
+                    else:
+                        # Compute rate of change of intrinsic growth rate of i_species
+                        sw_fixed = solver.sw
+                        sw_fixed[i_species] = True
+                        yd = self._derivatives(solver.t,solver.y,sw_fixed)
+                        c = -sum(self.C[i_species,:]*B*yd[0:self.S])
+                        print(f"c = {c}")
+                        if c <= 0:
+                            print(f"Sweep {c} is not positive!")
+                            transition_to_S = True
+                        else:
+                            prob_to_S = np.exp(-B[i_species]/(BODY_MASS*(1+np.sqrt(np.pi/(2*c))*MORTALITY_RATE)))
+                            print(f"prob_to_S = {prob_to_S}")
+                            transition_to_S = (np.random.rand(1) <= prob_to_S)
+                        if not transition_to_S:
+                            print(f"{i_species} P ({local_growth[i_species]}) -> D at {solver.t}")
+                            solver.y[i_species] = min(0,solver.y[i_species] - np.log(1-prob_to_S))
+                    if transition_to_S:
+                        print(f"{i_species} P ({local_growth[i_species]}) -> S at {solver.t}")
+                        solver.sw[i_species] = True
+                        solver.y[i_species+self.S] = np.log(np.random.rand())
+                        if not variant_with_background_fluxes:
+                            solver.y[i_species] = np.log(INV/100.0)
                 else:
                     print(f"{i_species} D -> P at {solver.t}")
             else: # event with pclock crossing zero => establishment
@@ -223,7 +256,7 @@ class PSD2Model:
         for step in range(recSteps.shape[0]):
             pclock = y[recSteps[step],self.S:(2*self.S)]
             waiting = pclock < 0
-            B = np.exp(y[recSteps[step],0:self.S]) * np.invert(waiting)
+            B = np.exp(y[recSteps[step],0:self.S]) * (1 if variant_with_background_fluxes else np.invert(waiting))
             self.trajectory[step, :] = B
             self.wait_trajectory[step, :] = waiting
             rec_time = t[recSteps[step]]
