@@ -16,9 +16,6 @@ from assimulo.problem import Explicit_Problem
 
 logger = logging.getLogger(__name__)
 
-def dummy_derivatives(t, y, sw):
-    return(y)
-
 class PSD2Model:
     def __init__(self, r, C, tmax=None, record_step=None, seed=123):
         np.random.seed(seed)
