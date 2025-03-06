@@ -167,7 +167,7 @@ class PSD2Model:
                         transition_to_S = True
                     else:
                         # Compute rate of change of intrinsic growth rate of i_species
-                        sw_fixed = solver.sw
+                        sw_fixed = solver.sw.copy()
                         sw_fixed[i_species] = True
                         yd = self._derivatives(solver.t,solver.y,sw_fixed)
                         c = -sum(self.C[i_species,:]*B*yd[0:self.S])
