@@ -80,35 +80,37 @@ class PSD2Model:
         return flat
 
     def _derivatives(self, t, y, sw):
-        y = self._ensure_flat_y(y) # looks rather expensive to call here
+        #y = self._ensure_flat_y(y) # looks rather expensive to call here
         logB = y[:self.S]
-        pclock = y[self.S:2*self.S]
 
         B = np.exp(logB) * (1 if variant_with_background_fluxes else np.invert(sw))
         local_growth = self.r - self.C.dot(B)
 
-        dlogB = np.zeros(self.S)
-        dpclock = np.zeros(self.S) ## Should not be needed
-
-        for i in range(self.S):
-            if not variant_with_background_fluxes:
+        if not variant_with_background_fluxes:
+            dlogB = np.zeros(self.S)
+            #dpclock = np.zeros(self.S) ## Should not be needed
+            for i in range(self.S):
                 if not sw[i]:
                     # Non-waiting => normal logB derivative
                     dlogB[i] = local_growth[i] + np.exp(np.log(INV) - logB[i])
-            else:
-                if not sw[i]:
-                    dlogB[i] = local_growth[i] + INV/B[i]
-                else:
-                    dlogB[i] = -local_growth[i] - 2*self.C[i,i]*B[i] + INV/B[i]
 
-            # Run pclock even if not waiting, so that waiting <-> pclock < 0
-            non_self_growth = local_growth[i] + B[i]*self.C[i,i]
+                # Run pclock even if not waiting, so that waiting <-> pclock < 0
+                non_self_growth = local_growth[i] + B[i]*self.C[i,i]
+                denom = non_self_growth + MORTALITY_RATE
+                if non_self_growth >= 0: # implies denom > 0 
+                    est_prob = non_self_growth / denom
+                else:
+                    est_prob = 0.0
+                dpclock[i] = INV * est_prob / BODY_MASS
+        else: # variant_with_background_fluxes
+            diagB = np.diag(self.C)*B
+            dlogB = local_growth + INV/B - 2*np.array(sw)*(local_growth+diagB)
+            non_self_growth = local_growth + diagB
+            non_self_growth[non_self_growth < 0] = 0
             denom = non_self_growth + MORTALITY_RATE
-            if non_self_growth >= 0: # implies denom > 0 
-                est_prob = non_self_growth / denom
-            else:
-                est_prob = 0.0
-            dpclock[i] = INV * est_prob / BODY_MASS
+            est_prob = non_self_growth / denom
+            dpclock  =  est_prob * (INV / BODY_MASS)
+
         
         return np.concatenate([dlogB, dpclock])
 
@@ -118,7 +120,7 @@ class PSD2Model:
           event(2*i)   = local_growth[i]
           event(2*i+1) = pclock[i]
         """
-        y = self._ensure_flat_y(y) # looks rather expensive to call here
+        #y = self._ensure_flat_y(y) # looks rather expensive to call here
         logB = y[:self.S]
         pclock = y[self.S:2*self.S]
 
@@ -131,7 +133,7 @@ class PSD2Model:
 
     def _handle_event_fn(self, solver, event_info): #(self, t, y):
         """Event logic by sign changes in _event_fn."""
-        y = self._ensure_flat_y(solver.y) # perhaps not needed?
+        y = solver.y # self._ensure_flat_y(solver.y)
         logB = y[:self.S].copy()
         pclock = y[self.S:2*self.S].copy()
 
@@ -226,14 +228,14 @@ class PSD2Model:
         solver.iter = 'Newton'
         # For large S, "Dense" can be huge. Use "SPGMR" for an iterative approach.
         solver.linear_solver = 'SPGMR'
-        solver.rtol = 1e-5  # Looser tolerance for big system
-        solver.atol = 1e-4
+        solver.rtol = 0  # Looser tolerance for big system
+        solver.atol = 1e-3
 
-        solver.options['hmin'] = 1e-4
-        solver.options['maxh'] = 1000
-        solver.options['root_tol'] = 1e-1
+        solver.options['hmin'] = 1e-2
+        solver.options['maxh'] = 10000
+        solver.options['root_tol'] = 1e0
         solver.options["mxhnil"] = 5
-        solver.options['maxsteps'] = 300
+        solver.options['maxsteps'] = 3000
 
         # #### TESTING ####
         # self._derivatives(0, y0, solver.sw)
