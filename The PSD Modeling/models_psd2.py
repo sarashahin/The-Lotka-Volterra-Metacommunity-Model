@@ -11,7 +11,7 @@ and more frequent logging to avoid silent long steps that risk OS kills.
 import sys
 import numpy as np
 import logging
-from assimulo.solvers import CVode
+from assimulo.solvers import CVode, ExplicitEuler
 from assimulo.problem import Explicit_Problem
 
 logger = logging.getLogger(__name__)
@@ -80,6 +80,8 @@ class PSD2Model:
         return flat
 
     def _derivatives(self, t, y, sw):
+        if t > 11.026398380734092:
+            print(["deriv", t, y[36], y[336], sw[36]])
         #y = self._ensure_flat_y(y) # looks rather expensive to call here
         logB = y[:self.S]
 
@@ -111,7 +113,8 @@ class PSD2Model:
             est_prob = non_self_growth / denom
             dpclock  =  est_prob * (INV / BODY_MASS)
 
-        
+        if t > 11.026398380734092:
+            print([dlogB[36], dpclock[36]])
         return np.concatenate([dlogB, dpclock])
 
     def _event_fn(self, t, y, sw):
@@ -120,15 +123,23 @@ class PSD2Model:
           event(2*i)   = local_growth[i]
           event(2*i+1) = pclock[i]
         """
+        if t > 11.026398380734092:
+            print(["event_fn", t, y[36], y[336], sw[36]])
         #y = self._ensure_flat_y(y) # looks rather expensive to call here
         logB = y[:self.S]
         pclock = y[self.S:2*self.S]
 
         B = np.exp(logB) * (1 if variant_with_background_fluxes else np.invert(sw))
-        local_growth = self.r - self.C.dot(B)
+        C = self.C.copy()
+        np.fill_diagonal(C, 0)
+        local_growth = self.r - C.dot(B)
+        if t > 11.026398380734092:
+            print([local_growth[36], pclock[36]])
 
         # Remove effect of intraspecific competition
-        local_growth = local_growth + np.diag(self.C) * B 
+#        local_growth = local_growth + np.diag(self.C) * B
+        if t > 11.026398380734092:
+            print([local_growth[36], pclock[36]])
         return np.concatenate([local_growth, pclock])
 
     def _handle_event_fn(self, solver, event_info): #(self, t, y):
@@ -143,6 +154,8 @@ class PSD2Model:
         # respective component.
         state_info = event_info[0]
         changed = np.nonzero(state_info)[0]
+        if solver.t > 11.026398380734092:
+            print(["event_hd", solver.t, solver.y[36], solver.y[336], solver.sw[36], state_info[36],state_info[336]])
 
         B = np.exp(logB) * (1 if variant_with_background_fluxes else np.invert(sw))
         local_growth = self.r - self.C.dot(B)
@@ -168,20 +181,24 @@ class PSD2Model:
                     else:
                         # Compute rate of change c of intrinsic growth rate of i_species
                         sw_fixed = solver.sw.copy()
-                        sw_fixed[i_species] = True
+                        #sw_fixed[i_species] = True
                         yd = self._derivatives(solver.t,solver.y,sw_fixed)
-                        c = -sum(self.C[i_species,:]*B*yd[0:self.S])
+                        yd[i_species] = 0 # Remove effect of intraspecific competition
+                        # if solver.t > 11.026398380734092:
+                        #     print(np.sort(self.C[i_species,:]*B*yd[:self.S]))
+ 
+                        c = -sum(self.C[i_species,:]*B*yd[:self.S])
                         print(f"c = {c}")
                         if c <= 0:
-                            print(f"Sweep {c} is not positive!")
-                            transition_to_S = True
+                            print(f"{i_species} Sweep {c} is not positive!")
+                            transition_to_S = False
                         else:
                             prob_to_S = np.exp(-B[i_species]/(BODY_MASS*(1+np.sqrt(np.pi/(2*c))*MORTALITY_RATE)))
                             print(f"prob_to_S = {prob_to_S}")
                             transition_to_S = (np.random.rand(1) <= prob_to_S)
-                        if not transition_to_S:
-                            print(f"{i_species} P ({local_growth[i_species]}) -> D at {solver.t}")
-                            solver.y[i_species] = min(0,solver.y[i_species] - np.log(1-prob_to_S))
+                            if not transition_to_S:
+                                print(f"{i_species} P ({local_growth[i_species]}) -> D at {solver.t}")
+                                solver.y[i_species] = min(0,solver.y[i_species] - np.log(1-prob_to_S))
                     if transition_to_S:
                         print(f"{i_species} P ({local_growth[i_species]}) -> S at {solver.t}")
                         solver.sw[i_species] = True
@@ -222,20 +239,28 @@ class PSD2Model:
         problem.handle_event = self._handle_event_fn
         problem.number_of_state_events = 2*self.S
 
-        # Solver configuration
-        solver = CVode(problem)
-        solver.discr = 'BDF'
-        solver.iter = 'Newton'
-        # For large S, "Dense" can be huge. Use "SPGMR" for an iterative approach.
-        solver.linear_solver = 'SPGMR'
-        solver.rtol = 0  # Looser tolerance for big system
-        solver.atol = 1e-3
-
-        solver.options['hmin'] = 1e-2
-        solver.options['maxh'] = 10000
-        solver.options['root_tol'] = 1e0
-        solver.options["mxhnil"] = 5
-        solver.options['maxsteps'] = 3000
+        if True:
+            # Solver configuration
+            solver = CVode(problem)
+            solver.discr = 'BDF'
+            solver.iter = 'Newton'
+            # For large S, "Dense" can be huge. Use "SPGMR" for an iterative approach.
+            solver.linear_solver = 'SPGMR'
+            solver.rtol = 0  # Looser tolerance for big system
+            solver.atol = 1e-3
+            
+            solver.options['hmin'] = 1e-2
+            solver.options['maxh'] = 10000
+            solver.options['root_tol'] = 1e-2
+            solver.options["mxhnil"] = 5
+            solver.options['maxsteps'] = 3000
+        else:
+            solver = ExplicitEuler(problem)
+            solver.options['h'] = 1e-2
+            solver.options['root_tol'] = 1e0
+            solver.options["mxhnil"] = 5
+            solver.options['maxsteps'] = 3000
+            
 
         # #### TESTING ####
         # self._derivatives(0, y0, solver.sw)
@@ -263,7 +288,7 @@ class PSD2Model:
         for step in range(recSteps.shape[0]):
             pclock = y[recSteps[step],self.S:(2*self.S)]
             waiting = pclock < 0
-            B = np.exp(y[recSteps[step],0:self.S]) * (1 if variant_with_background_fluxes else np.invert(waiting))
+            B = np.exp(y[recSteps[step],:self.S]) * (1 if variant_with_background_fluxes else np.invert(waiting))
             self.trajectory[step, :] = B
             self.wait_trajectory[step, :] = waiting
             rec_time = t[recSteps[step]]

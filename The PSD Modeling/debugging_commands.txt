@@ -1,0 +1,8 @@
+python main.py discrete_invasions200_config.py 2>/dev/null | tee log.txt; for i in $(seq 1 300);do echo '##### ' $i ; grep "^${i} " log.txt;done| tee transitions.txt
+
+
+
+(python main.py discrete_invasions200_config.py| grep -A 1 event_fn | awk '/event_fn/ {t=$2+0} /^[[][^'"'"']/{print t,substr($1,2)+0}' ) 2> error.log > tmp.dat
+
+# --> then study tmp.dat in R
+

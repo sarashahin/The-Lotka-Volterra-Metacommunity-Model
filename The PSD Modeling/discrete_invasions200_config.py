@@ -15,7 +15,7 @@ import numpy as np
 BODY_MASS = 1e-4
 
 # Invasion rate
-INV = 1e-10
+INV = 1e-10 * 1e6
 
 # Mortality rate (for large negative growth offsets)
 MORTALITY_RATE = 0.2
@@ -33,7 +33,7 @@ TARGET_RICHNESS = 300
 T_RELAX = 300
 
 #: Recording step size
-RECORDING_STEP_SIZE = 1000  # e.g., 1000
+RECORDING_STEP_SIZE = 1  # e.g., 1000
 
 #: Max simulation time
 TMAX =  200*RECORDING_STEP_SIZE  # (like 200000 in R)
