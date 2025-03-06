@@ -11,7 +11,7 @@ and more frequent logging to avoid silent long steps that risk OS kills.
 import sys
 import numpy as np
 import logging
-from assimulo.solvers import CVode
+from assimulo.solvers import CVode, ExplicitEuler
 from assimulo.problem import Explicit_Problem
 
 logger = logging.getLogger(__name__)
@@ -168,12 +168,13 @@ class PSD2Model:
                     else:
                         # Compute rate of change c of intrinsic growth rate of i_species
                         sw_fixed = solver.sw.copy()
-                        sw_fixed[i_species] = True
+                        #sw_fixed[i_species] = True
                         yd = self._derivatives(solver.t,solver.y,sw_fixed)
-                        c = -sum(self.C[i_species,:]*B*yd[0:self.S])
+                        yd[i_species] = 0 # Remove effect of intraspecific competition
+                        c = -sum(self.C[i_species,:]*B*yd[:self.S])
                         print(f"c = {c}")
                         if c <= 0:
-                            print(f"Sweep {c} is not positive!")
+                            print(f"{i_species} Sweep {c} is not positive!")
                             transition_to_S = True
                         else:
                             prob_to_S = np.exp(-B[i_species]/(BODY_MASS*(1+np.sqrt(np.pi/(2*c))*MORTALITY_RATE)))
@@ -222,20 +223,31 @@ class PSD2Model:
         problem.handle_event = self._handle_event_fn
         problem.number_of_state_events = 2*self.S
 
-        # Solver configuration
-        solver = CVode(problem)
-        solver.discr = 'BDF'
-        solver.iter = 'Newton'
-        # For large S, "Dense" can be huge. Use "SPGMR" for an iterative approach.
-        solver.linear_solver = 'SPGMR'
-        solver.rtol = 0  # Looser tolerance for big system
-        solver.atol = 1e-3
-
-        solver.options['hmin'] = 1e-2
-        solver.options['maxh'] = 10000
-        solver.options['root_tol'] = 1e0
-        solver.options["mxhnil"] = 5
-        solver.options['maxsteps'] = 3000
+        if True:
+            # Solver configuration
+            solver = CVode(problem)
+            solver.discr = 'BDF'
+            solver.iter = 'Newton'
+            # For large S, "Dense" can be huge. Use "SPGMR" for an iterative approach.
+            solver.linear_solver = 'SPGMR'
+            solver.rtol = 0  # Looser tolerance for big system
+            solver.atol = 1e-3
+            
+            solver.options['hmin'] = 1e-2
+            solver.options['maxh'] = 10000
+            solver.options['root_tol'] = 1e-2
+            solver.options["mxhnil"] = 5
+            solver.options['maxsteps'] = 3000
+            solver.options['store_event_points'] = False
+            solver.store_event_points = False
+        else:
+            solver = ExplicitEuler(problem)
+            solver.options['h'] = 1
+            solver.options['root_tol'] = 1e0
+            solver.options["mxhnil"] = 5
+            solver.options['maxsteps'] = 3000
+            solver.store_event_points = False
+            
 
         # #### TESTING ####
         # self._derivatives(0, y0, solver.sw)
@@ -256,17 +268,14 @@ class PSD2Model:
         # Run the simulation
         t, y = solver(self.tmax, record_times.shape[0]-1)
 
-        recSteps = np.where(np.remainder(t,self.record_step) == 0)[0]
-        if recSteps.shape[0] != record_times.shape[0]:
-            sys.exit("Could not localise recording time steps after simulation.")
-
-        for step in range(recSteps.shape[0]):
-            pclock = y[recSteps[step],self.S:(2*self.S)]
+        for step in range(record_times.shape[0]):
+            recStep = np.argmin(np.abs(t - record_times[step]))
+            pclock = y[recStep,self.S:(2*self.S)]
             waiting = pclock < 0
-            B = np.exp(y[recSteps[step],0:self.S]) * (1 if variant_with_background_fluxes else np.invert(waiting))
+            B = np.exp(y[recStep,:self.S]) * (1 if variant_with_background_fluxes else np.invert(waiting))
             self.trajectory[step, :] = B
             self.wait_trajectory[step, :] = waiting
-            rec_time = t[recSteps[step]]
+            rec_time = t[recStep]
             self.time_points[step] = rec_time
             # Compute extra diagnostics at t = 0
             growth = self.r - self.C.dot(B)

@@ -25,7 +25,7 @@ import analysis
 from models_ibm import IBMModel
 from models_psd import PSDModel
 from models_psd2 import PSD2Model
-from models_ode import ODEModel
+
 from analysis import (
     alpha_diversity,
     turnover_rate,
@@ -100,7 +100,7 @@ def main():
     config_utils.assign_all_config_variables(config_module, globals(),verbose=True)
 
     # Configure also the following modules:
-    modules_to_configure = [models_ibm, models_psd, models_psd2, models_ode, analysis]
+    modules_to_configure = [models_ibm, models_psd, models_psd2, analysis]
     config_utils.configure_modules(config_module, modules_to_configure)
 
     # Define number of species (TARGET_RICHNESS)
@@ -134,53 +134,49 @@ def main():
     (psd2_times, psd2_trajectory, psd2_waiting,
      psd2_poisson_clock, psd2_growth_rate, psd2_invasion_rate, psd2_est_prob) = psd2_model.run()
 
-    # RUN ODE Model
-    logger.info("Running ODE Model...")
-    ode_model = ODEModel(r=r, C=C, tmax=TMAX, record_step=RECORDING_STEP_SIZE, seed=RANDOM_SEED)
-    ode_times, ode_trajectory = ode_model.run()
-
     # Basic analysis and plotting
     logger.info("Generating basic analysis plots...")
 
     plot_trajectories(
-        trajectories=[ibm_trajectory, psd_trajectory, psd2_trajectory, ode_trajectory],
-        labels=["IBM", "PSD", "PSD2", "ODE"],
+        trajectories=[ibm_trajectory, psd_trajectory, psd2_trajectory],
+        labels=["IBM", "PSD", "PSD2"],
         title="Population Dynamics",
         filename_base="Trajectory.png"
     )
 
     plot_total_biomasses(
-        trajectories=[ibm_trajectory, psd_trajectory, psd2_trajectory, ode_trajectory],
-        labels=["IBM", "PSD", "PSD2", "ODE"],
+        trajectories=[ibm_trajectory, psd_trajectory, psd2_trajectory],
+        labels=["IBM", "PSD", "PSD2"],
         title="Population Dynamics: Total Biomass Comparison",
         filename="All_Models_Trajectory.png"
     )
 
     histogram_biomass(
-        trajectories=[ibm_trajectory, psd_trajectory, psd2_trajectory, ode_trajectory],
-        labels=["IBM", "PSD", "PSD2", "ODE"],
+        trajectories=[ibm_trajectory, psd_trajectory, psd2_trajectory],
+        labels=["IBM", "PSD", "PSD2"],
         filename="Biomass_Distribution_Histogram.png"
     )
 
     ibm_turnover = turnover_rate(ibm_trajectory, RECORDING_STEP_SIZE)
     psd_turnover = turnover_rate(psd_trajectory, RECORDING_STEP_SIZE)
     psd2_turnover = turnover_rate(psd2_trajectory, RECORDING_STEP_SIZE)
-    ode_turnover = turnover_rate(ode_trajectory, RECORDING_STEP_SIZE)
 
     ibm_alpha = alpha_diversity(ibm_trajectory)
     psd_alpha = alpha_diversity(psd_trajectory)
     psd2_alpha = alpha_diversity(psd2_trajectory)
-    ode_alpha = alpha_diversity(ode_trajectory)
 
     logger.info("Alpha diversity medians:")
-    logger.info(f"IBM: {np.median(ibm_alpha)}, PSD: {np.median(psd_alpha)}, PSD2: {np.median(psd2_alpha)}, ODE: {np.median(ode_alpha)}")
+    logger.info(f"IBM: {np.median(ibm_alpha)}, PSD: {np.median(psd_alpha)}, PSD2: {np.median(psd2_alpha)}")
     logger.info("Mean+SE alpha (blockwise average, n=50) for IBM:")
+    logger.info(mean_se(ibm_alpha))
+    logger.info("Mean+SE alpha (blockwise average, n=50) for PSD:")
     logger.info(mean_se(psd_alpha))
+    logger.info("Mean+SE alpha (blockwise average, n=50) for PSD2:")
+    logger.info(mean_se(psd2_alpha))
 
     covariance_matrix_plot(ibm_trajectory, "IBM Cov Matrix", "IBM_CovMatrix.png")
     covariance_matrix_plot(psd_trajectory, "PSD Cov Matrix", "PSD_CovMatrix.png")
     covariance_matrix_plot(psd2_trajectory, "PSD2 Cov Matrix", "PSD2_CovMatrix.png")
-    covariance_matrix_plot(ode_trajectory, "ODE Cov Matrix", "ODE_CovMatrix.png")
 
     # Save outputs for advanced visualization including PSD2 diagnostics
     save_model_output(
@@ -192,7 +188,7 @@ def main():
         psd2_growth_rate,
         psd2_invasion_rate,
         psd2_est_prob,
-        ode_trajectory
+        ibm_trajectory ## dummy, so we don't have to change extended analysis 
     )
     logger.info("All done. Model outputs saved to 'model_outputs.npz' for advanced usage.")
 
