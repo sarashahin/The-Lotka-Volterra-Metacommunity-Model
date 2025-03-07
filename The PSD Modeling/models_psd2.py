@@ -106,6 +106,7 @@ class PSD2Model:
             diagB = np.diag(self.C)*B
             dlogB = local_growth + INV/B - 2*np.array(sw)*(local_growth+diagB)
             non_self_growth = local_growth + diagB
+            non_self_growth[np.invert(sw)] = 0
             non_self_growth[non_self_growth < 0] = 0
             denom = non_self_growth + MORTALITY_RATE
             est_prob = non_self_growth / denom
@@ -175,6 +176,7 @@ class PSD2Model:
                         print(f"c = {c}")
                         if c <= 0:
                             print(f"{i_species} Sweep {c} is not positive!")
+                            print(f"Try reducing 'inith' parameter.")
                             transition_to_S = True
                         else:
                             prob_to_S = np.exp(-B[i_species]/(BODY_MASS*(1+np.sqrt(np.pi/(2*c))*MORTALITY_RATE)))
@@ -208,6 +210,7 @@ class PSD2Model:
                         solver.y[i_species] = 0.0
                     else:
                         solver.y[i_species] = np.log(val)
+                    solver.y[i_species + self.S] = 1 ## pclock unused
                     solver.sw[i_species] = False
         
     def run(self):
@@ -232,14 +235,12 @@ class PSD2Model:
             solver.linear_solver = 'SPGMR'
             solver.rtol = 0  # Looser tolerance for big system
             solver.atol = 1e-3
-            
-            solver.options['hmin'] = 1e-2
-            solver.options['maxh'] = 10000
-            solver.options['root_tol'] = 1e-2
-            solver.options["mxhnil"] = 5
-            solver.options['maxsteps'] = 3000
-            solver.options['store_event_points'] = False
+            solver.inith = 1e-7 # large values cause repeat evaluation of conditions
+            solver.maxh = 1e10
             solver.store_event_points = False
+            solver.options["mxhnil"] = 5
+            solver.options['maxsteps'] = 10000
+            solver.options['verbosity'] = 30 # QUIET = 50 WHISPER = 40 NORMAL = 30 LOUD = 20 SCREAM = 10
         else:
             solver = ExplicitEuler(problem)
             solver.options['h'] = 1
