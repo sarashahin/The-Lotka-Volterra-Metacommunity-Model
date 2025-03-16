@@ -79,7 +79,16 @@ class PSDMultiPatchModel:
             
             # Vectorized stopping waiting species update
             stopped_waiting = ~self.waiting & was_waiting
-            self.logB = np.where(stopped_waiting, np.log(INV * STEP_SIZE / 2), self.logB)
+            # Debugging print statements to inspect values
+            # print("BODY_MASS:", BODY_MASS)
+            # print("self.poisson_clock:", self.poisson_clock)
+            # print("est_prob:", est_prob)
+            
+            # Ensure values positive before taking the log
+            safe_values = np.maximum(BODY_MASS * np.ceil(-self.poisson_clock) / est_prob, 1e-10)
+            # print("safe_values:", safe_values)
+
+            self.logB = np.where(new_established, np.log(safe_values), self.logB)
             
             dB = local_growth + np.exp(np.log(INV) - self.logB)
             dB[self.waiting] = 0
