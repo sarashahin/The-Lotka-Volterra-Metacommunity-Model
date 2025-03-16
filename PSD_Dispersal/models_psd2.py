@@ -19,7 +19,7 @@ import numpy as np
 import logging
 from config import (BODY_MASS, INV, MORTALITY_RATE, TMAX, RECORDING_STEP_SIZE,
                     RTOL, ATOL, MAX_STEPS, NUM_PATCHES_X, NUM_PATCHES_Y, QUANTUM_DISPERSAL)
-from dispersal import compute_spatial_flux  # Assumed to be implemented correctly
+from dispersal import compute_spatial_flux
 from assimulo.solvers import CVode
 from assimulo.problem import Explicit_Problem
 
@@ -127,7 +127,7 @@ class PSD2MultiPatchModel:
         total = NUM_PATCHES_Y * NUM_PATCHES_X * self.S
         y0 = np.concatenate([self.logB.flatten(), self.poisson_clock.flatten()])
         
-        # Set up the Assimulo problem.
+        # Set up the Assimulo problem
         problem = Explicit_Problem(self._derivatives, y0, t0=0.0, sw0=self.waiting.flatten())
         problem.name = 'PSD2 Multi-patch Problem'
         
@@ -135,10 +135,8 @@ class PSD2MultiPatchModel:
         solver.discr = 'BDF'
         solver.iter = 'Newton'
         solver.linear_solver = 'SPGMR'
-        # >>> Use configured tolerances rather than rtol = 0.
         solver.rtol = RTOL
         solver.atol = ATOL
-        # <<<
         solver.options['hmin'] = 1e-2
         solver.options['maxh'] = 10000
         solver.options['root_tol'] = 1e0
@@ -153,34 +151,24 @@ class PSD2MultiPatchModel:
         if recIdx.shape[0] != record_times.shape[0]:
             raise RuntimeError("Recording time steps do not match.")
         
-        # For each recording time, extract the state and compute diagnostics.
+        # For each recording time, extract the state and compute diagnostics
         for idx, rec in enumerate(recIdx):
             state = y[rec, :]
             logB_rec = state[:total].reshape(NUM_PATCHES_Y, NUM_PATCHES_X, self.S)
-            # Deduce waiting from dpclock sign (here we assume waiting remains False).
             waiting_rec = state[total:2*total].reshape(NUM_PATCHES_Y, NUM_PATCHES_X, self.S) < 0
             self.trajectory[idx, :, :, :] = logB_rec
             self.wait_trajectory[idx, :, :, :] = waiting_rec
             self.time_points[idx] = t[rec]
             
-            # Compute diagnostics:
+            # Compute diagnostics using vectorized operations
             B_rec = np.exp(logB_rec)
             flux = compute_spatial_flux(B_rec)
             self.dispersal_flux_traj[idx, :, :, :] = flux
             
-            growth_rate = np.zeros_like(B_rec)
-            invasion_rate = np.zeros_like(B_rec)
-            est_prob = np.zeros_like(B_rec)
-            for i in range(NUM_PATCHES_Y):
-                for j in range(NUM_PATCHES_X):
-                    local_growth = self.r_field[i, j, :] - self.C.dot(B_rec[i, j, :])
-                    growth_rate[i, j, :] = local_growth
-                    invasion_rate[i, j, :] = INV * np.exp(-logB_rec[i, j, :])
-                    est_prob[i, j, :] = np.where(local_growth > 0,
-                                                 local_growth / (local_growth + MORTALITY_RATE),
-                                                 0)
-            self.growth_rate_traj[idx, :, :, :] = growth_rate
-            self.invasion_rate_traj[idx, :, :, :] = invasion_rate
+            local_growth = self.r_field - np.einsum('ijk,lk->ijl', B_rec, self.C)
+            self.growth_rate_traj[idx, :, :, :] = local_growth
+            self.invasion_rate_traj[idx, :, :, :] = INV * np.exp(-logB_rec)
+            est_prob = np.where(local_growth > 0, local_growth / (local_growth + MORTALITY_RATE), 0)
             self.establishment_prob_traj[idx, :, :, :] = est_prob
             self.poisson_clock_traj[idx, :, :, :] = state[total:2*total].reshape(NUM_PATCHES_Y, NUM_PATCHES_X, self.S)
             
