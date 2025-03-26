@@ -13,6 +13,7 @@ import numpy as np
 import logging
 from assimulo.solvers import CVode, ExplicitEuler
 from assimulo.problem import Explicit_Problem
+from euler_simple import EulerSimple
 
 logger = logging.getLogger(__name__)
 
@@ -202,16 +203,15 @@ class PSD2Model:
                     denom = local_growth[i_species] + MORTALITY_RATE
                     if local_growth[i_species] >= 0: # implies denom > 0 
                         est_prob = local_growth[i_species] / denom
+                        val = BODY_MASS / est_prob if est_prob > 0 else BODY_MASS
+                        if val > 1: ## avoid values that are too large
+                            solver.y[i_species] = 0.0
+                        else:
+                            solver.y[i_species] = np.log(val)
+                        solver.y[i_species + self.S] = 1 ## pclock unused
+                        solver.sw[i_species] = False
                     else:
                         print("Local growth negative when pclock triggered!")
-                        sys.exit()
-                    val = BODY_MASS / est_prob if est_prob > 0 else BODY_MASS
-                    if val > 1: ## avoid values that are too large
-                        solver.y[i_species] = 0.0
-                    else:
-                        solver.y[i_species] = np.log(val)
-                    solver.y[i_species + self.S] = 1 ## pclock unused
-                    solver.sw[i_species] = False
         
     def run(self):
         logger.info("Starting PSD2 simulation with Assimulo...")
@@ -242,11 +242,9 @@ class PSD2Model:
             solver.options['maxsteps'] = 10000
             solver.options['verbosity'] = 30 # QUIET = 50 WHISPER = 40 NORMAL = 30 LOUD = 20 SCREAM = 10
         else:
-            solver = ExplicitEuler(problem)
-            solver.options['h'] = 1
-            solver.options['root_tol'] = 1e0
-            solver.options["mxhnil"] = 5
-            solver.options['maxsteps'] = 3000
+            solver = EulerSimple(problem)
+            solver.options['inith'] = 1
+            solver.options['maxsteps'] = 10000000
             solver.store_event_points = False
             
 
