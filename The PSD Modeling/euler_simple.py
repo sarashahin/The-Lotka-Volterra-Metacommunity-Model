@@ -55,6 +55,9 @@ class EulerSimple(Explicit_ODE):
         self.statistics.reset()
             
     def set_problem_data(self): 
+        def f(t, y): 
+            return self.problem.rhs(t, y, self.sw)
+        self.f = f
         if self.problem_info["state_events"]: 
             def event_func(t, y):
                 try:
@@ -63,21 +66,12 @@ class EulerSimple(Explicit_ODE):
                     self._py_err = E
                     return -1, None # non-recoverable
                 return 0, res ## OK
-            def f(dy ,t, y): 
-                try:
-                    dy[:] = self.problem.rhs(t, y, self.sw)
-                except Exception:
-                    return False
-                return True
-            self.f = f
             self.event_func = event_func
             self._event_info = [0] * self.problem_info["dimRoot"] 
             ret, self.g_old = self.event_func(self.t, self.y)
             if ret < 0:
                 raise self._py_err
             self.statistics["nstatefcns"] += 1
-        else: 
-            self.f = self.problem.rhs_internal
     
     def _set_initial_step(self, initstep):
         try:
@@ -147,15 +141,23 @@ class EulerSimple(Explicit_ODE):
     def _simple_event_locator(self,t,y):
         n_g = self.problem_info["dimRoot"]
         ret, g_new = self.event_func(t, y)
+        self.statistics["nstatefcns"] += 1
         if ret < 0:
             raise self._py_err
         event_info = np.zeros(n_g, dtype = int)
-        ## perhaps we can code this faster?
-        flag = ID_PY_OK
-        for i in range(n_g):
-            if (g_new[i] > 0) != (self.g_old[i] > 0):
+        ## faster, slightly less safe replacement for code below
+        w = np.where((g_new > 0) != (self.g_old > 0))[0]
+        if w.size == 0:
+            flag = ID_PY_OK
+        else:
+            flag = ID_PY_EVENT
+            for i in w:
                 event_info[i] = 1 if g_new[i] > 0 else -1
-                flag = ID_PY_EVENT
+        # flag = ID_PY_OK
+        # for i in range(n_g):
+        #     if (g_new[i] > 0) != (self.g_old[i] > 0):
+        #         event_info[i] = 1 if g_new[i] > 0 else -1
+        #         flag = ID_PY_EVENT
         self.set_event_info(event_info)
         self.statistics["nstateevents"] += 1
         self.g_old = g_new
@@ -166,12 +168,11 @@ class EulerSimple(Explicit_ODE):
             self.set_problem_data()
         maxsteps = self.options["maxsteps"]
         h = self.options["inith"]
-        self.f(self.Y1, t, y)
         flag = ID_PY_OK
         
         for i in range(maxsteps):
             if t+h < tf and flag == ID_PY_OK:
-                t, y, error = self._step(t, y, h)
+                t, y = self._step(t, y, h)
                 self.statistics["nsteps"] += 1
                 if self.problem_info["state_events"]: 
                     flag = self._simple_event_locator(t, y) 
@@ -200,7 +201,7 @@ class EulerSimple(Explicit_ODE):
         
         #If no event has been detected, do the last step.
         if flag == ID_PY_OK:
-            t, y, error = self._step(t, y, h)
+            t, y = self._step(t, y, h)
             self.statistics["nsteps"] += 1
             if self.problem_info["state_events"]: 
                 flag = self._simple_event_locator(t, y)
@@ -229,19 +230,17 @@ class EulerSimple(Explicit_ODE):
         """
         self.statistics["nfcns"] += 1
         
-        f = self.f
-            
-        f(self.Y1, t, y)
-        t_next = t + h
-        y_next = y + h*self.Y1
 
+        t_next = t + h
+        y_next = y + h*self.f(t, y)
 
         def interpolate(time):
+            print(f"INTERPOLATING {time}")
             thetha = (time - t) / (t_next - t)
             return (1 - thetha) * y + thetha * y_next 
         self.interpolate = interpolate
 
-        return t_next, y_next, y_next*0
+        return t_next, y_next
         
     def state_event_info(self): 
         return self._event_info
