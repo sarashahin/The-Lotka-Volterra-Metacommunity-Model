@@ -42,7 +42,7 @@ class ODEModel:
         # localGrowthRate = (r - C@B)
         local_growth = self.r - self.C.dot(B)
         # dlogB_i/dt = local_growth[i] + exp(log(INV) - logB[i])
-        # Because i_i can be species-specific, we do an array of i's => let's just do INV for each species
+        # Because i_i can be species-specific, we do an array of i's => INV for each species
         dlogB = local_growth + np.exp(np.log(INV) - logB)
         logger.debug(f"[ODEModel _deriv] t={t:.2f}, sample logB={logB[:10]}, local_growth~={local_growth[:10]}")
         return dlogB
