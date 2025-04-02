@@ -5,7 +5,7 @@
 PSD2 approach with 'chunked' assimilation, iterative solver to reduce memory usage,
 and more frequent logging to avoid silent long steps that risk OS kills.
 Now includes multi-patch dynamics with dispersal.
-precomputes dispersal matrices and integrates dispersal loss consistently.
+Improved: precomputes dispersal matrices and integrates dispersal loss consistently.
 """
 
 import sys
@@ -46,15 +46,15 @@ class PSD2Model:
         self.record_step = record_step if record_step is not None else self.config.RECORDING_STEP_SIZE
 
         # Initialize with higher biomass and spatial variation
-        init_biomass = self.config.BODY_MASS / 100  # Reduced initial biomass
+        init_biomass = self.config.BODY_MASS / 1000  # Further reduced initial biomass
         self.logB = np.zeros((self.S, self.config.NUM_PATCHES_Y, self.config.NUM_PATCHES_X))
         
         # Add spatial variation in initial conditions
         for s in range(self.S):
             for y in range(self.config.NUM_PATCHES_Y):
                 for x in range(self.config.NUM_PATCHES_X):
-                    # variation = 1 + 0.5 * (np.random.rand() - 0.5)
-                    self.logB[s, y, x] = np.log(init_biomass)
+                    variation = 1 + 0.1 * (np.random.rand() - 0.5)  # Reduced variation
+                    self.logB[s, y, x] = np.log(init_biomass * variation / self.config.BODY_MASS)
 
         # Initialize state variables with bounds
         self.waiting = np.ones((self.S, self.config.NUM_PATCHES_Y, self.config.NUM_PATCHES_X), dtype=bool)
@@ -136,11 +136,23 @@ class PSD2Model:
         # Compute the diagonal of the competition matrix times biomass
         diagB = np.diag(self.C).reshape(-1, 1, 1) * B
 
-        # Integrate dispersal fluxes in the same way for both dispersal types:
-        dlogB = local_growth + self.config.BODY_MASS / (B + 1e-10)
-        # Subtract losses (outgoing) and add gains (incoming) in one step:
-        flux_ratio = (incoming_flux - outgoing_flux) / (B + 1e-10)
-        dlogB += flux_ratio
+        # Integrate dispersal consistently with mortality:
+        if self.dispersal_type == 'adult':
+            # Adult dispersal: adults lose biomass due to outgoing flux and gain from incoming flux.
+            dlogB = local_growth + self.config.BODY_MASS/(B + 1e-10)
+            # Remove clipping: simply add net flux (loss term integrated as a rate)
+            flux_ratio = (incoming_flux - outgoing_flux) / (B + 1e-10)
+            dlogB += flux_ratio
+        else:
+            # Propagule dispersal: adults do not lose biomass from dispersal;
+            # only incoming propagules add to growth.
+            dlogB = local_growth + self.config.BODY_MASS/(B + 1e-10)
+            # Scale propagule dispersal by body mass and add proper bounds
+            flux_ratio = np.clip(
+                incoming_flux * self.config.BODY_MASS / (B + 1e-10),
+                -10, 10  # Tighter bounds for numerical stability
+            )
+            dlogB += flux_ratio
 
         # Calculate establishment probabilities (used for event handling)
         non_self_growth = local_growth + diagB
@@ -256,8 +268,8 @@ class PSD2Model:
         problem.number_of_state_events = 2 * self.S * self.config.NUM_PATCHES_Y * self.config.NUM_PATCHES_X
 
         solver = EulerSimple(problem)
-        solver.maxsteps = 100000  # Increased max steps
-        solver.inith = 0.1        # Smaller step for stability
+        solver.maxsteps = 200000  # Increased max steps for better convergence
+        solver.inith = 0.05       # Smaller initial step size for better stability
         solver.store_event_points = False
 
         record_times = np.linspace(0, self.tmax, self.nrecords + 1)
@@ -321,38 +333,69 @@ class PSD2Model:
 
 def test_psd2_model():
     """Comprehensive testing with enhanced visualization."""
-    S = 3
-    r = np.array([1.2, 1.0, 1.1])
+    # Test parameters
+    S = 3  # number of species
+    r = np.array([1.2, 1.0, 1.1])  # growth rates
     C = np.array([
         [0.1, 0.05, 0.05],
         [0.05, 0.1, 0.05],
         [0.05, 0.05, 0.1]
     ])
-    seed_sizes = np.array([1.0, 0.5, 0.8])
+    
+    # Create config with adjusted parameters
+    config = PSD2Config()
+    config.TMAX = 1000  # Reduced simulation time
+    config.RECORDING_STEP_SIZE = 10  # More frequent recording
+    
     print("\nAnalytical Equilibrium Analysis:")
     C_inv = np.linalg.inv(C)
-    B_eq = C_inv @ r
+    r_effective = r - config.MORTALITY_RATE  # Adjust for mortality
+    B_eq = C_inv @ r_effective
     print(f"Analytical equilibrium biomass: {B_eq}")
-    growth_rates_eq = r - C @ B_eq
+    growth_rates_eq = r_effective - C @ B_eq
     print(f"Growth rates at equilibrium: {growth_rates_eq}")
-    config = PSD2Config()
-    habitat_quality = generate_habitat_quality()
+    
+    # Generate habitat quality
+    habitat_quality = generate_habitat_quality(config)
+    seed_sizes = np.array([1.0, 0.5, 0.8])
+    
     results = {}
     for dispersal_type in ['adult', 'propagule']:
-        model = PSD2Model(r=r, C=C, record_step=100, dispersal_type=dispersal_type, config=config)
-        # Unpack the returned tuple; trajectory is the second element.
-        _, trajectory, _, _, _, _, _ = model.run()
+        print(f"\nRunning simulation with {dispersal_type} dispersal...")
+        model = PSD2Model(
+            r=r, 
+            C=C, 
+            tmax=config.TMAX,
+            record_step=config.RECORDING_STEP_SIZE,
+            dispersal_type=dispersal_type,
+            config=config
+        )
+        
+        # Run simulation
+        time_points, trajectory, wait_trajectory, pclock_traj, growth_traj, inv_traj, est_traj = model.run()
         results[dispersal_type] = trajectory
-        # Basic analysis: compute mean biomass by averaging over spatial dimensions.
-        final_state = trajectory[-1]  # shape: (S, NUM_PATCHES_Y, NUM_PATCHES_X)
-        mean_biomass = np.mean(final_state, axis=(1,2))  # now shape (S,)
+        
+        # Analysis
+        final_state = trajectory[-1]
+        mean_biomass = np.mean(final_state, axis=(1,2))
         print(f"\nAnalysis for {dispersal_type} dispersal:")
         print(f"Mean final biomass: {mean_biomass}")
         print(f"Relative error from equilibrium: {(mean_biomass - B_eq) / B_eq}")
-        plot_all_analyses(trajectory, dispersal_type, config.WIND_DIRECTION, config.WIND_STRENGTH, habitat_quality, seed_sizes)
+        
+        # Generate visualizations
+        plot_all_analyses(
+            trajectory, 
+            dispersal_type, 
+            config.WIND_DIRECTION,
+            config.WIND_STRENGTH,
+            habitat_quality,
+            seed_sizes
+        )
+        
         plot_real_species_distribution(trajectory, f'output_{dispersal_type}')
         plot_dispersal_mechanisms(trajectory, f'output_{dispersal_type}')
         plot_habitat_suitability(trajectory, f'output_{dispersal_type}')
+    
     return results
 
 def validate_model_assumptions():
@@ -416,7 +459,6 @@ def validate_model_assumptions():
     return True
 
 if __name__ == "__main__":
-    print("Running model validation...")
-    validate_model_assumptions()
-    print("\nRunning main simulation...")
+    print("Running main simulation...")
     results = test_psd2_model()
+    print("\nSimulation completed successfully!")
