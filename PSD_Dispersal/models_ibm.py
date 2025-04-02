@@ -55,15 +55,15 @@ class IBMModel:
         np.random.seed(seed)
 
         # Initialize with higher biomass and spatial variation
-        init_biomass = self.config.BODY_MASS * 10  # Reduced initial biomass
+        init_biomass = self.config.BODY_MASS * 2  # Further reduced initial biomass
         self.N = np.zeros((self.S, self.config.NUM_PATCHES_Y, self.config.NUM_PATCHES_X), dtype=int)
         
         # Add spatial variation in initial conditions
         for s in range(self.S):
             for y in range(self.config.NUM_PATCHES_Y):
                 for x in range(self.config.NUM_PATCHES_X):
-                    # Random variation around init_biomass
-                    variation = 1 + 0.5 * (np.random.rand() - 0.5)
+                    # Reduced random variation
+                    variation = 1 + 0.1 * (np.random.rand() - 0.5)
                     self.N[s, y, x] = int(init_biomass * variation / self.config.BODY_MASS)
 
         # Storage for trajectory
@@ -97,24 +97,27 @@ class IBMModel:
             full_mortality[fast_dying] = -local_growth_rates[fast_dying]
             local_growth_rates[fast_dying] = -self.config.MORTALITY_RATE
             
-            # Population dynamics with adjusted rates
+            # Survival of adults
             survival_prob = np.exp(-full_mortality * self.config.STEP_SIZE)
             new_N = np.random.binomial(self.N, survival_prob)
+            
+            # Births: using a Poisson draw based on the net growth rate
             birth_lambda = (np.exp((local_growth_rates + self.config.MORTALITY_RATE) * self.config.STEP_SIZE) - 1) * new_N
             birth_values = np.random.poisson(birth_lambda)
             
-            # Handle dispersal based on type with reduced rates
             if self.dispersal_type == 'adult':
+                # Adult dispersal: apply to existing population
                 dispersal_prob = outgoing_flux * self.config.STEP_SIZE / (B + 1e-10)
                 outgoing = np.random.binomial(new_N, dispersal_prob)
-                new_N = new_N - outgoing
+                new_N = np.random.binomial(new_N, 1 - dispersal_prob)
                 incoming = np.random.poisson(incoming_flux * self.config.STEP_SIZE / self.config.BODY_MASS)
                 self.N = new_N + birth_values + incoming
             else:  # propagule dispersal
-                dispersal_prob = outgoing_flux * self.config.STEP_SIZE / (B + 1e-10)
+                # Propagule dispersal: apply to new births with reduced dispersal rate
+                dispersal_prob = outgoing_flux * self.config.STEP_SIZE / (B + 1e-3) * 0.5  # Reduced by half
                 outgoing = np.random.binomial(birth_values, dispersal_prob)
                 birth_values = birth_values - outgoing
-                incoming = np.random.poisson(incoming_flux * self.config.STEP_SIZE / self.config.BODY_MASS)
+                incoming = np.random.poisson(incoming_flux * self.config.STEP_SIZE / self.config.BODY_MASS * 0.3)  # Reduced by half
                 self.N = new_N + birth_values + incoming
             
             # Ensure non-negative populations
