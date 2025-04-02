@@ -5,7 +5,7 @@
 PSD2 approach with 'chunked' assimilation, iterative solver to reduce memory usage,
 and more frequent logging to avoid silent long steps that risk OS kills.
 Now includes multi-patch dynamics with dispersal.
-Improved: precomputes dispersal matrices and integrates dispersal loss consistently.
+precomputes dispersal matrices and integrates dispersal loss consistently.
 """
 
 import sys
