@@ -64,21 +64,6 @@ NUM_PATCHES_X = 2   # Number of patches horizontally
 NUM_PATCHES_Y = 2   # Number of patches vertically
 
 # Dispersal rate (diffusion coefficient): fraction of biomass exchanged per time step.
-DISPERSAL_RATE = 0.001
+DISPERSAL_RATE = 0.2
+LONG_DISTANCE_PROB = 0.2  # Probability of long-distance dispersal
 
-# x = np.linspace(0.5, 1.5, NUM_PATCHES_X)
-# y = np.linspace(0.5, 1.5, NUM_PATCHES_Y)
-# X, Y = np.meshgrid(x, y)
-# DISPERSAL_FIELD = 0.001 * (X + Y) / 2
-DISPERSAL_FIELD = None
-
-# -----------------------------
-# Quantum-Inspired Dispersal Parameters
-# -----------------------------
-# Set to True to use the quantum-inspired dispersal formulation.
-QUANTUM_DISPERSAL = True
-# The quantum dispersal rate ( start with the same order of magnitude as classical dispersal).
-QUANTUM_DISPERSAL_RATE = 0.002
-# Phase parameter (phi) that weights direct vs. diagonal contributions.
-# For example, phi = pi/4 gives equal weight when cos(pi/4)=sin(pi/4)=~0.707.
-QUANTUM_PHASE = np.pi / 4
