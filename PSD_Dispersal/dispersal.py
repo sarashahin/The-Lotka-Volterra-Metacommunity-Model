@@ -84,15 +84,22 @@ def compute_dispersal(B):
         neighbor_mean_flat = LOCAL_DISPERSAL_MATRIX.dot(species_B_flat)
         neighbor_mean = neighbor_mean_flat.reshape(species_B.shape)
         
+        
         # Compute the biomass difference (source minus neighbor mean).
-        biomass_diff = species_B - neighbor_mean
+        # biomass_diff = species_B - neighbor_mean
+
+        # # Only allow dispersal from patches where the biomass exceeds the neighbor average.
+        # dispersal_mask = biomass_diff > 0
+
+        # # Compute the dispersal flux (proportional to biomass and its excess) for each patch.
+        # dispersal_flux = DISPERSAL_RATE * species_B * biomass_diff / (species_B + 1e-10)
+        # dispersal_flux[~dispersal_mask] = 0
+
         
-        # Only allow dispersal from patches where the biomass exceeds the neighbor average.
-        dispersal_mask = biomass_diff > 0
-        
-        # Compute the dispersal flux (proportional to biomass and its excess) for each patch.
-        dispersal_flux = DISPERSAL_RATE * species_B * biomass_diff / (species_B + 1e-10)
-        dispersal_flux[~dispersal_mask] = 0
+        # Passive dispersal: each patch disperses a fixed fraction of its biomass,
+        # regardless of local biomass differences.
+        dispersal_flux = DISPERSAL_RATE * species_B
+
         
         # Split the flux into local and long-distance components.
         local_flux = (1 - LONG_DISTANCE_PROB) * dispersal_flux
