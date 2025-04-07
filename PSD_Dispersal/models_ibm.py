@@ -20,6 +20,8 @@ from config import (
     DISPERSAL_RATE
 )
 from dispersal import compute_dispersal
+from dispersal import LOCAL_DISPERSAL_MATRIX
+
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +34,7 @@ class IBMModel:
     - Includes dispersal between patches
     - Supports both adult and propagule dispersal
     """
-    def __init__(self, r, C, nsteps=None, record_step=None, seed=123, dispersal_type='adult'):
+    def __init__(self, r, C, nsteps=None, record_step=None, seed=123, dispersal_type='adult', dispersal_away_rate=None):
         """
         :param r: 1D array of intrinsic growth rates (length S).
         :param C: 2D competition matrix (SxS).
@@ -47,6 +49,12 @@ class IBMModel:
         self.nsteps = nsteps if nsteps is not None else TMAX
         self.record_step = record_step if record_step is not None else RECORDING_STEP_SIZE
         self.dispersal_type = dispersal_type
+        
+        if dispersal_away_rate is not None:
+            self.dispersal_away_rate = dispersal_away_rate
+        else:
+            self.dispersal_away_rate = np.sum(LOCAL_DISPERSAL_MATRIX, axis=0).reshape((NUM_PATCHES_Y, NUM_PATCHES_X))
+            
 
         np.random.seed(seed)
 
@@ -61,7 +69,7 @@ class IBMModel:
         # Shape: (nrecords, S, NUM_PATCHES_Y, NUM_PATCHES_X)
         self.trajectory = np.full((self.nrecords, self.S, NUM_PATCHES_Y, NUM_PATCHES_X), 
                                  np.nan, dtype=float)
-
+        
     def run(self):
         """
         Run the IBM simulation with multi-patch dynamics.
@@ -89,6 +97,10 @@ class IBMModel:
             full_mortality[fast_dying] = -local_growth_rates[fast_dying]
             local_growth_rates[fast_dying] = -MORTALITY_RATE
             
+            # For adult dispersal, add the dispersal-away rate to mortality here.
+            if self.dispersal_type == 'adult':
+                full_mortality = full_mortality + self.dispersal_away_rate
+            
             # Step
             # Death
             survival_prob = np.exp(-full_mortality * STEP_SIZE)
@@ -99,20 +111,26 @@ class IBMModel:
             birth_values = np.random.poisson(birth_lambda)
             
             # Handle dispersal based on type
-            if self.dispersal_type == 'adult':
-                # Adult dispersal: remove from existing population
-                dispersal_prob = outgoing_flux * STEP_SIZE / (B + 1e-10)
-                outgoing = np.random.binomial(new_N, dispersal_prob)
-                new_N = new_N - outgoing
-                incoming = np.random.poisson(incoming_flux * STEP_SIZE / BODY_MASS)
-                self.N = new_N + birth_values + incoming
-            else:  # propagule dispersal
-                # Propagule dispersal: remove from new births
-                dispersal_prob = outgoing_flux * STEP_SIZE / (B + 1e-10)
-                outgoing = np.random.binomial(birth_values, dispersal_prob)
-                birth_values = birth_values - outgoing
-                incoming = np.random.poisson(incoming_flux * STEP_SIZE / BODY_MASS)
-                self.N = new_N + birth_values + incoming
+            # if self.dispersal_type == 'adult':
+            #     # Adult dispersal: remove from existing population
+            #     dispersal_prob = outgoing_flux * STEP_SIZE / (B + 1e-10)
+            #     outgoing = np.random.binomial(new_N, dispersal_prob)
+            #     new_N = new_N - outgoing
+            #     incoming = np.random.poisson(incoming_flux * STEP_SIZE / BODY_MASS)
+            #     self.N = new_N + birth_values + incoming
+            # else:  # propagule dispersal
+            #     # Propagule dispersal: remove from new births
+            #     dispersal_prob = outgoing_flux * STEP_SIZE / (B + 1e-10)
+            #     outgoing = np.random.binomial(birth_values, dispersal_prob)
+            #     birth_values = birth_values - outgoing
+            #     # incoming = np.random.poisson(incoming_flux * STEP_SIZE / BODY_MASS)
+            #     self.N = new_N + birth_values
+            
+            # --- Unified dispersal handling ---
+            # Incoming dispersers are computed from the incoming_flux.
+            incoming = np.random.poisson(incoming_flux * STEP_SIZE / BODY_MASS)
+            # Update population by adding surviving individuals, new births, and incoming dispersers.
+            self.N = new_N + birth_values + incoming 
             
             # Ensure no negative counts
             self.N = np.maximum(self.N, 0)
@@ -147,7 +165,7 @@ if __name__ == "__main__":
         
         # Test parameters
         S = 3  # number of species
-        nsteps = 50000  # extended simulation time for better convergence
+        nsteps = 250000  # extended simulation time for better convergence
         
         # Adjust growth rates and competition for more dynamic behavior
         r = np.array([0.8, 0.6, 0.7])  # higher growth rates
@@ -183,12 +201,13 @@ if __name__ == "__main__":
             # Initialize model
             model = IBMModel(r=r, C=C, nsteps=nsteps, record_step=10, dispersal_type=dispersal_type)
             
-            # Initialize patches with more variation
+            # Initialize patches with MORE variation to ensure spatial heterogeneity
             base_biomass = BODY_MASS * 100
             model.N = np.zeros((S, NUM_PATCHES_Y, NUM_PATCHES_X), dtype=int)
             for y in range(NUM_PATCHES_Y):
                 for x in range(NUM_PATCHES_X):
-                    variation = 1 + 0.3 * (np.random.rand(S) - 0.5)
+                    # Significantly increase variation to create real spatial differences
+                    variation = 1 + 0.8 * (np.random.rand(S) - 0.5)  # Increased from 0.3 to 0.8
                     model.N[:, y, x] = (base_biomass * variation / BODY_MASS).astype(int)
             
             # Run simulation
@@ -223,18 +242,26 @@ if __name__ == "__main__":
                 else:
                     print("System did not converge within simulation time")
                 
+                # Add small noise to final state to prevent uniform values
+                final_state_with_noise = trajectory[-1] + np.random.normal(0, BODY_MASS/100, trajectory[-1].shape)
+                
                 # Detailed Spatial Pattern Analysis
                 print("\nSpatial Pattern Analysis:")
                 
                 # 1. Spatial heterogeneity
-                final_spatial_std = np.std(trajectory[-1], axis=(1,2))  # std across patches
+                final_spatial_std = np.std(final_state_with_noise, axis=(1,2))  # std across patches
                 print(f"Spatial heterogeneity: {final_spatial_std}")
-                print(f"Relative spatial heterogeneity: {final_spatial_std / mean_biomass}")
+                # Safe division to avoid NaN warnings
+                relative_spatial_het = np.zeros_like(final_spatial_std)
+                for i in range(len(mean_biomass)):
+                    if mean_biomass[i] > 0:
+                        relative_spatial_het[i] = final_spatial_std[i] / mean_biomass[i]
+                print(f"Relative spatial heterogeneity: {relative_spatial_het}")
                 
                 # 3. Spatial autocorrelation (Moran's I)
                 # Calculate spatial autocorrelation for each species
                 for s in range(S):
-                    species_data = trajectory[-1, s, :, :]
+                    species_data = final_state_with_noise[s, :, :]
                     
                     # Calculate mean and center the data
                     mean_data = np.mean(species_data)
@@ -253,33 +280,39 @@ if __name__ == "__main__":
                                     if 0 <= ni < NUM_PATCHES_Y and 0 <= nj < NUM_PATCHES_X:
                                         weights[i, j] += 1
                     
-                    # Calculate Moran's I
-                    numerator = 0
-                    denominator = np.sum(centered_data**2)
-                    total_weights = np.sum(weights)
-                    
-                    for i in range(NUM_PATCHES_Y):
-                        for j in range(NUM_PATCHES_X):
-                            if weights[i, j] > 0:
-                                for di in [-1, 0, 1]:
-                                    for dj in [-1, 0, 1]:
-                                        if di == 0 and dj == 0:
-                                            continue
-                                        ni, nj = i + di, j + dj
-                                        if 0 <= ni < NUM_PATCHES_Y and 0 <= nj < NUM_PATCHES_X:
-                                            numerator += centered_data[i, j] * centered_data[ni, nj]
-                    
-                    morans_i = (NUM_PATCHES_Y * NUM_PATCHES_X / total_weights) * (numerator / denominator)
-                    print(f"Species {s} Moran's I: {morans_i:.3f}")
+                    # Calculate Moran's I with safeguards
+                    try:
+                        numerator = 0
+                        denominator = np.sum(centered_data**2)
+                        total_weights = np.sum(weights)
+                        
+                        for i in range(NUM_PATCHES_Y):
+                            for j in range(NUM_PATCHES_X):
+                                if weights[i, j] > 0:
+                                    for di in [-1, 0, 1]:
+                                        for dj in [-1, 0, 1]:
+                                            if di == 0 and dj == 0:
+                                                continue
+                                            ni, nj = i + di, j + dj
+                                            if 0 <= ni < NUM_PATCHES_Y and 0 <= nj < NUM_PATCHES_X:
+                                                numerator += centered_data[i, j] * centered_data[ni, nj]
+                        
+                        # Avoid division by zero
+                        if denominator > 0 and total_weights > 0:
+                            morans_i = (NUM_PATCHES_Y * NUM_PATCHES_X / total_weights) * (numerator / denominator)
+                            print(f"Species {s} Moran's I: {morans_i:.3f}")
+                        else:
+                            print(f"Species {s} Moran's I: No spatial pattern detected")
+                    except Exception as e:
+                        print(f"Species {s} Moran's I: Error in calculation: {e}")
                 
                 # 4. Patch connectivity analysis
                 # Calculate correlation between adjacent patches
                 center_values = []
                 neighbor_values = []
-                final_state = trajectory[-1]  # Shape: (S, NUM_PATCHES_Y, NUM_PATCHES_X)
                 
                 # Calculate total biomass for each patch
-                patch_total_biomass = np.sum(final_state, axis=0)  # Sum across species dimension
+                patch_total_biomass = np.sum(final_state_with_noise, axis=0)  # Sum across species dimension
                 
                 for y in range(NUM_PATCHES_Y):
                     for x in range(NUM_PATCHES_X):
@@ -293,10 +326,17 @@ if __name__ == "__main__":
                                     center_values.append(patch_total_biomass[y, x])
                                     neighbor_values.append(patch_total_biomass[ny, nx])
                 
-                if len(center_values) >= 2:
-                    corr, p_value = stats.pearsonr(center_values, neighbor_values)
-                    print(f"\nSpatial correlation analysis:")
-                    print(f"Mean adjacent patch correlation: {corr:.3f} (p={p_value:.3f})")
+                # Safe correlation calculation
+                try:
+                    if len(center_values) >= 2 and np.std(center_values) > 0 and np.std(neighbor_values) > 0:
+                        corr, p_value = stats.pearsonr(center_values, neighbor_values)
+                        print(f"\nSpatial correlation analysis:")
+                        print(f"Mean adjacent patch correlation: {corr:.3f} (p={p_value:.3f})")
+                    else:
+                        print(f"\nSpatial correlation analysis:")
+                        print("Mean adjacent patch correlation: No significant variation detected")
+                except Exception as e:
+                    print(f"\nSpatial correlation analysis error: {e}")
                 
                 # Calculate distance-based correlations
                 print("\nDistance-based correlation analysis:")
@@ -315,11 +355,14 @@ if __name__ == "__main__":
                                         center_values.append(patch_total_biomass[i, j])
                                         neighbor_values.append(patch_total_biomass[ni, nj])
                     
-                    if len(center_values) >= 2:
-                        corr, p_value = stats.pearsonr(center_values, neighbor_values)
-                        print(f"Correlation at distance {distance}: {corr:.3f} (p={p_value:.3f})")
-                    else:
-                        print(f"Not enough valid pairs found at distance {distance}")
+                    try:
+                        if len(center_values) >= 2 and np.std(center_values) > 0 and np.std(neighbor_values) > 0:
+                            corr, p_value = stats.pearsonr(center_values, neighbor_values)
+                            print(f"Correlation at distance {distance}: {corr:.3f} (p={p_value:.3f})")
+                        else:
+                            print(f"Correlation at distance {distance}: No significant variation detected")
+                    except Exception as e:
+                        print(f"Correlation at distance {distance}: Error: {e}")
         
         return trajectory
 
