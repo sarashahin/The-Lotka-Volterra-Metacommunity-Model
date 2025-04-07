@@ -19,8 +19,7 @@ from config import (
     NUM_PATCHES_Y,
     DISPERSAL_RATE
 )
-from dispersal import compute_dispersal
-from dispersal import LOCAL_DISPERSAL_MATRIX
+from dispersal import compute_dispersal, LOCAL_DISPERSAL_MATRIX
 
 
 logger = logging.getLogger(__name__)
