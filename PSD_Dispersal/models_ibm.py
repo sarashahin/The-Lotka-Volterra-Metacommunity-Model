@@ -48,6 +48,7 @@ class IBMModel:
         self.nsteps = nsteps if nsteps is not None else TMAX
         self.record_step = record_step if record_step is not None else RECORDING_STEP_SIZE
         self.dispersal_type = dispersal_type
+
         
         if dispersal_away_rate is not None:
             self.dispersal_away_rate = dispersal_away_rate
