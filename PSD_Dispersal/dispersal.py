@@ -1,3 +1,6 @@
+############################################
+# dispersal.py
+############################################
 """
 Dispersal module.
 Computes dispersal between patches using a source-based approach.
