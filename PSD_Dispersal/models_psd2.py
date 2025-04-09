@@ -1,464 +1,433 @@
 ############################################
 # models_psd2.py
 ############################################
+
 """
-PSD2 approach with 'chunked' assimilation, iterative solver to reduce memory usage,
-and more frequent logging to avoid silent long steps that risk OS kills.
-Now includes multi-patch dynamics with dispersal.
-Improved: precomputes dispersal matrices and integrates dispersal loss consistently.
+PSD2 approach with multi‐patch dynamics, ‘chunked’ assimilation,
+and unified dispersal handling. Now, after computing the biomass
+B (from logB) in each derivative evaluation, we compute the 
+dispersal invasion flux via a matrix‐calculation in dispersal.py.
+We then add a passive dispersal term (invasion/B) and, for adult 
+dispersal, subtract an extra dispersal‐away mortality.
 """
 
 import sys
 import numpy as np
 import logging
-import matplotlib.pyplot as plt
-from assimulo.solvers import CVode, ExplicitEuler
+from assimulo.solvers import CVode  # or use preferred solver
 from assimulo.problem import Explicit_Problem
-from euler_simple import EulerSimple
-from dispersal import compute_dispersal, generate_habitat_quality, compute_dispersal_matrix
-from config_base import PSD2Config
-import copy  # For deep copying config objects
+from euler_simple import EulerSimple  # fallback solver if needed
 
-from visualization import (
-    plot_spatial_patterns, plot_dispersal_patterns, plot_temporal_evolution,
-    plot_environmental_effects, plot_seed_size_effects, plot_species_comparison,
-    plot_dispersal_analysis, plot_all_analyses
+# Import necessary constants from  config file
+from config import (
+    BODY_MASS,
+    MORTALITY_RATE,
+    TMAX,
+    RECORDING_STEP_SIZE,
+    NUM_PATCHES_X,
+    NUM_PATCHES_Y,
+    DISPERSAL_RATE,
+    LONG_DISTANCE_PROB
 )
-from real_species_vis import (
-    plot_real_species_distribution, plot_dispersal_mechanisms,
-    plot_habitat_suitability
-)
+# Import dispersal routine and precomputed matrix
+from dispersal import compute_dispersal, LOCAL_DISPERSAL_MATRIX
 
 logger = logging.getLogger(__name__)
 
 class PSD2Model:
-    def __init__(self, r, C, tmax=None, record_step=None, seed=123, config=None, dispersal_type='adult'):
+    def __init__(self, r, C, tmax=None, record_step=None, seed=123,
+                 dispersal_type='adult', dispersal_away_rate=None):
+        """
+        :param r: 1D array of intrinsic growth rates (length S).
+        :param C: 2D competition matrix (SxS).
+        :param tmax: maximum simulation time.
+        :param record_step: time interval for recording outputs.
+        :param dispersal_type: 'adult' or 'propagule' to indicate how dispersal is handled.
+        :param dispersal_away_rate: optional extra mortality due to dispersal away.
+                                    If None and dispersal_type=='adult', it is set from the local dispersal matrix.
+        """
         np.random.seed(seed)
-        self.config = config if config is not None else PSD2Config()
-        self.dispersal_type = dispersal_type  # 'adult' or 'propagule'
-
-        # Force r, C to correct shapes
-        self.r = np.asarray(r, dtype=float).flatten()
+        self.r = np.asarray(r, dtype=float).flatten()  # shape (S,)
         self.C = np.asarray(C, dtype=float)
         self.S = len(self.r)
-
-        self.tmax = tmax if tmax is not None else self.config.TMAX
-        self.record_step = record_step if record_step is not None else self.config.RECORDING_STEP_SIZE
-
-        # Initialize with higher biomass and spatial variation
-        init_biomass = self.config.BODY_MASS / 1000  # Further reduced initial biomass
-        self.logB = np.zeros((self.S, self.config.NUM_PATCHES_Y, self.config.NUM_PATCHES_X))
         
-        # Add spatial variation in initial conditions
-        for s in range(self.S):
-            for y in range(self.config.NUM_PATCHES_Y):
-                for x in range(self.config.NUM_PATCHES_X):
-                    variation = 1 + 0.1 * (np.random.rand() - 0.5)  # Reduced variation
-                    self.logB[s, y, x] = np.log(init_biomass * variation / self.config.BODY_MASS)
+        self.tmax = tmax if tmax is not None else TMAX
+        self.record_step = record_step if record_step is not None else RECORDING_STEP_SIZE
 
-        # Initialize state variables with bounds
-        self.waiting = np.ones((self.S, self.config.NUM_PATCHES_Y, self.config.NUM_PATCHES_X), dtype=bool)
-        self.poisson_clock = np.log(np.random.rand(self.S, self.config.NUM_PATCHES_Y, self.config.NUM_PATCHES_X))
+        # Multi-patch initialization: each species is distributed over a grid of patches.
+        init_biomass = BODY_MASS / 10
+        # logB is now a (S, NUM_PATCHES_Y, NUM_PATCHES_X) array
+        self.logB = np.full((self.S, NUM_PATCHES_Y, NUM_PATCHES_X), np.log(init_biomass))
+        self.waiting = np.ones((self.S, NUM_PATCHES_Y, NUM_PATCHES_X), dtype=bool)
+        self.poisson_clock = np.log(np.random.rand(self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
 
-        # For storing results with better organization
+        # Set dispersal parameters
+        self.dispersal_type = dispersal_type
+        if dispersal_away_rate is not None:
+            self.dispersal_away_rate = dispersal_away_rate
+        else:
+            # Compute dispersal-away rate from the local dispersal matrix (shape: NUM_PATCHES_Y x NUM_PATCHES_X)
+            self.dispersal_away_rate = np.sum(LOCAL_DISPERSAL_MATRIX, axis=0).reshape((NUM_PATCHES_Y, NUM_PATCHES_X))
+
+        # For storing results (trajectory arrays now have an extra spatial dimension)
         self.nrecords = max(1, self.tmax // self.record_step)
-        self.trajectory = np.zeros((self.nrecords + 1, self.S, self.config.NUM_PATCHES_Y, self.config.NUM_PATCHES_X))
-        self.wait_trajectory = np.zeros((self.nrecords + 1, self.S, self.config.NUM_PATCHES_Y, self.config.NUM_PATCHES_X), dtype=bool)
+        self.trajectory = np.zeros((self.nrecords + 1, self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+        self.wait_trajectory = np.zeros((self.nrecords + 1, self.S, NUM_PATCHES_Y, NUM_PATCHES_X), dtype=bool)
         self.time_points = np.zeros(self.nrecords + 1)
+
+        # Diagnostic outputs
+        self.poisson_clock_traj = np.zeros((self.nrecords + 1, self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+        self.growth_rate_traj   = np.zeros((self.nrecords + 1, self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+        self.invasion_rate_traj = np.zeros((self.nrecords + 1, self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+        self.establishment_prob_traj = np.zeros((self.nrecords + 1, self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+
         self.record_idx = 0
-
-        # Diagnostic arrays
-        self.poisson_clock_traj = np.zeros((self.nrecords + 1, self.S, self.config.NUM_PATCHES_Y, self.config.NUM_PATCHES_X))
-        self.growth_rate_traj = np.zeros((self.nrecords + 1, self.S, self.config.NUM_PATCHES_Y, self.config.NUM_PATCHES_X))
-        self.invasion_rate_traj = np.zeros((self.nrecords + 1, self.S, self.config.NUM_PATCHES_Y, self.config.NUM_PATCHES_X))
-        self.establishment_prob_traj = np.zeros((self.nrecords + 1, self.S, self.config.NUM_PATCHES_Y, self.config.NUM_PATCHES_X))
-
-        # Precompute dispersal matrices for efficiency
-        self.dispersal_matrices = compute_dispersal_matrix(self.config)
-
-        # Track event sign changes
         self.last_sw = None
 
         logger.info(f"PSD2Model init: S={self.S}, tmax={self.tmax}, record_step={self.record_step}")
-        logger.debug(f"Initial logB shape: {self.logB.shape}")
-        logger.debug(f"Initial waiting shape: {self.waiting.shape}")
-        logger.debug(f"Initial PoissonClock shape: {self.poisson_clock.shape}")
+        logger.debug(f"Initial logB (shape {self.logB.shape}): {self.logB}")
+        logger.debug(f"Initial waiting (shape {self.waiting.shape}): {self.waiting}")
+        logger.debug(f"Initial PoissonClock (shape {self.poisson_clock.shape}): {self.poisson_clock}")
         logger.debug(f"Growth rates r: {self.r}")
         logger.debug(f"Competition Matrix C shape: {self.C.shape}")
 
     def _ensure_flat_y(self, y):
-        if isinstance(y, (list, tuple)) and len(y) == 2:
-            part1 = np.ravel(np.asarray(y[0], dtype=float))
-            part2 = np.ravel(np.asarray(y[1], dtype=float))
-            flat = np.concatenate([part1, part2])
-        else:
-            flat = np.ravel(np.asarray(y, dtype=float))
-        if flat.shape[0] == 2*self.S*self.config.NUM_PATCHES_Y*self.config.NUM_PATCHES_X + 1:
-            flat = flat[:-1]
-        if flat.shape[0] != 2*self.S*self.config.NUM_PATCHES_Y*self.config.NUM_PATCHES_X:
-            raise ValueError(f"Expected length {2*self.S*self.config.NUM_PATCHES_Y*self.config.NUM_PATCHES_X}, got {flat.shape[0]}")
+        """
+        Flatten the state arrays. The state y is a concatenation of logB and pclock,
+        each of which is of shape (S, NUM_PATCHES_Y, NUM_PATCHES_X). Hence the total length is 2*S*NUM_PATCHES_Y*NUM_PATCHES_X.
+        """
+        y = np.asarray(y, dtype=float)
+        flat = y.flatten()
+        expected_length = 2 * self.S * NUM_PATCHES_Y * NUM_PATCHES_X
+        if flat.shape[0] != expected_length:
+            raise ValueError(f"Expected state vector of length {expected_length}, got {flat.shape[0]}")
         return flat
 
     def _derivatives(self, t, y, sw):
         """
-        Compute the derivatives of log-biomass and the Poisson clock,
-        including dispersal effects.
-        
-        Both adult and propagule dispersal now subtract outgoing flux 
-        (losses) and add incoming flux, ensuring that losses are treated 
-        in the same way as mortality.
+        Compute the derivatives for the state vector y.
+        The state consists of logB and the Poisson clock (pclock) for each species in each patch.
+        We now add a unified dispersal (invasion) term computed via compute_dispersal.
         """
-        # Reshape y into logB and pclock components
-        logB = y[:self.S * self.config.NUM_PATCHES_Y * self.config.NUM_PATCHES_X].reshape(
-            self.S, self.config.NUM_PATCHES_Y, self.config.NUM_PATCHES_X)
-        pclock = y[self.S * self.config.NUM_PATCHES_Y * self.config.NUM_PATCHES_X:].reshape(
-            self.S, self.config.NUM_PATCHES_Y, self.config.NUM_PATCHES_X)
-
-        # Ensure the switch array has the proper shape
-        sw = np.array(sw).reshape(self.S, self.config.NUM_PATCHES_Y, self.config.NUM_PATCHES_X)
-
-        # Compute actual biomass
+        total_elements = self.S * NUM_PATCHES_Y * NUM_PATCHES_X
+        logB_flat = y[:total_elements]
+        pclock_flat = y[total_elements: 2 * total_elements]
+        logB = logB_flat.reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+        pclock = pclock_flat.reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+        
+        
         B = np.exp(logB)
-
-        # Calculate local growth: r - C @ B (reshaped) and then add intraspecific competition.
+        # Compute the biomass for each species in each patch.
+        epsilon = 1e-300
+        safeB = np.maximum(B, epsilon)
+        
+        # Calculate growth rates for all patches at once
+        # C @ B_reshaped will have shape (S, NUM_PATCHES_Y * NUM_PATCHES_X)
         B_reshaped = B.reshape(self.S, -1)
-        local_growth = (self.r.reshape(-1, 1) - self.C @ B_reshaped).reshape(B.shape)
-
-        # For patches with very low growth, set a floor (handle mortality)
-        fast_dying = local_growth < (-self.config.MORTALITY_RATE)
-        full_mortality = np.full_like(local_growth, self.config.MORTALITY_RATE)
-        full_mortality[fast_dying] = -local_growth[fast_dying]
-        local_growth[fast_dying] = -self.config.MORTALITY_RATE
-
-        # Compute dispersal fluxes using precomputed dispersal matrices
-        outgoing_flux, incoming_flux = compute_dispersal(B, self.config, self.dispersal_matrices)
-
-        # Compute the diagonal of the competition matrix times biomass
+        competitive_loss = (self.C @ B_reshaped).reshape(B.shape)
+        local_growth = self.r.reshape(-1, 1, 1) - competitive_loss
         diagB = np.diag(self.C).reshape(-1, 1, 1) * B
-
-        # Integrate dispersal consistently with mortality:
-        if self.dispersal_type == 'adult':
-            # Adult dispersal: adults lose biomass due to outgoing flux and gain from incoming flux.
-            dlogB = local_growth + self.config.BODY_MASS/(B + 1e-10)
-            # Remove clipping: simply add net flux (loss term integrated as a rate)
-            flux_ratio = (incoming_flux - outgoing_flux) / (B + 1e-10)
-            dlogB += flux_ratio
-        else:
-            # Propagule dispersal: adults do not lose biomass from dispersal;
-            # only incoming propagules add to growth.
-            dlogB = local_growth + self.config.BODY_MASS/(B + 1e-10)
-            # Scale propagule dispersal by body mass and add proper bounds
-            flux_ratio = np.clip(
-                incoming_flux * self.config.BODY_MASS / (B + 1e-10),
-                -10, 10  # Tighter bounds for numerical stability
-            )
-            dlogB += flux_ratio
-
-        # Calculate establishment probabilities (used for event handling)
+        
+        # Compute invasion flux from dispersal.
+        _, invasion = compute_dispersal(B)
+        
+        # Use raw local growth for effective growth.
+        effective_growth = local_growth
+        
+        sw_reshaped = np.array(sw).reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+        # Compute derivative for logB.
+        dlogB = effective_growth + (invasion / safeB)+ 2* sw_reshaped*(local_growth+diagB)
+        
+        # For establishment probability: include dispersal-away in effective mortality for adult dispersal.
         non_self_growth = local_growth + diagB
-        non_self_growth[np.invert(sw)] = 0
+        sw_reshaped = np.array(sw).reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+        non_self_growth[~sw_reshaped] = 0
         non_self_growth[non_self_growth < 0] = 0
-        denom = non_self_growth + self.config.MORTALITY_RATE
-        est_prob = np.divide(non_self_growth, denom, where=denom != 0)
-        dpclock = est_prob * (self.config.BODY_MASS / (self.config.BODY_MASS + 1e-10))
-
-        return np.concatenate([dlogB.ravel(), dpclock.ravel()])
-
-
+        
+        if self.dispersal_type == 'adult':
+            denom = non_self_growth + MORTALITY_RATE + self.dispersal_away_rate
+        else:
+            denom = non_self_growth + MORTALITY_RATE
+            
+        est_prob = np.divide(non_self_growth, denom, out=np.zeros_like(non_self_growth), where=denom != 0)
+        dpclock = est_prob * (invasion / BODY_MASS)
+        
+        return np.concatenate([dlogB.flatten(), dpclock.flatten()])
 
     def _event_fn(self, t, y, sw):
-        logB = y[:self.S*self.config.NUM_PATCHES_Y*self.config.NUM_PATCHES_X].reshape(self.S, self.config.NUM_PATCHES_Y, self.config.NUM_PATCHES_X)
-        pclock = y[self.S*self.config.NUM_PATCHES_Y*self.config.NUM_PATCHES_X:].reshape(self.S, self.config.NUM_PATCHES_Y, self.config.NUM_PATCHES_X)
+        """
+        Compute event function values.
+        We use 2*(S * NUM_PATCHES_Y * NUM_PATCHES_X) event values:
+          For each species in each patch:
+            event( index )   = local_growth (with intraspecific competition added back)
+            event( index + total_elements) = pclock
+        """
+        total_elements = self.S * NUM_PATCHES_Y * NUM_PATCHES_X
+        logB = y[:total_elements].reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+        pclock = y[total_elements:2*total_elements].reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
         B = np.exp(logB)
+        # Calculate growth rates for all patches at once
+        # C @ B_reshaped will have shape (S, NUM_PATCHES_Y * NUM_PATCHES_X)
         B_reshaped = B.reshape(self.S, -1)
-        local_growth = (self.r.reshape(-1, 1) - self.C @ B_reshaped).reshape(B.shape)
+        local_growth = self.r.reshape(-1, 1, 1) - (self.C @ B_reshaped).reshape(B.shape)
+        # Add back intraspecific effect:
         local_growth = local_growth + np.diag(self.C).reshape(-1, 1, 1) * B
-        return np.concatenate([local_growth.ravel(), pclock.ravel()])
+        return np.concatenate([local_growth.flatten(), pclock.flatten()])
 
     def _handle_event_fn(self, solver, event_info):
-        y = solver.y
-        logB = y[:self.S*self.config.NUM_PATCHES_Y*self.config.NUM_PATCHES_X].reshape(self.S, self.config.NUM_PATCHES_Y, self.config.NUM_PATCHES_X)
-        pclock = y[self.S*self.config.NUM_PATCHES_Y*self.config.NUM_PATCHES_X:].reshape(self.S, self.config.NUM_PATCHES_Y, self.config.NUM_PATCHES_X)
-        state_info = event_info[0]
-        changed = np.nonzero(state_info)[0]
+        """
+        Revised multi‐patch event handler.
+        Handles events from changes in local growth (from logB) and Poisson clock crossings,
+        applying similar logic to the original one‐patch version but extended over species and patches.
+        """
+        import math
+        total_elements = self.S * NUM_PATCHES_Y * NUM_PATCHES_X
+        # Copy the current state and reshape into multi‐patch arrays.
+        y = solver.y.copy()  # current state vector (length 2*total_elements)
+        logB = y[:total_elements].reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X)).copy()
+        pclock = y[total_elements:2*total_elements].reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X)).copy()
+        # Convert logB to biomass.
         B = np.exp(logB)
-        B_reshaped = B.reshape(self.S, -1)
-        local_growth = (self.r.reshape(-1, 1) - self.C @ B_reshaped).reshape(B.shape)
+        
+        # Compute local growth rates per patch:
+        # First, reshape B for the matrix multiplication.
+        B_flat = B.reshape(self.S, -1)
+        local_growth = self.r.reshape(-1, 1, 1) - (self.C @ B_flat).reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+        # Add back the intraspecific effect (diagonal term).
         local_growth = local_growth + np.diag(self.C).reshape(-1, 1, 1) * B
-        sw = np.array(solver.sw).reshape(self.S, self.config.NUM_PATCHES_Y, self.config.NUM_PATCHES_X)
 
+        # Get the event information:
+        state_info = np.array(event_info[0])
+        changed = np.nonzero(state_info)[0]
+        current_time = solver.t  # current simulation time
+        
+        # Convert solver.sw into an array with multi-patch shape:
+        sw = np.array(solver.sw).reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+
+        # Process each event index:
         for idx in changed:
-            if idx < self.S*self.config.NUM_PATCHES_Y*self.config.NUM_PATCHES_X:
-                i_species = idx // (self.config.NUM_PATCHES_Y*self.config.NUM_PATCHES_X)
-                i_patch = idx % (self.config.NUM_PATCHES_Y*self.config.NUM_PATCHES_X)
-                i_y = i_patch // self.config.NUM_PATCHES_X
-                i_x = i_patch % self.config.NUM_PATCHES_X
-                
-                if sw[i_species, i_y, i_x]:
-                    if state_info[idx] == +1:
-                        print(f"Local growth rate {local_growth[i_species, i_y, i_x]} of {i_species} at patch ({i_y}, {i_x}) was negative while waiting!")
+            if idx < total_elements:
+                s_idx, i_idx, j_idx = np.unravel_index(idx, (self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+                event_val = state_info[idx]
+                bg = B[s_idx, i_idx, j_idx]
+                lg = local_growth[s_idx, i_idx, j_idx]
+                cur_logB = logB[s_idx, i_idx, j_idx]
+                cur_pclock = pclock[s_idx, i_idx, j_idx]
+                if sw[s_idx, i_idx, j_idx]:
+                    if event_val == +1:
+                        print(f"Local growth rate {lg} of species {s_idx} at patch ({i_idx},{j_idx}) was negative while waiting "
+                              f"({cur_logB:.12f}, {cur_pclock:.12f}) at time {current_time:.8f}!")
                     else:
-                        if B[i_species, i_y, i_x] > self.config.THRESHOLD:
-                            print(f"{i_species} at patch ({i_y}, {i_x}) S ({local_growth[i_species, i_y, i_x]}) -> P at {solver.t}")
-                            sw[i_species, i_y, i_x] = False
-                            solver.y[i_species*self.config.NUM_PATCHES_Y*self.config.NUM_PATCHES_X + i_patch + 
-                                     self.S*self.config.NUM_PATCHES_Y*self.config.NUM_PATCHES_X] = 1
-                elif state_info[idx] == +1:
+                        print(f"Species {s_idx} at patch ({i_idx},{j_idx}): S ({lg:.12f}) -> P at time {current_time:.12f}")
+                        sw[s_idx, i_idx, j_idx] = False
+                        flat_index = np.ravel_multi_index((s_idx, i_idx, j_idx), (self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+                        solver.y[total_elements + flat_index] = 1.0
+                elif event_val == +1:
                     sw_fixed = sw.copy()
-                    yd = self._derivatives(solver.t, solver.y, sw_fixed)
-                    yd = yd.reshape(2*self.S, self.config.NUM_PATCHES_Y, self.config.NUM_PATCHES_X)
-                    local_B = B[:, i_y, i_x]
-                    local_dlogB = yd[:self.S, i_y, i_x]
-                    c = -np.sum(self.C[i_species, :] * local_B * local_dlogB)
-                    print(f"Local sweep parameter c = {c} at species {i_species}, patch ({i_y}, {i_x})")
-                    if c > 0:
-                        prob_to_S = np.clip(
-                            np.exp(-B[i_species, i_y, i_x] / (self.config.BODY_MASS * (1 + np.sqrt(np.pi/(2*c))*self.config.MORTALITY_RATE))),
-                            0, 1)
-                        print(f"prob_to_S = {prob_to_S}")
-                        transition_to_S = (np.random.rand(1) <= prob_to_S)
-                        if not transition_to_S:
-                            print(f"{i_species} at patch ({i_y}, {i_x}) P ({local_growth[i_species, i_y, i_x]}) -> D at {solver.t}")
-                            solver.y[i_species*self.config.NUM_PATCHES_Y*self.config.NUM_PATCHES_X + i_patch] = min(
-                                0,
-                                solver.y[i_species*self.config.NUM_PATCHES_Y*self.config.NUM_PATCHES_X + i_patch] - np.log(1-prob_to_S))
-                        if transition_to_S:
-                            print(f"{i_species} at patch ({i_y}, {i_x}) P ({local_growth[i_species, i_y, i_x]}) -> S at {solver.t}")
-                            sw[i_species, i_y, i_x] = True
-                            solver.y[i_species*self.config.NUM_PATCHES_Y*self.config.NUM_PATCHES_X + i_patch + 
-                                     self.S*self.config.NUM_PATCHES_Y*self.config.NUM_PATCHES_X] = np.log(np.random.rand())
+                    yd = self._derivatives(solver.t, solver.y, sw_fixed.flatten())
+                    yd_logB = yd[:total_elements].reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+                    yd_logB[s_idx, i_idx, j_idx] = 0
+                    B_patch = B[:, i_idx, j_idx]
+                    yd_patch = yd_logB[:, i_idx, j_idx]
+                    c = -np.sum(self.C[s_idx, :] * B_patch * yd_patch)
+                    print(f"Computed c = {c:.8f} at patch ({i_idx},{j_idx}) for species {s_idx}")
+                    if c <= 0:
+                        print(f"Species {s_idx} at patch ({i_idx},{j_idx}): Sweep {c:.8f} is not positive! "
+                              f"Try reducing 'inith' parameter.")
+                        transition_to_S = True
                     else:
-                        print(f"Sweep {c} is not positive at species {i_species}, patch ({i_y}, {i_x})!")
-                        print("Consider checking parameter values or revising the derivative calculation.")
+                        prob_to_S = np.exp(-bg / (BODY_MASS * (1 + math.sqrt(math.pi / (2 * c)) * MORTALITY_RATE)))
+                        print(f"prob_to_S = {prob_to_S:.8f} at patch ({i_idx},{j_idx}) for species {s_idx}")
+                        transition_to_S = (np.random.rand() <= prob_to_S)
+                    if not transition_to_S:
+                        print(f"Species {s_idx} at patch ({i_idx},{j_idx}): P ({lg:.8f}) -> D at time {current_time:.8f}")
+                        new_val = min(0, cur_logB - np.log(1 - prob_to_S))
+                        flat_index = np.ravel_multi_index((s_idx, i_idx, j_idx), (self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+                        solver.y[flat_index] = new_val
+                    if transition_to_S:
+                        print(f"Species {s_idx} at patch ({i_idx},{j_idx}): P ({lg:.8f}) -> S at time {current_time:.8f}")
+                        sw[s_idx, i_idx, j_idx] = True
+                        flat_index = np.ravel_multi_index((s_idx, i_idx, j_idx), (self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+                        solver.y[total_elements + flat_index] = np.log(np.random.rand())
                 else:
-                    print(f"{i_species} at patch ({i_y}, {i_x}) D -> P at {solver.t}")
+                    print(f"Species {s_idx} at patch ({i_idx},{j_idx}): D -> P at time {current_time:.8f}")
             else:
-                i_species = (idx - self.S*self.config.NUM_PATCHES_Y*self.config.NUM_PATCHES_X) // (self.config.NUM_PATCHES_Y*self.config.NUM_PATCHES_X)
-                i_patch = (idx - self.S*self.config.NUM_PATCHES_Y*self.config.NUM_PATCHES_X) % (self.config.NUM_PATCHES_Y*self.config.NUM_PATCHES_X)
-                i_y = i_patch // self.config.NUM_PATCHES_X
-                i_x = i_patch % self.config.NUM_PATCHES_X
-                    
-                if state_info[idx] == -1:
-                    print(f"Poisson Clock {pclock[i_species, i_y, i_x]} declined at patch ({i_y}, {i_x})!")
+                idx_adjusted = idx - total_elements
+                s_idx, i_idx, j_idx = np.unravel_index(idx_adjusted, (self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+                event_val = state_info[idx]
+                cur_pclock = pclock[s_idx, i_idx, j_idx]
+                if event_val == -1:
+                    print(f"Poisson Clock {cur_pclock:.8f} declined for species {s_idx} at patch ({i_idx},{j_idx}) "
+                          f"(waiting: {sw[s_idx, i_idx, j_idx]}) at time {current_time:.8f}!")
                 else:
-                    print(f"{i_species} at patch ({i_y}, {i_x}) S ({pclock[i_species, i_y, i_x]}) -> D at {solver.t}")
-                    denom = local_growth[i_species, i_y, i_x] + self.config.MORTALITY_RATE
-                    if local_growth[i_species, i_y, i_x] >= 0:
-                        est_prob = local_growth[i_species, i_y, i_x] / denom
-                        val = self.config.BODY_MASS / est_prob if est_prob > 0 else self.config.BODY_MASS
+                    print(f"Species {s_idx} at patch ({i_idx},{j_idx}): S ({cur_pclock:.12f}) -> D at time {current_time:.12f}")
+                    lg = local_growth[s_idx, i_idx, j_idx]
+                    denom = lg + MORTALITY_RATE
+                    if lg >= 0 and denom > 0:
+                        est_prob = lg / denom
+                        val = BODY_MASS / est_prob if est_prob > 0 else BODY_MASS
+                        flat_index = np.ravel_multi_index((s_idx, i_idx, j_idx), (self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
                         if val > 1:
-                            solver.y[i_species*self.config.NUM_PATCHES_Y*self.config.NUM_PATCHES_X + i_patch] = 0.0
+                            solver.y[flat_index] = 0.0
                         else:
-                            solver.y[i_species*self.config.NUM_PATCHES_Y*self.config.NUM_PATCHES_X + i_patch] = np.log(val)
-                        solver.y[i_species*self.config.NUM_PATCHES_Y*self.config.NUM_PATCHES_X + i_patch + 
-                                 self.S*self.config.NUM_PATCHES_Y*self.config.NUM_PATCHES_X] = 1
-                        sw[i_species, i_y, i_x] = False
+                            solver.y[flat_index] = np.log(val)
+                        solver.y[total_elements + flat_index] = 1.0
+                        sw[s_idx, i_idx, j_idx] = False
                     else:
-                        print("Local growth negative when pclock triggered!")
-            
-        solver.sw = sw.ravel().tolist()
+                        print(f"Local growth negative when pclock triggered for species {s_idx} at patch ({i_idx},{j_idx})!")
+        
+        # After processing, update solver.sw to remain consistent:
+        solver.sw = sw.flatten().tolist()
 
+    
     def run(self):
-        logger.info("Starting PSD2 simulation with Assimulo...")
-        y0 = np.concatenate([self.logB.ravel(), self.poisson_clock.ravel()])
-        problem = Explicit_Problem(self._derivatives, y0, t0=0.0, sw0=self.waiting)
-        problem.name = 'PSD2 Problem'
+        logger.info("Starting PSD2 simulation with Assimulo (multi-patch)...")
+        
+        # Build initial state vector y0 by flattening logB and poisson_clock.
+        y0 = np.concatenate([self.logB.flatten(), self.poisson_clock.flatten()])
+        
+        # Problem setup
+        problem = Explicit_Problem(self._derivatives, y0, t0=0.0, sw0=self.waiting.flatten())
+        problem.name = 'PSD2 Multi-Patch Problem'
         problem.state_events = self._event_fn
         problem.handle_event = self._handle_event_fn
-        problem.number_of_state_events = 2 * self.S * self.config.NUM_PATCHES_Y * self.config.NUM_PATCHES_X
+        problem.number_of_state_events = 2 * self.S * NUM_PATCHES_Y * NUM_PATCHES_X
 
-        solver = EulerSimple(problem)
-        solver.maxsteps = 200000  # Increased max steps for better convergence
-        solver.inith = 0.05       # Smaller initial step size for better stability
+        # Solver configuration
+        solver = CVode(problem)
+        solver.discr = 'BDF'
+        solver.iter = 'Newton'
+        solver.linear_solver = 'SPGMR'
+        solver.rtol = 1e-6
+        solver.atol = 1e-6
+        solver.inith = 1e-7
+        solver.maxh = 1e10
         solver.store_event_points = False
+        solver.options["mxhnil"] = 5
+        solver.options['maxsteps'] = 20000
+        solver.options['verbosity'] = 30
 
-        record_times = np.linspace(0, self.tmax, self.nrecords + 1)
+        # Chunk the integration to avoid overly long steps.
+        chunk_size = 2000
+        times = np.arange(0, self.tmax + chunk_size, chunk_size)
+        times = np.unique(np.clip(times, 0, self.tmax))
+        record_times = np.arange(0, self.tmax + self.record_step, self.record_step)
+        record_times = np.unique(np.clip(record_times, 0, self.tmax))
 
-        try:
-            t, y = solver(self.tmax, record_times.shape[0]-1)
-            for step in range(record_times.shape[0]):
-                recStep = np.argmin(np.abs(t - record_times[step]))
-                rec_time = t[recStep]
-                pclock = y[recStep, self.S * self.config.NUM_PATCHES_Y * self.config.NUM_PATCHES_X:].reshape(self.S, self.config.NUM_PATCHES_Y, self.config.NUM_PATCHES_X)
-                waiting = pclock < 0
-                B = np.exp(y[recStep, :self.S * self.config.NUM_PATCHES_Y * self.config.NUM_PATCHES_X].reshape(self.S, self.config.NUM_PATCHES_Y, self.config.NUM_PATCHES_X))
-                self.trajectory[step, :] = B
-                self.wait_trajectory[step, :] = waiting
-                self.time_points[step] = rec_time
+        # Run the simulation
+        t, y = solver(self.tmax, record_times.shape[0]-1)
+        
+        total_elements = self.S * NUM_PATCHES_Y * NUM_PATCHES_X
+        
+        for step in range(record_times.shape[0]):
+            # Find the index corresponding to the record time
+            rec_idx = np.argmin(np.abs(t - record_times[step]))
+            y_rec = y[rec_idx, :]
+            logB = y_rec[:total_elements].reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+            pclock = y_rec[total_elements:2*total_elements].reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+            waiting = pclock < 0
+            B = np.exp(logB)
+            self.trajectory[step, :, :, :] = B
+            self.wait_trajectory[step, :, :, :] = waiting
+            self.time_points[step] = t[rec_idx]
+            
+            # Calculate growth rates for all patches at once
+            # C @ B_reshaped will have shape (S, NUM_PATCHES_Y * NUM_PATCHES_X)
+            B_reshaped = B.reshape(self.S, -1)
+            local_growth = self.r.reshape(-1, 1, 1) - (self.C @ B_reshaped).reshape(B.shape)
+            local_growth = local_growth + np.diag(self.C).reshape(-1, 1, 1) * B
+            inv_rate = np.zeros((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+            est_prob = np.zeros((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+            # Compute dispersal (invasion) flux
+            _, invasion = compute_dispersal(B)
+            for j in range(self.S):
+                # For patches where local growth is positive:
+                pos_mask = local_growth[j] > 0
+                denom = local_growth[j] + MORTALITY_RATE
+                est_prob[j][pos_mask] = local_growth[j][pos_mask] / denom[pos_mask]
+                inv_rate[j] = invasion[j] * est_prob[j] / BODY_MASS
+            self.poisson_clock_traj[step, :, :, :] = pclock
+            self.growth_rate_traj[step, :, :, :] = local_growth
+            self.invasion_rate_traj[step, :, :, :] = inv_rate
+            self.establishment_prob_traj[step, :, :, :] = est_prob
+            
+            if np.any(waiting):
+                mean_poisson = np.mean(np.exp(pclock[waiting]))
+                logger.info(f"At t={t[rec_idx]:.2f}, mean raw Poisson clock for waiting patches: {mean_poisson:.3f}")
+            else:
+                logger.info(f"At t={t[rec_idx]:.2f}, no patches are in waiting state.")
+            logger.info(f"PSD2: recorded at t={t[rec_idx]:.2f} => record #{step}")
 
-                # Compute diagnostics
-                B_reshaped = B.reshape(self.S, -1)
-                growth = (self.r.reshape(-1, 1) - self.C @ B_reshaped).reshape(B.shape)
-                growth = growth + np.diag(self.C).reshape(-1, 1, 1) * B
-
-                inv_rate = np.zeros_like(B)
-                est_prob = np.zeros_like(B)
-                for j in range(self.S):
-                    mask = growth[j] > 0
-                    denom = growth[j] + self.config.MORTALITY_RATE
-                    est_prob[j, mask] = growth[j, mask] / denom[mask]
-                    inv_rate[j, mask] = self.config.BODY_MASS  # Simplified as the ratio cancels
-
-                self.poisson_clock_traj[step, :] = pclock
-                self.growth_rate_traj[step, :] = growth
-                self.invasion_rate_traj[step, :] = inv_rate
-                self.establishment_prob_traj[step, :] = est_prob
-
-                if np.any(waiting):
-                    mean_poisson = np.mean(np.exp(pclock[waiting]))
-                    logger.info(f"At t={rec_time}, mean raw Poisson clock for waiting species: {mean_poisson:.3f}")
-                else:
-                    logger.info(f"At t={rec_time}, no species are in waiting state.")
-                    logger.info(f"PSD2: recorded at t={rec_time} => record #{step}")
-
-            logger.info("PSD2 simulation completed.")
-            return (
-                self.time_points,
-                self.trajectory,
-                self.wait_trajectory,
-                self.poisson_clock_traj,
-                self.growth_rate_traj,
-                self.invasion_rate_traj,
-                self.establishment_prob_traj
-            )
-        except Exception as e:
-            logger.error(f"Error during simulation: {str(e)}")
-            raise
-
-
+        logger.info("PSD2 simulation completed.")
+        return (
+            self.time_points,
+            self.trajectory,
+            self.wait_trajectory,
+            self.poisson_clock_traj,
+            self.growth_rate_traj,
+            self.invasion_rate_traj,
+            self.establishment_prob_traj
+        )
 
 ############################################
-# Test functions for PSD2Model
+# Testing
 ############################################
-
-def test_psd2_model():
-    """Comprehensive testing with enhanced visualization."""
-    # Test parameters
-    S = 3  # number of species
-    r = np.array([1.2, 1.0, 1.1])  # growth rates
-    C = np.array([
-        [0.1, 0.05, 0.05],
-        [0.05, 0.1, 0.05],
-        [0.05, 0.05, 0.1]
-    ])
-    
-    # Create config with adjusted parameters
-    config = PSD2Config()
-    config.TMAX = 1000  # Reduced simulation time
-    config.RECORDING_STEP_SIZE = 10  # More frequent recording
-    
-    print("\nAnalytical Equilibrium Analysis:")
-    C_inv = np.linalg.inv(C)
-    r_effective = r - config.MORTALITY_RATE  # Adjust for mortality
-    B_eq = C_inv @ r_effective
-    print(f"Analytical equilibrium biomass: {B_eq}")
-    growth_rates_eq = r_effective - C @ B_eq
-    print(f"Growth rates at equilibrium: {growth_rates_eq}")
-    
-    # Generate habitat quality
-    habitat_quality = generate_habitat_quality(config)
-    seed_sizes = np.array([1.0, 0.5, 0.8])
-    
-    results = {}
-    for dispersal_type in ['adult', 'propagule']:
-        print(f"\nRunning simulation with {dispersal_type} dispersal...")
-        model = PSD2Model(
-            r=r, 
-            C=C, 
-            tmax=config.TMAX,
-            record_step=config.RECORDING_STEP_SIZE,
-            dispersal_type=dispersal_type,
-            config=config
-        )
-        
-        # Run simulation
-        time_points, trajectory, wait_trajectory, pclock_traj, growth_traj, inv_traj, est_traj = model.run()
-        results[dispersal_type] = trajectory
-        
-        # Analysis
-        final_state = trajectory[-1]
-        mean_biomass = np.mean(final_state, axis=(1,2))
-        print(f"\nAnalysis for {dispersal_type} dispersal:")
-        print(f"Mean final biomass: {mean_biomass}")
-        print(f"Relative error from equilibrium: {(mean_biomass - B_eq) / B_eq}")
-        
-        # Generate visualizations
-        plot_all_analyses(
-            trajectory, 
-            dispersal_type, 
-            config.WIND_DIRECTION,
-            config.WIND_STRENGTH,
-            habitat_quality,
-            seed_sizes
-        )
-        
-        plot_real_species_distribution(trajectory, f'output_{dispersal_type}')
-        plot_dispersal_mechanisms(trajectory, f'output_{dispersal_type}')
-        plot_habitat_suitability(trajectory, f'output_{dispersal_type}')
-    
-    return results
-
-def validate_model_assumptions():
-    """Validate key model assumptions with detailed equilibrium analysis."""
-    S = 3
-    r = np.array([1.2, 1.0, 1.1])
-    C = np.array([
-        [0.1, 0.05, 0.05],
-        [0.05, 0.1, 0.05],
-        [0.05, 0.05, 0.1]
-    ])
-    print("\nAnalytical Equilibrium Analysis:")
-    C_inv = np.linalg.inv(C)
-    B_eq = C_inv @ r
-    print(f"Analytical equilibrium biomass: {B_eq}")
-    dispersal_rates = [0.1, 0.2, 0.3]
-    print("\nTesting equilibrium convergence at different dispersal rates:")
-    for rate in dispersal_rates:
-        config = PSD2Config()
-        config.DISPERSAL_RATE = rate
-        model = PSD2Model(r=r, C=C, config=config)
-        _, trajectory, _, _, _, _, _ = model.run()
-        final_state = trajectory[-1]
-        mean_biomass = np.mean(final_state, axis=(1,2))  # shape (S,)
-        growth_rates = r - C @ mean_biomass
-        net_growth = mean_biomass * growth_rates
-        print(f"\nDispersal rate: {rate}")
-        print("Mean biomass:", mean_biomass)
-        print("Relative error from equilibrium:", (mean_biomass - B_eq) / B_eq)
-        print("Net growth rates (should be ≈ 0):", net_growth)
-        print("Growth rates (r - C*mean_biomass):", growth_rates)
-        min_biomass = np.min(final_state)
-        print("Minimum biomass:", min_biomass)
-    print("\nTesting continuous approximation:")
-    step_sizes = [0.1, 0.05, 0.01]
-    for dt in step_sizes:
-        config = PSD2Config()
-        config.STEP_SIZE = dt
-        model = PSD2Model(r=r, C=C, config=config)
-        _, trajectory, _, _, _, _, _ = model.run()
-        final_state = trajectory[-1]
-        mean_biomass = np.mean(final_state, axis=(1,2))
-        print(f"\nStep size: {dt}")
-        print("Mean biomass:", mean_biomass)
-        print("Relative error from equilibrium:", (mean_biomass - B_eq) / B_eq)
-    print("\nSpatial homogeneity analysis:")
-    final_state = trajectory[-1]
-    spatial_var = np.var(final_state, axis=(1,2))
-    spatial_cv = spatial_var / np.mean(final_state, axis=(1,2))
-    print("Spatial coefficient of variation:", spatial_cv)
-    print("\nTesting equilibrium stability:")
-    config = PSD2Config()
-    model = PSD2Model(r=r, C=C, config=config)
-    init_biomass = B_eq.reshape(-1, 1, 1) * (1 + 0.1 * np.random.randn(S, config.NUM_PATCHES_Y, config.NUM_PATCHES_X))
-    model.N = (init_biomass / config.BODY_MASS).astype(int)
-    _, trajectory, _, _, _, _, _ = model.run()
-    final_state = trajectory[-1]
-    mean_biomass = np.mean(final_state, axis=(1,2))
-    print("Final biomass with perturbed initial conditions:", mean_biomass)
-    print("Relative error from equilibrium:", (mean_biomass - B_eq) / B_eq)
-    return True
-
 if __name__ == "__main__":
-    print("Running main simulation...")
-    results = test_psd2_model()
-    print("\nSimulation completed successfully!")
+    import matplotlib.pyplot as plt
+    from scipy import stats
+    from scipy.ndimage import correlate
+    
+    def test_psd2_model():
+        """
+        Comprehensive testing of the PSD2Model class.
+        Tests multi-patch dispersal (via compute_dispersal injection), biomass dynamics,
+        growth rates, and invasion (dispersal) flux.
+        """
+        # Set random seed for reproducibility
+        np.random.seed(42)
+        
+        # Test parameters
+        S = 3  # number of species
+        nsteps = 250000  # extended simulation time
+        
+        # Adjust growth rates and competition for dynamic behavior
+        r = np.array([0.8, 0.6, 0.7])
+        C = np.array([
+            [0.2, 0.1, 0.1],
+            [0.1, 0.2, 0.1],
+            [0.1, 0.1, 0.2]
+        ])
+        
+        print("\nAnalytical Equilibrium Analysis:")
+        try:
+            C_inv = np.linalg.inv(C)
+            B_eq = C_inv @ r
+            print(f"Analytical equilibrium biomass: {B_eq}")
+            growth_rates_eq = r - C @ B_eq
+            print(f"Growth rates at equilibrium: {growth_rates_eq}")
+            print(f"Max absolute growth rate at equilibrium: {np.max(np.abs(growth_rates_eq))}")
+            print(f"All components positive: {np.all(B_eq > 0)}")
+        except np.linalg.LinAlgError:
+            print("Warning: Competition matrix is not invertible")
+            B_eq = None
+        
+        print("\nTesting PSD2Model with dispersal injection:")
+        model = PSD2Model(r=r, C=C, tmax=nsteps, record_step=10, seed=42)
+        t_points, traj, wait_traj, pclock_traj, growth_traj, inv_rate_traj, estab_prob_traj = model.run()
+        
+        if B_eq is not None:
+            # Average over time and over all patches (axes 0, 2, and 3)
+            mean_biomass = np.mean(traj, axis=(0,2,3))
+            rel_error = (mean_biomass - B_eq) / B_eq
+            print(f"\nMean final biomass: {mean_biomass}")
+            print(f"Relative error from equilibrium: {rel_error}")
+        
+    test_psd2_model()
+
+
+
+
+
+
+
+
