@@ -64,6 +64,6 @@ NUM_PATCHES_X = 5   # Number of patches horizontally
 NUM_PATCHES_Y = 5   # Number of patches vertically
 
 # Dispersal rate (diffusion coefficient): fraction of biomass exchanged per time step.
-DISPERSAL_RATE = 0.2
-LONG_DISTANCE_PROB = 0.2  # Probability of long-distance dispersal
+DISPERSAL_RATE = 0.01
+LONG_DISTANCE_PROB = 1  # Probability of long-distance dispersal
 

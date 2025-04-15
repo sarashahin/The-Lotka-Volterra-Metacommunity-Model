@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 class PSD2Model:
     def __init__(self, r, C, tmax=None, record_step=None, seed=123,
-                 dispersal_type='adult', dispersal_away_rate=None):
+                 dispersal_type='propagule', dispersal_away_rate=None):
         """
         :param r: 1D array of intrinsic growth rates (length S).
         :param C: 2D competition matrix (SxS).
@@ -59,19 +59,23 @@ class PSD2Model:
         init_biomass = BODY_MASS / 10
         # logB is now a (S, NUM_PATCHES_Y, NUM_PATCHES_X) array
         self.logB = np.full((self.S, NUM_PATCHES_Y, NUM_PATCHES_X), np.log(init_biomass))
-        self.waiting = np.ones((self.S, NUM_PATCHES_Y, NUM_PATCHES_X), dtype=bool)
-        self.poisson_clock = np.log(np.random.rand(self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+
+        ### No species can invade like this (at least it's super unlikely)
+        # self.waiting = np.ones((self.S, NUM_PATCHES_Y, NUM_PATCHES_X), dtype=bool)
+        # self.poisson_clock = np.log(np.random.rand(self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+        ### Start all species at all patches in D state:
+        self.waiting = np.zeros((self.S, NUM_PATCHES_Y, NUM_PATCHES_X), dtype=bool)
+        self.poisson_clock = np.ones((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
 
         # Set dispersal parameters
         self.dispersal_type = dispersal_type
         if dispersal_away_rate is not None:
             self.dispersal_away_rate = dispersal_away_rate
         else:
-            # Compute dispersal-away rate from the local dispersal matrix (shape: NUM_PATCHES_Y x NUM_PATCHES_X)
-            self.dispersal_away_rate = np.sum(LOCAL_DISPERSAL_MATRIX, axis=0).reshape((NUM_PATCHES_Y, NUM_PATCHES_X))
+            self.dispersal_away_rate = \
+                np.asarray(LOCAL_DISPERSAL_MATRIX.sum(axis=0)).flatten(). \
+                reshape((NUM_PATCHES_Y, NUM_PATCHES_X))
             
-        self.alpha = 1
-
         # For storing results (trajectory arrays now have an extra spatial dimension)
         self.nrecords = max(1, self.tmax // self.record_step)
         self.trajectory = np.zeros((self.nrecords + 1, self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
@@ -129,10 +133,15 @@ class PSD2Model:
         B_reshaped = B.reshape(self.S, -1)
         competitive_loss = (self.C @ B_reshaped).reshape(B.shape)
         local_growth = self.r.reshape(-1, 1, 1) - competitive_loss
+
+        if self.dispersal_type == 'adult':
+            local_growth = local_growth - \
+                np.broadcast_to(self.dispersal_away_rate,local_growth.shape)
+
         diagB = np.diag(self.C).reshape(-1, 1, 1) * B
         
         # Compute invasion flux from dispersal.
-        _, invasion = compute_dispersal(B)
+        invasion = compute_dispersal(B)
         
         # Use raw local growth for effective growth.
         effective_growth = local_growth
@@ -142,11 +151,8 @@ class PSD2Model:
         
         # Note the sign change (minus) to match the one-patch formulation.
         # The mortality/dispersal-away term is now scaled by 1 so that it aligns with the lecture derivations.
-        dlogB = effective_growth + (invasion / safeB) - 1 * sw_reshaped * (local_growth + diagB)
+        dlogB = effective_growth + (invasion / safeB) - 2 * sw_reshaped * (local_growth + diagB)
 
-                
-        # dlogB = effective_growth + (invasion / safeB)+ 2 * sw_reshaped*(local_growth+diagB)
-        
         # For establishment probability: include dispersal-away in effective mortality for adult dispersal.
         non_self_growth = local_growth + diagB
         sw_reshaped = np.array(sw).reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
@@ -158,9 +164,9 @@ class PSD2Model:
         else:
             denom = non_self_growth + MORTALITY_RATE
             
-        est_prob = np.divide(non_self_growth, denom, out=np.zeros_like(non_self_growth), where=denom != 0)
+        est_prob = non_self_growth / denom
         dpclock = est_prob * (invasion / BODY_MASS)
-        
+
         return np.concatenate([dlogB.flatten(), dpclock.flatten()])
 
     def _event_fn(self, t, y, sw):
@@ -179,6 +185,12 @@ class PSD2Model:
         # C @ B_reshaped will have shape (S, NUM_PATCHES_Y * NUM_PATCHES_X)
         B_reshaped = B.reshape(self.S, -1)
         local_growth = self.r.reshape(-1, 1, 1) - (self.C @ B_reshaped).reshape(B.shape)
+
+        if self.dispersal_type == 'adult':
+            local_growth = local_growth - \
+                np.broadcast_to(self.dispersal_away_rate,local_growth.shape)
+
+
         # Add back intraspecific effect:
         local_growth = local_growth + np.diag(self.C).reshape(-1, 1, 1) * B
         return np.concatenate([local_growth.flatten(), pclock.flatten()])
@@ -202,6 +214,11 @@ class PSD2Model:
         # First, reshape B for the matrix multiplication.
         B_flat = B.reshape(self.S, -1)
         local_growth = self.r.reshape(-1, 1, 1) - (self.C @ B_flat).reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+
+        if self.dispersal_type == 'adult':
+            local_growth = local_growth - \
+                np.broadcast_to(self.dispersal_away_rate,local_growth.shape)
+
         # Add back the intraspecific effect (diagonal term).
         local_growth = local_growth + np.diag(self.C).reshape(-1, 1, 1) * B
 
@@ -271,8 +288,11 @@ class PSD2Model:
                 else:
                     print(f"Species {s_idx} at patch ({i_idx},{j_idx}): S ({cur_pclock:.12f}) -> D at time {current_time:.12f}")
                     lg = local_growth[s_idx, i_idx, j_idx]
-                    denom = lg + MORTALITY_RATE
-                    if lg >= 0 and denom > 0:
+                    if self.dispersal_type == 'adult':
+                        denom = lg + MORTALITY_RATE + self.dispersal_away_rate[i_idx, j_idx]
+                    else:
+                        denom = lg + MORTALITY_RATE
+                    if lg >= 0: # implies denom > 0
                         est_prob = lg / denom
                         val = BODY_MASS / est_prob if est_prob > 0 else BODY_MASS
                         flat_index = np.ravel_multi_index((s_idx, i_idx, j_idx), (self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
@@ -316,6 +336,13 @@ class PSD2Model:
         solver.options['maxsteps'] = 20000
         solver.options['verbosity'] = 30
 
+        # # #### TEST FOR TECHNICAL ERRORS: ####
+        # self._derivatives(0, y0, solver.sw)
+        # self._event_fn(0, y0, solver.sw)
+        # self._handle_event_fn(solver,np.random.rand(2,2*self.S)*0)
+        # print("TESTING OK")
+        # sys.exit()
+
         # Chunk the integration to avoid overly long steps.
         chunk_size = 2000
         times = np.arange(0, self.tmax + chunk_size, chunk_size)
@@ -344,14 +371,22 @@ class PSD2Model:
             # C @ B_reshaped will have shape (S, NUM_PATCHES_Y * NUM_PATCHES_X)
             B_reshaped = B.reshape(self.S, -1)
             local_growth = self.r.reshape(-1, 1, 1) - (self.C @ B_reshaped).reshape(B.shape)
+            if self.dispersal_type == 'adult':
+                local_growth = local_growth - \
+                    np.broadcast_to(self.dispersal_away_rate,local_growth.shape)
+
             local_growth = local_growth + np.diag(self.C).reshape(-1, 1, 1) * B
             inv_rate = np.zeros((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
             est_prob = np.zeros((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
             # Compute dispersal (invasion) flux
-            _, invasion = compute_dispersal(B)
+            invasion = compute_dispersal(B)
             for j in range(self.S):
                 # For patches where local growth is positive:
                 pos_mask = local_growth[j] > 0
+                ####!!!! Axel tried to add the correct
+                ####!!!! dispersal_away_rate for adult dispersal here,
+                ####!!!! but failed because he did not understand how
+                ####!!!! the indexing works.
                 denom = local_growth[j] + MORTALITY_RATE
                 est_prob[j][pos_mask] = local_growth[j][pos_mask] / denom[pos_mask]
                 inv_rate[j] = invasion[j] * est_prob[j] / BODY_MASS
@@ -395,7 +430,7 @@ if __name__ == "__main__":
         
         # Test parameters
         S = 3  # number of species
-        nsteps = 300000  # extended simulation time
+        nsteps = 25000  # extended simulation time
         
         # Define growth rates and competition matrix
         r = np.array([0.8, 0.6, 0.7])
@@ -420,7 +455,7 @@ if __name__ == "__main__":
             B_eq = None
         
         print("\nTesting PSD2Model with dispersal injection:")
-        model = PSD2Model(r=r, C=C, tmax=nsteps, record_step=10, seed=42)
+        model = PSD2Model(r=r, C=C, tmax=nsteps, record_step=10, seed=42, dispersal_type='adult')
         t_points, traj, wait_traj, pclock_traj, growth_traj, inv_rate_traj, estab_prob_traj = model.run()
 
         # Calculate mean and variance over patches at every recorded time.
