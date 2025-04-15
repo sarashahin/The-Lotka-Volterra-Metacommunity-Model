@@ -17,6 +17,7 @@ import logging
 from assimulo.solvers import CVode  # or use preferred solver
 from assimulo.problem import Explicit_Problem
 from euler_simple import EulerSimple  # fallback solver if needed
+import math
 
 # Import necessary constants from  config file
 from config import (
@@ -68,6 +69,8 @@ class PSD2Model:
         else:
             # Compute dispersal-away rate from the local dispersal matrix (shape: NUM_PATCHES_Y x NUM_PATCHES_X)
             self.dispersal_away_rate = np.sum(LOCAL_DISPERSAL_MATRIX, axis=0).reshape((NUM_PATCHES_Y, NUM_PATCHES_X))
+            
+        self.alpha = 1
 
         # For storing results (trajectory arrays now have an extra spatial dimension)
         self.nrecords = max(1, self.tmax // self.record_step)
@@ -136,7 +139,13 @@ class PSD2Model:
         
         sw_reshaped = np.array(sw).reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
         # Compute derivative for logB.
-        dlogB = effective_growth + (invasion / safeB)+ 2* sw_reshaped*(local_growth+diagB)
+        
+        # Note the sign change (minus) to match the one-patch formulation.
+        # The mortality/dispersal-away term is now scaled by 1 so that it aligns with the lecture derivations.
+        dlogB = effective_growth + (invasion / safeB) - 1 * sw_reshaped * (local_growth + diagB)
+
+                
+        # dlogB = effective_growth + (invasion / safeB)+ 2 * sw_reshaped*(local_growth+diagB)
         
         # For establishment probability: include dispersal-away in effective mortality for adult dispersal.
         non_self_growth = local_growth + diagB
@@ -180,7 +189,7 @@ class PSD2Model:
         Handles events from changes in local growth (from logB) and Poisson clock crossings,
         applying similar logic to the original one‐patch version but extended over species and patches.
         """
-        import math
+
         total_elements = self.S * NUM_PATCHES_Y * NUM_PATCHES_X
         # Copy the current state and reshape into multi‐patch arrays.
         y = solver.y.copy()  # current state vector (length 2*total_elements)
@@ -370,27 +379,25 @@ class PSD2Model:
         )
 
 ############################################
-# Testing
+# Testing Mean and Variance in PSD2Model
 ############################################
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
-    from scipy import stats
-    from scipy.ndimage import correlate
-    
+    import numpy as np
+
     def test_psd2_model():
         """
-        Comprehensive testing of the PSD2Model class.
-        Tests multi-patch dispersal (via compute_dispersal injection), biomass dynamics,
-        growth rates, and invasion (dispersal) flux.
+        Runs the PSD2Model simulation, computes the mean and variance of biomass
+        for each species over time, and compares these with the theoretical expectations.
         """
-        # Set random seed for reproducibility
+        # Set random seed for reproducibility.
         np.random.seed(42)
         
         # Test parameters
         S = 3  # number of species
-        nsteps = 250000  # extended simulation time
+        nsteps = 300000  # extended simulation time
         
-        # Adjust growth rates and competition for dynamic behavior
+        # Define growth rates and competition matrix
         r = np.array([0.8, 0.6, 0.7])
         C = np.array([
             [0.2, 0.1, 0.1],
@@ -398,6 +405,7 @@ if __name__ == "__main__":
             [0.1, 0.1, 0.2]
         ])
         
+        # Compute analytical equilibrium (for reference)
         print("\nAnalytical Equilibrium Analysis:")
         try:
             C_inv = np.linalg.inv(C)
@@ -414,15 +422,43 @@ if __name__ == "__main__":
         print("\nTesting PSD2Model with dispersal injection:")
         model = PSD2Model(r=r, C=C, tmax=nsteps, record_step=10, seed=42)
         t_points, traj, wait_traj, pclock_traj, growth_traj, inv_rate_traj, estab_prob_traj = model.run()
+
+        # Calculate mean and variance over patches at every recorded time.
+        # traj is an array of shape (n_records, S, NUM_PATCHES_Y, NUM_PATCHES_X)
+        mean_time_series = np.mean(traj, axis=(2, 3))  # shape: (n_records, S)
+        var_time_series  = np.var(traj, axis=(2, 3))    # shape: (n_records, S)
+        
+        # Example: Compute final (steady-state) mean and variance for each species
+        final_biomass = traj[-1, :, :, :]  # biomass at final recorded time
+        mean_final = np.mean(final_biomass, axis=(1, 2))  # mean per species
+        var_final  = np.var(final_biomass, axis=(1, 2))   # variance per species
+        
+        print("\nFinal Mean biomass for each species:", mean_final)
+        print("Final Variance for each species:", var_final)
+        
+        # Plot the time series for the first species (Species 0)
+        plt.figure()
+        plt.plot(t_points, mean_time_series[:, 0], label='Mean biomass (Species 0)')
+        # Plot ± one standard deviation around the mean
+        std_dev_species0 = np.sqrt(var_time_series[:, 0])
+        plt.fill_between(t_points,
+                         mean_time_series[:, 0] - std_dev_species0,
+                         mean_time_series[:, 0] + std_dev_species0,
+                         color='blue', alpha=0.2, label='Std. Dev.')
+        plt.xlabel("Time")
+        plt.ylabel("Biomass")
+        plt.title("Time series of Mean Biomass and Variance (Species 0)")
+        plt.legend()
+        plt.show()
         
         if B_eq is not None:
-            # Average over time and over all patches (axes 0, 2, and 3)
-            mean_biomass = np.mean(traj, axis=(0,2,3))
-            rel_error = (mean_biomass - B_eq) / B_eq
-            print(f"\nMean final biomass: {mean_biomass}")
-            print(f"Relative error from equilibrium: {rel_error}")
-        
+            # Compare final simulation means with the analytical equilibrium (if available)
+            rel_error = (mean_final - B_eq) / B_eq
+            print(f"\nRelative error from analytical equilibrium: {rel_error}")
+    
     test_psd2_model()
+
+
 
 
 
