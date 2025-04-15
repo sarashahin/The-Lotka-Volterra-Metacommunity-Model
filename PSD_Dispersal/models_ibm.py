@@ -62,7 +62,8 @@ class IBMModel:
         # Shape: (S, NUM_PATCHES_Y, NUM_PATCHES_X)
         init_biomass = BODY_MASS/10
         self.N = np.full((self.S, NUM_PATCHES_Y, NUM_PATCHES_X), 
-                        int(init_biomass / BODY_MASS), dtype=int)
+                        max(1, int(init_biomass / BODY_MASS)), dtype=int)
+        
 
         # Storage for trajectory
         self.nrecords = self.nsteps // self.record_step
@@ -99,7 +100,7 @@ class IBMModel:
             
             # For adult dispersal, add the dispersal-away rate to mortality here.
             if self.dispersal_type == 'adult':
-                full_mortality = full_mortality + self.dispersal_away_rate
+                full_mortality = full_mortality + (self.dispersal_away_rate * 0.02)
             
             # Step
             # Death
@@ -147,26 +148,27 @@ class IBMModel:
       
 
 ############################################
-############################################
-# Testing
+# Testing IBM Model – Updated Test Code
 ############################################
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
-    from scipy import stats
-    
-    def test_ibm_model():
+    import numpy as np
+
+    def test_ibm_model_updated():
         """
-        Short test for IBMModel. This test:
+        Updated test for IBMModel.
+        This version:
           - Computes the analytical equilibrium.
-          - Runs the IBM simulation for a reduced number of steps.
-          - Averages biomass over patches (and time) to compare with the analytic solution.
-          - Plots the mean biomass time series.
+          - Runs the IBM simulation.
+          - Computes the mean and variance time series of biomass (averaged across patches).
+          - Plots the time series for one species.
+          - Prints the final mean biomass and the relative error from equilibrium.
         """
         np.random.seed(42)
         
         # Test parameters
         S = 3  # number of species
-        nsteps = 250000  # shorter simulation time for testing
+        nsteps = 250000  # simulation steps for testing
         r = np.array([0.8, 0.6, 0.7])
         C = np.array([
             [0.2, 0.1, 0.1],
@@ -174,7 +176,7 @@ if __name__ == "__main__":
             [0.1, 0.1, 0.2]
         ])
         
-        # Calculate analytical equilibrium solution:
+        # Analytical equilibrium solution:
         print("\nAnalytical Equilibrium Analysis:")
         try:
             C_inv = np.linalg.inv(C)
@@ -188,29 +190,47 @@ if __name__ == "__main__":
             print("Warning: Competition matrix is not invertible")
             B_eq = None
         
-        
-        # Initialize IBMModel with a shorter simulation time
+        # Initialize IBMModel with a shorter simulation time for testing
         model = IBMModel(r=r, C=C, nsteps=nsteps, record_step=10)
         
-        # Initialize patches uniformly (or with low variation)
-        # Here, we set each patch to a fixed value so that variation is minimal.
-        base_biomass = BODY_MASS * 100
-        model.N = np.full((S, NUM_PATCHES_Y, NUM_PATCHES_X), int(base_biomass / BODY_MASS))
-        
-        # Run simulation
+        # Run simulation. The trajectory is an array with shape (n_records, S, NUM_PATCHES_Y, NUM_PATCHES_X)
         trajectory = model.run()
         
+        # Compute the number of records and a time vector (assuming constant record_step timing)
+        nrecords = trajectory.shape[0]
+        record_times = np.linspace(0, nsteps, nrecords)
+        
+        # Compute time series of mean and variance (averaged over patches) for each species
+        # Here we average over patches (axes 2 and 3)
+        mean_time_series = np.mean(trajectory, axis=(2, 3))  # shape: (n_records, S)
+        var_time_series  = np.var(trajectory, axis=(2, 3))    # shape: (n_records, S)
+        
+        # Plot the time series for the first species
+        species = 0
+        plt.figure(figsize=(8, 5))
+        plt.plot(record_times, mean_time_series[:, species], label=f'Mean biomass (Species {species})')
+        std_dev = np.sqrt(var_time_series[:, species])
+        plt.fill_between(record_times,
+                         mean_time_series[:, species] - std_dev,
+                         mean_time_series[:, species] + std_dev,
+                         color='blue', alpha=0.2, label='Std. Deviation')
+        plt.xlabel("Time (steps)")
+        plt.ylabel("Biomass")
+        plt.title(f"Time Series of Mean Biomass and Std. Dev. (Species {species})")
+        plt.legend()
+        plt.show()
+        
+        # Compute final mean biomass by averaging over patches at the final recorded time
+        final_biomass = trajectory[-1, :, :, :]  # final time slice: shape (S, NUM_PATCHES_Y, NUM_PATCHES_X)
+        mean_final = np.mean(final_biomass, axis=(1, 2))  # one mean per species
+        print("\nFinal Mean biomass for each species:", mean_final)
+        
         if B_eq is not None:
-            # Average biomass across patches and time (time dimension is axis 0, patches are axes 2 and 3)
-            mean_biomass = np.mean(trajectory, axis=(0, 2, 3))
-            rel_error = (mean_biomass - B_eq) / B_eq
-            print(f"\nMean final biomass: {mean_biomass}")
-            print(f"Relative error from equilibrium: {rel_error}")
-            
-            final_growth_rates = r - C @ mean_biomass
-            print(f"Final growth rates: {final_growth_rates}")
-            print(f"Max absolute growth rate: {np.max(np.abs(final_growth_rates))}")
+            # Compute relative error from analytical equilibrium
+            rel_error = (mean_final - B_eq) / B_eq
+            print("Relative error from equilibrium:", rel_error)
     
-    test_ibm_model()
+    test_ibm_model_updated()
+
 
                 
