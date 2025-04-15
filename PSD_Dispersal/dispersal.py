@@ -1,6 +1,8 @@
+
 ############################################
 # dispersal.py
 ############################################
+
 """
 Dispersal module.
 Computes dispersal between patches using a source-based approach.
@@ -71,21 +73,21 @@ def compute_dispersal(B):
     if B.ndim != 3:
         raise ValueError("Input array B must have shape (S, NUM_PATCHES_Y, NUM_PATCHES_X)")
     
-    total_num_patches = NUM_PATCHES_X * NUM_PATCHES_Y
-    S = B.shape[0]
+    # total_num_patches = NUM_PATCHES_X * NUM_PATCHES_Y
+    # S = B.shape[0]
     
-    outgoing_flux = np.zeros_like(B)
-    incoming_flux = np.zeros_like(B)
+    # outgoing_flux = np.zeros_like(B)
+    # incoming_flux = np.zeros_like(B)
     
     # Process each species separately.
-    for s in range(S):
-        species_B = B[s]
+    # for s in range(S):
+    #     species_B = B[s]
         
-        # Compute the average neighbor biomass using the precomputed matrix.
-        # Flatten species_B to a vector.
-        species_B_flat = species_B.flatten()
-        neighbor_mean_flat = LOCAL_DISPERSAL_MATRIX.dot(species_B_flat)
-        neighbor_mean = neighbor_mean_flat.reshape(species_B.shape)
+    #     # Compute the average neighbor biomass using the precomputed matrix.
+    #     # Flatten species_B to a vector.
+    #     species_B_flat = species_B.flatten()
+    #     neighbor_mean_flat = LOCAL_DISPERSAL_MATRIX.dot(species_B_flat)
+    #     neighbor_mean = neighbor_mean_flat.reshape(species_B.shape)
         
         
         # Compute the biomass difference (source minus neighbor mean).
@@ -101,27 +103,49 @@ def compute_dispersal(B):
         
         # Passive dispersal: each patch disperses a fixed fraction of its biomass,
         # regardless of local biomass differences.
-        dispersal_flux = DISPERSAL_RATE * species_B
+    #     dispersal_flux = DISPERSAL_RATE * species_B
 
         
-        # Split the flux into local and long-distance components.
-        local_flux = (1 - LONG_DISTANCE_PROB) * dispersal_flux
-        ldd_flux = LONG_DISTANCE_PROB * dispersal_flux
+    #     # Split the flux into local and long-distance components.
+    #     local_flux = (1 - LONG_DISTANCE_PROB) * dispersal_flux
+    #     ldd_flux = LONG_DISTANCE_PROB * dispersal_flux
         
-        # Record the total outgoing flux.
-        outgoing_flux[s] = dispersal_flux
+    #     # Record the total outgoing flux.
+    #     outgoing_flux[s] = dispersal_flux
         
-        # Compute local incoming flux via matrix multiplication:
-        local_flux_flat = local_flux.flatten()
-        local_incoming_flat = LOCAL_DISPERSAL_MATRIX.T.dot(local_flux_flat)
-        local_incoming = local_incoming_flat.reshape(species_B.shape)
+    #     # Compute local incoming flux via matrix multiplication:
+    #     local_flux_flat = local_flux.flatten()
+    #     local_incoming_flat = LOCAL_DISPERSAL_MATRIX.T.dot(local_flux_flat)
+    #     local_incoming = local_incoming_flat.reshape(species_B.shape)
         
-        # Compute long-distance incoming flux:
-        # Sum the long-distance flux from all patches and distribute uniformly.
-        total_ldd_flux = np.sum(ldd_flux)
-        ldd_incoming = total_ldd_flux / total_num_patches
+    #     # Compute long-distance incoming flux:
+    #     # Sum the long-distance flux from all patches and distribute uniformly.
+    #     total_ldd_flux = np.sum(ldd_flux)
+    #     ldd_incoming = total_ldd_flux / total_num_patches
         
-        # Total incoming flux is the sum of local and long-distance contributions.
-        incoming_flux[s] = local_incoming + ldd_incoming
+    #     # Total incoming flux is the sum of local and long-distance contributions.
+    #     incoming_flux[s] = local_incoming + ldd_incoming
     
+    # return outgoing_flux, incoming_flux
+    
+    
+    S, ny, nx = B.shape
+    N = nx * ny
+
+    # Outgoing flux is proportional to biomass.
+    outgoing_flux = DISPERSAL_RATE * B
+
+    # Split outgoing flux.
+    local_flux = (1 - LONG_DISTANCE_PROB) * outgoing_flux
+    ldd_flux   = LONG_DISTANCE_PROB * outgoing_flux
+
+    # Compute local incoming flux (vectorized over all species).
+    local_incoming = (local_flux.reshape(S, -1) @ LOCAL_DISPERSAL_MATRIX.T).reshape(B.shape)
+    
+    # Compute long-distance flux: distribute uniformly.
+    total_ldd_flux = np.sum(ldd_flux, axis=(1, 2), keepdims=True)
+    ldd_incoming = total_ldd_flux / N
+
+    incoming_flux = local_incoming + ldd_incoming
+
     return outgoing_flux, incoming_flux
