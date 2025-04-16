@@ -34,7 +34,7 @@ class IBMModel:
     - Includes dispersal between patches
     - Supports both adult and propagule dispersal
     """
-    def __init__(self, r, C, nsteps=None, record_step=None, seed=123, dispersal_type='adult', dispersal_away_rate=None):
+    def __init__(self, r, C, nsteps=None, record_step=None, seed=123, dispersal_type='propagule', dispersal_away_rate=None):
         """
         :param r: 1D array of intrinsic growth rates (length S).
         :param C: 2D competition matrix (SxS).
@@ -53,17 +53,17 @@ class IBMModel:
         if dispersal_away_rate is not None:
             self.dispersal_away_rate = dispersal_away_rate
         else:
-            self.dispersal_away_rate = np.sum(LOCAL_DISPERSAL_MATRIX, axis=0).reshape((NUM_PATCHES_Y, NUM_PATCHES_X))
-            
+            self.dispersal_away_rate = \
+                np.asarray(LOCAL_DISPERSAL_MATRIX.sum(axis=0)).flatten(). \
+                reshape((NUM_PATCHES_Y, NUM_PATCHES_X))
 
         np.random.seed(seed)
 
         # Initialize counts (N) for each patch
         # Shape: (S, NUM_PATCHES_Y, NUM_PATCHES_X)
-        init_biomass = BODY_MASS/10
+        init_biomass = BODY_MASS /10
         self.N = np.full((self.S, NUM_PATCHES_Y, NUM_PATCHES_X), 
-                        max(1, int(init_biomass / BODY_MASS)), dtype=int)
-        
+                        max(10, int(init_biomass / BODY_MASS)), dtype=int)
 
         # Storage for trajectory
         self.nrecords = self.nsteps // self.record_step
@@ -79,11 +79,15 @@ class IBMModel:
         record_idx = 0
         
         for s in range(self.nsteps):
+            
             # Convert counts to biomass for all patches
             B = self.N * BODY_MASS  # Shape: (S, NUM_PATCHES_Y, NUM_PATCHES_X)
             
+            if s%1==0:
+                print(f"step {s}, {s/self.nsteps}, {np.sum(self.N)}")
+                
             # Compute dispersal flux between patches
-            outgoing_flux, incoming_flux = compute_dispersal(B)  # Same shape as B
+            incoming_flux = compute_dispersal(B)  # Same shape as B
             
             # Reshape B for matrix multiplication with C
             B_reshaped = B.reshape(self.S, -1)  # Shape: (S, NUM_PATCHES_Y * NUM_PATCHES_X)
@@ -91,6 +95,9 @@ class IBMModel:
             # Calculate growth rates for all patches at once
             # C @ B_reshaped will have shape (S, NUM_PATCHES_Y * NUM_PATCHES_X)
             local_growth_rates = (self.r.reshape(-1, 1) - self.C @ B_reshaped).reshape(B.shape)
+            if self.dispersal_type == 'adult':
+                local_growth_rates = local_growth_rates - \
+                    np.broadcast_to(self.dispersal_away_rate,local_growth_rates.shape)
             
             # Handle fast dying: localGrowthRate < - MORTALITY_RATE
             fast_dying = local_growth_rates < (-MORTALITY_RATE)
@@ -100,7 +107,7 @@ class IBMModel:
             
             # For adult dispersal, add the dispersal-away rate to mortality here.
             if self.dispersal_type == 'adult':
-                full_mortality = full_mortality + (self.dispersal_away_rate * 0.02)
+                full_mortality = full_mortality + self.dispersal_away_rate
             
             # Step
             # Death
@@ -111,30 +118,14 @@ class IBMModel:
             birth_lambda = (np.exp((local_growth_rates + MORTALITY_RATE) * STEP_SIZE) - 1) * new_N
             birth_values = np.random.poisson(birth_lambda)
             
-            # Handle dispersal based on type
-            # if self.dispersal_type == 'adult':
-            #     # Adult dispersal: remove from existing population
-            #     dispersal_prob = outgoing_flux * STEP_SIZE / (B + 1e-10)
-            #     outgoing = np.random.binomial(new_N, dispersal_prob)
-            #     new_N = new_N - outgoing
-            #     incoming = np.random.poisson(incoming_flux * STEP_SIZE / BODY_MASS)
-            #     self.N = new_N + birth_values + incoming
-            # else:  # propagule dispersal
-            #     # Propagule dispersal: remove from new births
-            #     dispersal_prob = outgoing_flux * STEP_SIZE / (B + 1e-10)
-            #     outgoing = np.random.binomial(birth_values, dispersal_prob)
-            #     birth_values = birth_values - outgoing
-            #     # incoming = np.random.poisson(incoming_flux * STEP_SIZE / BODY_MASS)
-            #     self.N = new_N + birth_values
-            
-            # --- Unified dispersal handling ---
             # Incoming dispersers are computed from the incoming_flux.
             incoming = np.random.poisson(incoming_flux * STEP_SIZE / BODY_MASS)
             # Update population by adding surviving individuals, new births, and incoming dispersers.
             self.N = new_N + birth_values + incoming 
             
             # Ensure no negative counts
-            self.N = np.maximum(self.N, 0)
+            if (self.N < 0).any():
+                sys.exit("Negative abundances!!")
             
             # Recording
             if (s+1) % self.record_step == 0:
@@ -168,12 +159,12 @@ if __name__ == "__main__":
         
         # Test parameters
         S = 3  # number of species
-        nsteps = 250000  # simulation steps for testing
-        r = np.array([0.8, 0.6, 0.7])
+        nsteps = 250 # shorter simulation time for testing
+        r = np.array([1.0, 1.0, 1.0])
         C = np.array([
-            [0.2, 0.1, 0.1],
-            [0.1, 0.2, 0.1],
-            [0.1, 0.1, 0.2]
+            [1.0, 1.7, 0.4],
+            [0.4, 1.0, 1.7],
+            [1.7, 0.4, 1.0]
         ])
         
         # Analytical equilibrium solution:
@@ -191,7 +182,7 @@ if __name__ == "__main__":
             B_eq = None
         
         # Initialize IBMModel with a shorter simulation time for testing
-        model = IBMModel(r=r, C=C, nsteps=nsteps, record_step=10)
+        model = IBMModel(r=r, C=C, nsteps=nsteps, record_step=10, dispersal_type="propagule")
         
         # Run simulation. The trajectory is an array with shape (n_records, S, NUM_PATCHES_Y, NUM_PATCHES_X)
         trajectory = model.run()
@@ -216,7 +207,7 @@ if __name__ == "__main__":
                          color='blue', alpha=0.2, label='Std. Deviation')
         plt.xlabel("Time (steps)")
         plt.ylabel("Biomass")
-        plt.title(f"Time Series of Mean Biomass and Std. Dev. (Species {species})")
+        plt.title(f"Time Series of Mean Biomass and Std. Dev.IBM Model (Species {species})")
         plt.legend()
         plt.show()
         
