@@ -121,8 +121,7 @@ class PSD2Model:
         pclock_flat = y[total_elements: 2 * total_elements]
         logB = logB_flat.reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
         pclock = pclock_flat.reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
-        
-        
+
         B = np.exp(logB)
         # Compute the biomass for each species in each patch.
         epsilon = 1e-300
@@ -152,7 +151,13 @@ class PSD2Model:
         # Note the sign change (minus) to match the one-patch formulation.
         # The mortality/dispersal-away term is now scaled by 1 so that it aligns with the lecture derivations.
         dlogB = effective_growth + (invasion / safeB) - 2 * sw_reshaped * (local_growth + diagB)
+        ## With local dispersal, sudden biomass increase in
+        ## neighbouring patches can lead to large invasion/safeB
+        ## terms that destabilise EulerSimple.  We put a limit to the
+        ## impact here.
+        dlogB = np.clip(dlogB, a_min=None, a_max=10)
 
+        
         # For establishment probability: include dispersal-away in effective mortality for adult dispersal.
         non_self_growth = local_growth + diagB
         sw_reshaped = np.array(sw).reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
@@ -323,18 +328,23 @@ class PSD2Model:
         problem.number_of_state_events = 2 * self.S * NUM_PATCHES_Y * NUM_PATCHES_X
 
         # Solver configuration
-        solver = CVode(problem)
-        solver.discr = 'BDF'
-        solver.iter = 'Newton'
-        solver.linear_solver = 'SPGMR'
-        solver.rtol = 1e-6
-        solver.atol = 1e-6
-        solver.inith = 1e-7
-        solver.maxh = 1e10
+        # solver = CVode(problem)
+        # solver.discr = 'BDF'
+        # solver.iter = 'Newton'
+        # solver.linear_solver = 'SPGMR'
+        # solver.rtol = 1e-6
+        # solver.atol = 1e-6
+        # solver.inith = 1e-7
+        # solver.maxh = 1e10
+        # solver.store_event_points = False
+        # solver.options["mxhnil"] = 5
+        # solver.options['maxsteps'] = 20000
+        # solver.options['verbosity'] = 30
+
+        solver = EulerSimple(problem)
+        solver.options['inith'] = 1
+        solver.options['maxsteps'] = 10000000
         solver.store_event_points = False
-        solver.options["mxhnil"] = 5
-        solver.options['maxsteps'] = 20000
-        solver.options['verbosity'] = 30
 
         # # #### TEST FOR TECHNICAL ERRORS: ####
         # self._derivatives(0, y0, solver.sw)
@@ -428,18 +438,28 @@ if __name__ == "__main__":
         # Set random seed for reproducibility.
         np.random.seed(42)
         
+        # # Test parameters
+        # S = 3  # number of species
+        # nsteps = 25000  # extended simulation time
+        
+        # # Define growth rates and competition matrix
+        # r = np.array([0.8, 0.6, 0.7])
+        # C = np.array([
+        #     [0.2, 0.1, 0.1],
+        #     [0.1, 0.2, 0.1],
+        #     [0.1, 0.1, 0.2]
+        # ])
+        
         # Test parameters
         S = 3  # number of species
-        nsteps = 25000  # extended simulation time
-        
-        # Define growth rates and competition matrix
-        r = np.array([0.8, 0.6, 0.7])
+        nsteps = 20000 # shorter simulation time for testing
+        r = np.array([1.0, 1.0, 1.0])
         C = np.array([
-            [0.2, 0.1, 0.1],
-            [0.1, 0.2, 0.1],
-            [0.1, 0.1, 0.2]
+            [1.0, 1.7, 0.4],
+            [0.4, 1.0, 1.7],
+            [1.7, 0.4, 1.0]
         ])
-        
+
         # Compute analytical equilibrium (for reference)
         print("\nAnalytical Equilibrium Analysis:")
         try:
@@ -455,7 +475,11 @@ if __name__ == "__main__":
             B_eq = None
         
         print("\nTesting PSD2Model with dispersal injection:")
-        model = PSD2Model(r=r, C=C, tmax=nsteps, record_step=10, seed=42, dispersal_type='adult')
+        model = PSD2Model(r=r, C=C, tmax=nsteps, record_step=10, seed=42, dispersal_type='propagule')
+
+        # Randomise initial state a bit:
+        model.logB = model.logB + 0.5*(np.random.random_sample(model.logB.shape) - 0.5)
+        
         t_points, traj, wait_traj, pclock_traj, growth_traj, inv_rate_traj, estab_prob_traj = model.run()
 
         # Calculate mean and variance over patches at every recorded time.
@@ -492,13 +516,3 @@ if __name__ == "__main__":
             print(f"\nRelative error from analytical equilibrium: {rel_error}")
     
     test_psd2_model()
-
-
-
-
-
-
-
-
-
-

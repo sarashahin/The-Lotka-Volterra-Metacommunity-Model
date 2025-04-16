@@ -44,11 +44,11 @@ def create_local_dispersal_matrix():
                     if di == 0 and dj == 0:
                         continue  # Skip the center cell.
                     if di*dj != 0:
-                        continue  # Do only nearest neighbors, as is conventional.
+                        continue  # Use only nearest neighbors as conventional.
                     ni = (i + di) % NUM_PATCHES_Y
                     nj = (j + dj) % NUM_PATCHES_X
                     n_idx = ni * NUM_PATCHES_X + nj
-                    D[idx, n_idx] = 1 # Convention has it to use a one here.
+                    D[idx, n_idx] = 1.0/4.0
     return DISPERSAL_RATE * D
 
 # Precompute the local dispersal matrix once.

@@ -56,7 +56,6 @@ class IBMModel:
             self.dispersal_away_rate = \
                 np.asarray(LOCAL_DISPERSAL_MATRIX.sum(axis=0)).flatten(). \
                 reshape((NUM_PATCHES_Y, NUM_PATCHES_X))
-        print(f"DISPERSAL_AWAY_RATE: {dispersal_away_rate}")
 
         np.random.seed(seed)
 
@@ -156,6 +155,16 @@ if __name__ == "__main__":
           - Plots the mean biomass time series.
         """
         np.random.seed(42)
+        
+        # # Test parameters
+        # S = 3  # number of species
+        # nsteps = 250  # shorter simulation time for testing
+        # r = np.array([0.8, 0.6, 0.7])
+        # C = np.array([
+        #     [0.2, 0.1, 0.1],
+        #     [0.1, 0.2, 0.1],
+        #     [0.1, 0.1, 0.2]
+        # ])
         
         # Test parameters
         S = 3  # number of species
