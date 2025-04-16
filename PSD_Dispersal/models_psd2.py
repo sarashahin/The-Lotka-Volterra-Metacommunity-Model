@@ -452,7 +452,7 @@ if __name__ == "__main__":
         
         # Test parameters
         S = 3  # number of species
-        nsteps = 250 # shorter simulation time for testing
+        nsteps = 1000 # shorter simulation time for testing
         r = np.array([1.0, 1.0, 1.0])
         C = np.array([
             [1.0, 1.7, 0.4],
@@ -496,7 +496,7 @@ if __name__ == "__main__":
         print("Final Variance for each species:", var_final)
         
         # Plot the time series for the first species (Species 0)
-        plt.figure()
+        plt.figure(figsize=(8, 5))
         plt.plot(t_points, mean_time_series[:, 0], label='Mean biomass (Species 0)')
         # Plot ± one standard deviation around the mean
         std_dev_species0 = np.sqrt(var_time_series[:, 0])

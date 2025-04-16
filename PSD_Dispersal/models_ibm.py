@@ -159,7 +159,7 @@ if __name__ == "__main__":
         
         # Test parameters
         S = 3  # number of species
-        nsteps = 250 # shorter simulation time for testing
+        nsteps = 1000 # shorter simulation time for testing
         r = np.array([1.0, 1.0, 1.0])
         C = np.array([
             [1.0, 1.7, 0.4],
