@@ -63,7 +63,7 @@ class IBMModel:
         # Shape: (S, NUM_PATCHES_Y, NUM_PATCHES_X)
         init_biomass = BODY_MASS /10
         self.N = np.full((self.S, NUM_PATCHES_Y, NUM_PATCHES_X), 
-                        max(10, int(init_biomass / BODY_MASS)), dtype=int)
+                        max(1, int(init_biomass / BODY_MASS)), dtype=int)
 
         # Storage for trajectory
         self.nrecords = self.nsteps // self.record_step
