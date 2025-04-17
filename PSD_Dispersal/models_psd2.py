@@ -398,8 +398,20 @@ class PSD2Model:
                 ####!!!! but failed because he did not understand how
                 ####!!!! the indexing works.
                 denom = local_growth[j] + MORTALITY_RATE
-                est_prob[j][pos_mask] = local_growth[j][pos_mask] / denom[pos_mask]
-                inv_rate[j] = invasion[j] * est_prob[j] / BODY_MASS
+                if self.dispersal_type == 'adult':
+                    denom = denom + self.dispersal_away_rate
+
+                # establishment probability only where growth>0
+                est = np.zeros_like(local_growth[j])
+                est[pos_mask] = local_growth[j][pos_mask] / denom[pos_mask]
+
+                # invasion flux scaled by establishment and normalized by body mass
+                inv_rate[j] = invasion[j] * est / BODY_MASS
+                est_prob[j] = est
+                # -----------------------------------------------
+                # est_prob[j][pos_mask] = local_growth[j][pos_mask] / denom[pos_mask]
+                # inv_rate[j] = invasion[j] * est_prob[j] / BODY_MASS
+                # -----------------------------------------------                
             self.poisson_clock_traj[step, :, :, :] = pclock
             self.growth_rate_traj[step, :, :, :] = local_growth
             self.invasion_rate_traj[step, :, :, :] = inv_rate
@@ -496,7 +508,7 @@ if __name__ == "__main__":
         print("Final Variance for each species:", var_final)
         
         # Plot the time series for the first species (Species 0)
-        plt.figure(figsize=(8, 5))
+        plt.figure()
         plt.plot(t_points, mean_time_series[:, 0], label='Mean biomass (Species 0)')
         # Plot ± one standard deviation around the mean
         std_dev_species0 = np.sqrt(var_time_series[:, 0])
@@ -506,7 +518,7 @@ if __name__ == "__main__":
                          color='blue', alpha=0.2, label='Std. Dev.')
         plt.xlabel("Time")
         plt.ylabel("Biomass")
-        plt.title("Time series of Mean Biomass and Variance PSD2 Model (Species 0)")
+        plt.title("Time series of Mean Biomass and Variance (Species 0)")
         plt.legend()
         plt.show()
         
