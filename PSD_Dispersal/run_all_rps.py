@@ -95,12 +95,14 @@ def main(argv=None):
     #  PSD2
     # =====================================================================
     if use_assembly:
-        r_psd, C_psd = stepwise_assembly_psd2(
+        r_psd, C_psd, extra_psd = stepwise_assembly_psd2(
             window_time=args.assemble_horizon,
             record_step=args.record)
+        data['PSD2_occ'] = extra_psd['occ_counts']          # NEW
         dispersal.set_invasion_pressure(None)            # safety
     else:
         r_psd, C_psd = r0, C0
+        extra_psd = {}  # Empty dict to avoid errors when referenced
 
     m_psd = PSD2Model(r_psd, C_psd,
                       tmax=args.tmax, record_step=args.record,
@@ -120,13 +122,14 @@ def main(argv=None):
     #  IBM
     # =====================================================================
     if use_assembly:
-        r_ibm, C_ibm, N_ibm = stepwise_assembly_ibm(
+        r_ibm, C_ibm, N_ibm, extra_ibm = stepwise_assembly_ibm(
             window_steps=int(args.assemble_horizon/STEP_SIZE),
             record_step=int(args.record/STEP_SIZE),
             seed_size=5)
     else:
         r_ibm, C_ibm = r0, C0
         N_ibm        = None                                 # nothing to save
+        extra_ibm     = {}          # nothing to add later
 
     m_ibm = IBMModel(r_ibm, C_ibm,
                      nsteps=int(args.tmax/STEP_SIZE),
@@ -141,6 +144,10 @@ def main(argv=None):
                    ext_step=first_extinction_time(B_ibm, t_ibm))
     if N_ibm is not None:            # only when we actually assembled
         ibm_blk['N_final'] = N_ibm
+    if extra_ibm:
+        ibm_blk['occ_counts'] = extra_ibm['occ_counts']
+        
+        
     data.update({f'IBM_{k}': v for k,v in ibm_blk.items()})
 
     if not args.no_movie:
