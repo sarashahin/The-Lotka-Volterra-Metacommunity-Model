@@ -6,14 +6,12 @@ import numpy as np
 import os
 
 # Determine the base directory 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# Build the relative path to the data file
-data_file = os.path.join(BASE_DIR, "model_outputs.npz")
+BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+DATA_FILE = os.path.join(BASE_DIR, "results", "data", "rps_dataset_full.npz")
+data      = np.load(DATA_FILE, allow_pickle=True)
 
-# Load the data using NumPy
-data = np.load(data_file, allow_pickle=True)
 
-def print_limited(key, arr, num=4):
+def print_limited(key, arr, num=1):
     print(f"Key: {key}")
     print("Shape:", arr.shape)
     if arr.ndim == 0:
@@ -32,4 +30,4 @@ print("Available keys:", data.files)
 print("\n" + "="*50 + "\n")
 
 for key in data.files:
-    print_limited(key, data[key], num=4)
+    print_limited(key, data[key], num=1)
