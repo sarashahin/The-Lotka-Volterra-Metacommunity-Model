@@ -92,8 +92,8 @@ def animate_spatial(traj, title='', filename=None, fps=30):
     for i in range(S, len(axes)):
         axes[i].set_visible(False)
     
-    # Set up initial frame
-    vmax = [np.max(traj[:,i]) for i in range(S)]
+    # Set up initial frame/ – guarantee vmax > 0 to avoid divide-by-zero
+    vmax = [max(np.max(traj[:, i]), 1e-12) for i in range(S)]
     for i in range(S):
         im = axes[i].imshow(traj[0,i], vmin=0, vmax=vmax[i] or 1)
         axes[i].set_title(f'Species {i}')
