@@ -4,26 +4,30 @@
 
 import numpy as np
 from config import CONNECTANCE, INTERACTION_STRENGTH
+from typing import Tuple  # Add this import
 
 def draw_interactions(k: int, *, rng=np.random):
     """
-    Draw a size-(k,) vector of inter-specific coefficients for ONE new species
-    from the Jack-style distribution.
-    Returns (new_row, new_col) where
+    Return (row, col) – the interactions between ONE *new* species
+    and the current γ=k residents.
 
-      new_row[j]  = effect of resident j ON the new species
-      new_col[j]  = effect of the new species ON resident j
+       row[j] = effect of resident j  → new
+       col[j] = effect of new        → resident j
+    Non–zero entries occur with probability CONNECTANCE and have the
+    *constant* magnitude INTERACTION_STRENGTH (Axel’s default).
     """
     mask = rng.random(k) < CONNECTANCE
     new_row = np.zeros(k)
-    new_col = np.zeros(k)
-    new_row[mask] = INTERACTION_STRENGTH * rng.random(mask.sum())
+    new_row[mask] = INTERACTION_STRENGTH         # constant value
+
     mask = rng.random(k) < CONNECTANCE
-    new_col[mask] = INTERACTION_STRENGTH * rng.random(mask.sum())
+    new_col = np.zeros(k)
+    new_col[mask] = INTERACTION_STRENGTH         # constant value
     return new_row, new_col
 
+
 def expand_RC(r: np.ndarray, C: np.ndarray, r_new: float,
-              row: np.ndarray, col: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+              row: np.ndarray, col: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Append one species to (r,C) and keep C_ii = 1."""
     r_out = np.append(r, r_new)
     k = len(r)
