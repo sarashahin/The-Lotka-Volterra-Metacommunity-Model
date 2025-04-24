@@ -8,6 +8,7 @@ Now includes multi-patch dynamics with dispersal.
 """
 import numpy as np
 import logging
+from typing import Optional  
 from config import (
     BODY_MASS,
     MORTALITY_RATE,
@@ -17,11 +18,14 @@ from config import (
     RECORDING_STEP_SIZE,
     NUM_PATCHES_X,
     NUM_PATCHES_Y,
-    DISPERSAL_RATE
+    DISPERSAL_RATE,
+    CONNECTANCE,            # ◀◀◀
+    INTERACTION_STRENGTH    # ◀◀◀
 )
 from dispersal import compute_dispersal
 from dispersal import LOCAL_DISPERSAL_MATRIX
-
+from environment import generate_spatial_r     # ◀◀◀
+from config import LONG_DISTANCE_PROB
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +38,20 @@ class IBMModel:
     - Includes dispersal between patches
     - Supports both adult and propagule dispersal
     """
-    def __init__(self, r, C, nsteps=None, record_step=None, seed=123, dispersal_type='propagule', dispersal_away_rate=None):
+    def __init__(self,
+                 r,                 # either 1D array (length S) or ignored if r_field supplied
+                #  C,
+                 C=None,
+                 initial_N: Optional[np.ndarray] = None,   
+                 r_field=None,      # ◀◀◀ CHANGED: expect spatial field of shape (S, Y, X)
+                 length_scale=None, # ◀◀◀ CHANGED: for on‐the‐fly generation
+                 var_r=None,        # ◀◀◀ CHANGED: for on‐the‐fly generation
+                 seed_field=None,   # ◀◀◀ CHANGED: seed for generate_spatial_r
+                 nsteps=None,
+                 record_step=None,
+                 seed=123,
+                 dispersal_type='propagule',
+                 dispersal_away_rate=None):
         """
         :param r: 1D array of intrinsic growth rates (length S).
         :param C: 2D competition matrix (SxS).
@@ -43,9 +60,38 @@ class IBMModel:
         :param seed: random seed for reproducibility.
         :param dispersal_type: 'adult' or 'propagule' - specifies which life stage disperses
         """
-        self.r = r
-        self.C = C
+        # self.r = r
+        # self.C = C
         self.S = len(r)  # number of species
+        
+        # ◀◀◀ CHANGED: competition matrix
+        if C is None:
+            rng = np.random.default_rng(seed)
+            C = np.eye(self.S, dtype=float)
+            for i in range(self.S):
+                for j in range(self.S):
+                    if i != j and rng.random() < CONNECTANCE:
+                        C[i,j] = INTERACTION_STRENGTH * rng.random()
+        self.C = np.asarray(C, float)
+
+        # ◀◀◀ CHANGED: spatial r_field
+        if r_field is None:
+            if (length_scale is not None) and (var_r is not None):
+                self.r_field = generate_spatial_r(
+                    self.S, NUM_PATCHES_Y, NUM_PATCHES_X,
+                    length_scale, r, var_r, seed=seed_field
+                )
+            else:
+                self.r_field = np.broadcast_to(
+                    np.asarray(r, float).reshape(self.S,1,1),
+                    (self.S, NUM_PATCHES_Y, NUM_PATCHES_X)
+                )
+        else:
+            assert r_field.shape == (self.S, NUM_PATCHES_Y, NUM_PATCHES_X)
+            self.r_field = r_field
+
+        self.r_flat = self.r_field.reshape(self.S, -1)
+        
         self.nsteps = nsteps if nsteps is not None else TMAX
         self.record_step = record_step if record_step is not None else RECORDING_STEP_SIZE
         self.dispersal_type = dispersal_type
@@ -61,9 +107,24 @@ class IBMModel:
 
         # Initialize counts (N) for each patch
         # Shape: (S, NUM_PATCHES_Y, NUM_PATCHES_X)
-        init_biomass = BODY_MASS /10
-        self.N = np.full((self.S, NUM_PATCHES_Y, NUM_PATCHES_X), 
-                        max(1, int(init_biomass / BODY_MASS)), dtype=int)
+        # init_biomass = BODY_MASS /10
+        # self.N = np.full((self.S, NUM_PATCHES_Y, NUM_PATCHES_X), 
+        #                 max(1, int(init_biomass / BODY_MASS)), dtype=int)
+        
+        # ◀◀◀ CHANGED: initialize N with random values
+        # right
+        if initial_N is not None:  # ← caller DID supply counts
+            assert initial_N.shape == (self.S, NUM_PATCHES_Y, NUM_PATCHES_X)
+            self.N = initial_N.copy()
+        else:
+            init_biomass = BODY_MASS / 10
+            self.N = np.full(
+                (self.S, NUM_PATCHES_Y, NUM_PATCHES_X),
+                max(1, int(init_biomass / BODY_MASS)),
+                dtype=int
+            )
+
+
 
         # Storage for trajectory
         self.nrecords = self.nsteps // self.record_step
@@ -83,8 +144,11 @@ class IBMModel:
             # Convert counts to biomass for all patches
             B = self.N * BODY_MASS  # Shape: (S, NUM_PATCHES_Y, NUM_PATCHES_X)
             
-            if s%1==0:
-                print(f"step {s}, {s/self.nsteps}, {np.sum(self.N)}")
+            # if s%1==0:
+            #     print(f"step {s}, {s/self.nsteps}, {np.sum(self.N)}")
+            
+            if s % 100 == 0:
+                print(f"step {s}, {s/self.nsteps:.1%}, total N = {self.N.sum()}")
                 
             # Compute dispersal flux between patches
             incoming_flux = compute_dispersal(B)  # Same shape as B
@@ -94,10 +158,16 @@ class IBMModel:
             
             # Calculate growth rates for all patches at once
             # C @ B_reshaped will have shape (S, NUM_PATCHES_Y * NUM_PATCHES_X)
-            local_growth_rates = (self.r.reshape(-1, 1) - self.C @ B_reshaped).reshape(B.shape)
+            # local_growth_rates = (self.r.reshape(-1, 1) - self.C @ B_reshaped).reshape(B.shape)
+            
+            # ◀◀◀ CHANGED: use spatial r_flat
+            local_growth_flat = self.r_flat - (self.C @ B_reshaped)
+            local_growth_rates = local_growth_flat.reshape(B.shape)
+            
             if self.dispersal_type == 'adult':
-                local_growth_rates = local_growth_rates - \
-                    np.broadcast_to(self.dispersal_away_rate,local_growth_rates.shape)
+                local_growth_rates -= np.broadcast_to(self.dispersal_away_rate, local_growth_rate.shape)
+                # local_growth_rates = local_growth_rates - \
+                #     np.broadcast_to(self.dispersal_away_rate,local_growth_rates.shape)
             
             # Handle fast dying: localGrowthRate < - MORTALITY_RATE
             fast_dying = local_growth_rates < (-MORTALITY_RATE)
@@ -222,6 +292,9 @@ if __name__ == "__main__":
             print("Relative error from equilibrium:", rel_error)
     
     test_ibm_model_updated()
+    
+    
+
 
 
                 
