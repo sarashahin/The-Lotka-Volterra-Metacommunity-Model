@@ -17,7 +17,26 @@ import logging
 
 from config import DISPERSAL_RATE, NUM_PATCHES_X, NUM_PATCHES_Y, LONG_DISTANCE_PROB
 
+# ‹NEW›  –– external invasion tap (uniform per‑patch flux, species‑specific)
+_EXTRA_INVASION = None            # will hold shape (S, Ny, Nx) at runtime
+
+
 logger = logging.getLogger(__name__)
+
+def set_invasion_pressure(arr):
+    """
+    arr: ndarray (S, Ny, Nx) – flux of propagules per patch & species.
+         Use zeros to switch the tap off again.
+    """
+    global _EXTRA_INVASION
+    # _EXTRA_INVASION = np.asarray(arr, float)
+    if arr is None:
+        _EXTRA_INVASION = None
+    else:
+        _EXTRA_INVASION = np.asarray(arr, float)
+        # if _EXTRA_INVASION.shape != (len(arr), NUM_PATCHES_Y, NUM_PATCHES_X):
+        #     raise ValueError(f"arr shape {arr.shape} does not match grid size "
+        #                      f"{NUM_PATCHES_Y}×{NUM_PATCHES_X}")
 
 def create_local_dispersal_matrix():
     """
@@ -86,5 +105,10 @@ def compute_dispersal(B):
         
     incoming_flux = (1 - LONG_DISTANCE_PROB) * dispersal_flux + \
         np.broadcast_to(ldd_incoming[:, np.newaxis],dispersal_flux.shape)
+        
+    # ‹NEW› ---------------------------------------------------------------
+    if _EXTRA_INVASION is not None:
+        incoming_flux += _EXTRA_INVASION.reshape(S, -1)
+    # --------------------------------------------------------------------
     
     return incoming_flux.reshape(B.shape)
