@@ -17,6 +17,8 @@ import logging
 from assimulo.solvers import CVode  # or use preferred solver
 from assimulo.problem import Explicit_Problem
 from euler_simple import EulerSimple  # fallback solver if needed
+# ◀◀◀ CHANGED: import the generator signature for type hints
+from environment import generate_spatial_r
 import math
 
 # Import necessary constants from  config file
@@ -28,7 +30,9 @@ from config import (
     NUM_PATCHES_X,
     NUM_PATCHES_Y,
     DISPERSAL_RATE,
-    LONG_DISTANCE_PROB
+    LONG_DISTANCE_PROB,
+    CONNECTANCE,            # ◀◀◀
+    INTERACTION_STRENGTH    # ◀◀◀
 )
 # Import dispersal routine and precomputed matrix
 from dispersal import compute_dispersal, LOCAL_DISPERSAL_MATRIX
@@ -36,8 +40,20 @@ from dispersal import compute_dispersal, LOCAL_DISPERSAL_MATRIX
 logger = logging.getLogger(__name__)
 
 class PSD2Model:
-    def __init__(self, r, C, tmax=None, record_step=None, seed=123,
-                 dispersal_type='propagule', dispersal_away_rate=None):
+    def __init__(self,
+                 r,                 # either 1D array (length S) or ignored if r_field supplied
+                #  C,
+                 C=None,   
+                 r_field=None,      # ◀◀◀ CHANGED: expect spatial field of shape (S, Y, X)
+                 length_scale=None, # ◀◀◀ CHANGED: for on‐the‐fly generation
+                 var_r=None,        # ◀◀◀ CHANGED: for on‐the‐fly generation
+                 seed_field=None,   # ◀◀◀ CHANGED: seed for generate_spatial_r
+                 tmax=None,
+                 record_step=None,
+                 seed=123,
+                 dispersal_type='propagule',
+                 dispersal_away_rate=None):
+
         """
         :param r: 1D array of intrinsic growth rates (length S).
         :param C: 2D competition matrix (SxS).
@@ -48,9 +64,42 @@ class PSD2Model:
                                     If None and dispersal_type=='adult', it is set from the local dispersal matrix.
         """
         np.random.seed(seed)
-        self.r = np.asarray(r, dtype=float).flatten()  # shape (S,)
+        # self.r = np.asarray(r, dtype=float).flatten()  # shape (S,)
+        # self.C = np.asarray(C, dtype=float)
+        self.S = len(r)
+        
+        # ◀◀◀ CHANGED: build competition matrix if not provided
+        if C is None:
+            rng = np.random.default_rng(seed)
+            C = np.eye(self.S, dtype=float)
+            # off‐diagonals: nonzero with prob=CONNECTANCE
+            for i in range(self.S):
+                for j in range(self.S):
+                    if i != j and rng.random() < CONNECTANCE:
+                        # interaction strength positive means j reduces i
+                        C[i,j] = INTERACTION_STRENGTH * rng.random()
         self.C = np.asarray(C, dtype=float)
-        self.S = len(self.r)
+
+        # ◀◀◀ CHANGED: build self.r_field (S, Y, X)
+        if r_field is None:
+            if length_scale is not None and var_r is not None:
+                # generate a spatial field
+                self.r_field = generate_spatial_r(
+                    self.S, NUM_PATCHES_Y, NUM_PATCHES_X,
+                    length_scale, r, var_r, seed=seed_field
+                )
+            else:
+                # broadcast constant r to every patch
+                self.r_field = np.broadcast_to(
+                    np.asarray(r, float).reshape(self.S,1,1),
+                    (self.S, NUM_PATCHES_Y, NUM_PATCHES_X)
+                )
+        else:
+            assert r_field.shape == (self.S, NUM_PATCHES_Y, NUM_PATCHES_X)
+            self.r_field = r_field
+
+        # flatten for linear algebra: shape (S, Y*X)
+        self.r_flat = self.r_field.reshape(self.S, -1)
         
         self.tmax = tmax if tmax is not None else TMAX
         self.record_step = record_step if record_step is not None else RECORDING_STEP_SIZE
@@ -77,16 +126,16 @@ class PSD2Model:
                 reshape((NUM_PATCHES_Y, NUM_PATCHES_X))
             
         # For storing results (trajectory arrays now have an extra spatial dimension)
-        self.nrecords = max(1, self.tmax // self.record_step)
+        self.nrecords = int(max(1, self.tmax // self.record_step))
         self.trajectory = np.zeros((self.nrecords + 1, self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
         self.wait_trajectory = np.zeros((self.nrecords + 1, self.S, NUM_PATCHES_Y, NUM_PATCHES_X), dtype=bool)
         self.time_points = np.zeros(self.nrecords + 1)
 
         # Diagnostic outputs
-        self.poisson_clock_traj = np.zeros((self.nrecords + 1, self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
-        self.growth_rate_traj   = np.zeros((self.nrecords + 1, self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
-        self.invasion_rate_traj = np.zeros((self.nrecords + 1, self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
-        self.establishment_prob_traj = np.zeros((self.nrecords + 1, self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+        self.poisson_clock_traj   = np.zeros_like(self.trajectory)
+        self.growth_rate_traj     = np.zeros_like(self.trajectory)
+        self.invasion_rate_traj   = np.zeros_like(self.trajectory)
+        self.establishment_prob_traj = np.zeros_like(self.trajectory)
 
         self.record_idx = 0
         self.last_sw = None
@@ -95,7 +144,7 @@ class PSD2Model:
         logger.debug(f"Initial logB (shape {self.logB.shape}): {self.logB}")
         logger.debug(f"Initial waiting (shape {self.waiting.shape}): {self.waiting}")
         logger.debug(f"Initial PoissonClock (shape {self.poisson_clock.shape}): {self.poisson_clock}")
-        logger.debug(f"Growth rates r: {self.r}")
+        logger.debug(f"Growth rates r: {self.r_flat}")
         logger.debug(f"Competition Matrix C shape: {self.C.shape}")
 
     def _ensure_flat_y(self, y):
@@ -116,11 +165,15 @@ class PSD2Model:
         The state consists of logB and the Poisson clock (pclock) for each species in each patch.
         We now add a unified dispersal (invasion) term computed via compute_dispersal.
         """
-        total_elements = self.S * NUM_PATCHES_Y * NUM_PATCHES_X
-        logB_flat = y[:total_elements]
-        pclock_flat = y[total_elements: 2 * total_elements]
-        logB = logB_flat.reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
-        pclock = pclock_flat.reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+        # total_elements = self.S * NUM_PATCHES_Y * NUM_PATCHES_X
+        # logB_flat = y[:total_elements]
+        # pclock_flat = y[total_elements: 2 * total_elements]
+        # logB = logB_flat.reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+        # pclock = pclock_flat.reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+        
+        total = self.S * NUM_PATCHES_Y * NUM_PATCHES_X
+        logB = y[:total].reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+        pclock = y[total:2*total].reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
 
         B = np.exp(logB)
         # Compute the biomass for each species in each patch.
@@ -131,7 +184,10 @@ class PSD2Model:
         # C @ B_reshaped will have shape (S, NUM_PATCHES_Y * NUM_PATCHES_X)
         B_reshaped = B.reshape(self.S, -1)
         competitive_loss = (self.C @ B_reshaped).reshape(B.shape)
-        local_growth = self.r.reshape(-1, 1, 1) - competitive_loss
+        # local_growth = (self.r_flat[:, None].reshape(local_growth.shape)
+        #                 if False else None)
+        # local_growth = self.r.reshape(-1, 1, 1) - competitive_loss
+        local_growth = self.r_field - competitive_loss
 
         if self.dispersal_type == 'adult':
             local_growth = local_growth - \
@@ -189,7 +245,8 @@ class PSD2Model:
         # Calculate growth rates for all patches at once
         # C @ B_reshaped will have shape (S, NUM_PATCHES_Y * NUM_PATCHES_X)
         B_reshaped = B.reshape(self.S, -1)
-        local_growth = self.r.reshape(-1, 1, 1) - (self.C @ B_reshaped).reshape(B.shape)
+        # local_growth = self.r_field.reshape(-1, 1, 1) - (self.C @B_reshaped).reshape(B.shape)
+        local_growth = self.r_field - (self.C @ B_reshaped).reshape(B.shape)
 
         if self.dispersal_type == 'adult':
             local_growth = local_growth - \
@@ -200,119 +257,283 @@ class PSD2Model:
         local_growth = local_growth + np.diag(self.C).reshape(-1, 1, 1) * B
         return np.concatenate([local_growth.flatten(), pclock.flatten()])
 
+    # def _handle_event_fn(self, solver, event_info):
+    #     """
+    #     Revised multi‐patch event handler.
+    #     Handles events from changes in local growth (from logB) and Poisson clock crossings,
+    #     applying similar logic to the original one‐patch version but extended over species and patches.
+    #     """
+
+    #     total_elements = self.S * NUM_PATCHES_Y * NUM_PATCHES_X
+    #     # Copy the current state and reshape into multi‐patch arrays.
+    #     y = solver.y.copy()  # current state vector (length 2*total_elements)
+    #     logB = y[:total_elements].reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X)).copy()
+    #     pclock = y[total_elements:2*total_elements].reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X)).copy()
+
+    #     # Convert logB to biomass.
+    #     B = np.exp(logB)
+        
+    #     # Compute local growth rates per patch:
+    #     # First, reshape B for the matrix multiplication.
+    #     B_flat = B.reshape(self.S, -1)
+    #     local_growth = self.r_field - (self.C @ B_flat).reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+
+    #     if self.dispersal_type == 'adult':
+    #         local_growth = local_growth - \
+    #             np.broadcast_to(self.dispersal_away_rate,local_growth.shape)
+
+    #     # Add back the intraspecific effect (diagonal term).
+    #     local_growth = local_growth + np.diag(self.C).reshape(-1, 1, 1) * B
+        
+    #     if self.dispersal_type=='adult':
+    #         local_growth -= np.broadcast_to(self.dispersal_away_rate, local_growth.shape)
+    #     # add back diag‐term
+    #     local_growth += np.diag(self.C).reshape(self.S,1,1) * B
+
+    #     # Get the event information:
+    #     state_info = np.array(event_info[0])
+    #     changed = np.nonzero(state_info)[0]
+    #     current_time = solver.t  # current simulation time
+        
+    #     # Convert solver.sw into an array with multi-patch shape:
+    #     sw = np.array(solver.sw).reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+
+    #     # Process each event index:
+    #     for idx in changed:
+    #         if idx < total_elements:
+    #             s_idx, i_idx, j_idx = np.unravel_index(idx, (self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+    #             event_val = state_info[idx]
+    #             bg = B[s_idx, i_idx, j_idx]
+    #             lg = local_growth[s_idx, i_idx, j_idx]
+    #             cur_logB = logB[s_idx, i_idx, j_idx]
+    #             cur_pclock = pclock[s_idx, i_idx, j_idx]
+    #             if sw[s_idx, i_idx, j_idx]:
+    #                 if event_val == +1:
+    #                     print(f"Local growth rate {lg} of species {s_idx} at patch ({i_idx},{j_idx}) was negative while waiting "
+    #                           f"({cur_logB:.12f}, {cur_pclock:.12f}) at time {current_time:.8f}!")
+    #                 else:
+    #                     print(f"Species {s_idx} at patch ({i_idx},{j_idx}): S ({lg:.12f}) -> P at time {current_time:.12f}")
+    #                     sw[s_idx, i_idx, j_idx] = False
+    #                     flat_index = np.ravel_multi_index((s_idx, i_idx, j_idx), (self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+    #                     solver.y[total_elements + flat_index] = 1.0
+    #             elif event_val == +1:
+    #                 sw_fixed = sw.copy()
+    #                 yd = self._derivatives(solver.t, solver.y, sw_fixed.flatten())
+    #                 yd_logB = yd[:total_elements].reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+    #                 yd_logB[s_idx, i_idx, j_idx] = 0
+    #                 B_patch = B[:, i_idx, j_idx]
+    #                 yd_patch = yd_logB[:, i_idx, j_idx]
+    #                 c = -np.sum(self.C[s_idx, :] * B_patch * yd_patch)
+    #                 print(f"Computed c = {c:.8f} at patch ({i_idx},{j_idx}) for species {s_idx}")
+    #                 if c <= 0:
+    #                     print(f"Species {s_idx} at patch ({i_idx},{j_idx}): Sweep {c:.8f} is not positive! "
+    #                           f"Try reducing 'inith' parameter.")
+    #                     transition_to_S = True
+    #                 else:
+    #                     prob_to_S = np.exp(-bg / (BODY_MASS * (1 + math.sqrt(math.pi / (2 * c)) * MORTALITY_RATE)))
+    #                     print(f"prob_to_S = {prob_to_S:.8f} at patch ({i_idx},{j_idx}) for species {s_idx}")
+    #                     transition_to_S = (np.random.rand() <= prob_to_S)
+    #                 if not transition_to_S:
+    #                     print(f"Species {s_idx} at patch ({i_idx},{j_idx}): P ({lg:.8f}) -> D at time {current_time:.8f}")
+    #                     new_val = min(0, cur_logB - np.log(1 - prob_to_S))
+    #                     flat_index = np.ravel_multi_index((s_idx, i_idx, j_idx), (self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+    #                     solver.y[flat_index] = new_val
+    #                 if transition_to_S:
+    #                     print(f"Species {s_idx} at patch ({i_idx},{j_idx}): P ({lg:.8f}) -> S at time {current_time:.8f}")
+    #                     sw[s_idx, i_idx, j_idx] = True
+    #                     flat_index = np.ravel_multi_index((s_idx, i_idx, j_idx), (self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+    #                     solver.y[total_elements + flat_index] = np.log(np.random.rand())
+    #             else:
+    #                 print(f"Species {s_idx} at patch ({i_idx},{j_idx}): D -> P at time {current_time:.8f}")
+    #         else:
+    #             idx_adjusted = idx - total_elements
+    #             s_idx, i_idx, j_idx = np.unravel_index(idx_adjusted, (self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+    #             event_val = state_info[idx]
+    #             cur_pclock = pclock[s_idx, i_idx, j_idx]
+    #             if event_val == -1:
+    #                 print(f"Poisson Clock {cur_pclock:.8f} declined for species {s_idx} at patch ({i_idx},{j_idx}) "
+    #                       f"(waiting: {sw[s_idx, i_idx, j_idx]}) at time {current_time:.8f}!")
+    #             else:
+    #                 print(f"Species {s_idx} at patch ({i_idx},{j_idx}): S ({cur_pclock:.12f}) -> D at time {current_time:.12f}")
+    #                 lg = local_growth[s_idx, i_idx, j_idx]
+    #                 if self.dispersal_type == 'adult':
+    #                     denom = lg + MORTALITY_RATE + self.dispersal_away_rate[i_idx, j_idx]
+    #                 else:
+    #                     denom = lg + MORTALITY_RATE
+    #                 if lg >= 0: # implies denom > 0
+    #                     est_prob = lg / denom
+    #                     val = BODY_MASS / est_prob if est_prob > 0 else BODY_MASS
+    #                     flat_index = np.ravel_multi_index((s_idx, i_idx, j_idx), (self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+    #                     if val > 1:
+    #                         solver.y[flat_index] = 0.0
+    #                     else:
+    #                         solver.y[flat_index] = np.log(val)
+    #                     solver.y[total_elements + flat_index] = 1.0
+    #                     sw[s_idx, i_idx, j_idx] = False
+    #                 else:
+    #                     print(f"Local growth negative when pclock triggered for species {s_idx} at patch ({i_idx},{j_idx})!")
+        
+    #     # After processing, update solver.sw to remain consistent:
+    #     solver.sw = sw.flatten().tolist()
+    
+
     def _handle_event_fn(self, solver, event_info):
         """
-        Revised multi‐patch event handler.
-        Handles events from changes in local growth (from logB) and Poisson clock crossings,
-        applying similar logic to the original one‐patch version but extended over species and patches.
+        **Vectorised multi‑patch event handler**
+
+        Handles two families of events without explicit Python loops:
+
+        ── Local‑growth events  (first S·Y·X entries)  
+           •  S → P  (waiting → propagule)  
+           •  P sweep test  → S  or  P → D  
+           •  D → P
+
+        ── Poisson‑clock events  (second S·Y·X entries)  
+           •  S → D (successful establishment)  
+           •  diagnostic clock declines
+
+        The logic is mathematically identical to the previous
+        implementation but operates on boolean masks and array algebra,
+        so the cost is `O(S·Y·X)` regardless of how many events fire in
+        one step.
         """
+        import numpy as np
+        total = self.S * NUM_PATCHES_Y * NUM_PATCHES_X
 
-        total_elements = self.S * NUM_PATCHES_Y * NUM_PATCHES_X
-        # Copy the current state and reshape into multi‐patch arrays.
-        y = solver.y.copy()  # current state vector (length 2*total_elements)
-        logB = y[:total_elements].reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X)).copy()
-        pclock = y[total_elements:2*total_elements].reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X)).copy()
-        # Convert logB to biomass.
-        B = np.exp(logB)
-        
-        # Compute local growth rates per patch:
-        # First, reshape B for the matrix multiplication.
-        B_flat = B.reshape(self.S, -1)
-        local_growth = self.r.reshape(-1, 1, 1) - (self.C @ B_flat).reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+        # ------------------------------------------------------------------
+        # Current state (reshaped) -------------------------------------------------
+        # ------------------------------------------------------------------
+        y_vec   = solver.y.copy()                        # (2·total,)
+        logB    = y_vec[:total      ].reshape(self.S, NUM_PATCHES_Y, NUM_PATCHES_X)
+        pclock  = y_vec[ total:2*total].reshape(self.S, NUM_PATCHES_Y, NUM_PATCHES_X)
+        B       = np.exp(logB)
 
+        # Boolean “waiting” grid ----------------------------------------------------
+        sw = np.asarray(solver.sw, dtype=bool).reshape(self.S, NUM_PATCHES_Y, NUM_PATCHES_X)
+
+        # ------------------------------------------------------------------
+        # Local growth field g = r – C B  (+ intrapecific term) --------------
+        # ------------------------------------------------------------------
+        B_flat       = B.reshape(self.S, -1)                       # (S, Y·X)
+        local_growth = self.r_field - (self.C @ B_flat).reshape(B.shape)
         if self.dispersal_type == 'adult':
-            local_growth = local_growth - \
-                np.broadcast_to(self.dispersal_away_rate,local_growth.shape)
+            local_growth = local_growth - np.broadcast_to(self.dispersal_away_rate, local_growth.shape)
+        local_growth += np.diag(self.C).reshape(-1, 1, 1) * B      # add diagonal
 
-        # Add back the intraspecific effect (diagonal term).
-        local_growth = local_growth + np.diag(self.C).reshape(-1, 1, 1) * B
+        # ------------------------------------------------------------------
+        # Event flags -------------------------------------------------------
+        # event_info[0] is the sign (+1 / −1) for every root
+        # ------------------------------------------------------------------
+        flag = np.asarray(event_info[0], dtype=int)
+        lg_evt_flag = flag[:total     ].reshape(self.S, NUM_PATCHES_Y, NUM_PATCHES_X)  # local‑growth events
+        pc_evt_flag = flag[ total:2*total].reshape(self.S, NUM_PATCHES_Y, NUM_PATCHES_X)  # clock events
 
-        # Get the event information:
-        state_info = np.array(event_info[0])
-        changed = np.nonzero(state_info)[0]
-        current_time = solver.t  # current simulation time
-        
-        # Convert solver.sw into an array with multi-patch shape:
-        sw = np.array(solver.sw).reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+        # Helper masks ------------------------------------------------------
+        waiting      = sw
+        not_waiting  = ~sw
 
-        # Process each event index:
-        for idx in changed:
-            if idx < total_elements:
-                s_idx, i_idx, j_idx = np.unravel_index(idx, (self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
-                event_val = state_info[idx]
-                bg = B[s_idx, i_idx, j_idx]
-                lg = local_growth[s_idx, i_idx, j_idx]
-                cur_logB = logB[s_idx, i_idx, j_idx]
-                cur_pclock = pclock[s_idx, i_idx, j_idx]
-                if sw[s_idx, i_idx, j_idx]:
-                    if event_val == +1:
-                        print(f"Local growth rate {lg} of species {s_idx} at patch ({i_idx},{j_idx}) was negative while waiting "
-                              f"({cur_logB:.12f}, {cur_pclock:.12f}) at time {current_time:.8f}!")
-                    else:
-                        print(f"Species {s_idx} at patch ({i_idx},{j_idx}): S ({lg:.12f}) -> P at time {current_time:.12f}")
-                        sw[s_idx, i_idx, j_idx] = False
-                        flat_index = np.ravel_multi_index((s_idx, i_idx, j_idx), (self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
-                        solver.y[total_elements + flat_index] = 1.0
-                elif event_val == +1:
-                    sw_fixed = sw.copy()
-                    yd = self._derivatives(solver.t, solver.y, sw_fixed.flatten())
-                    yd_logB = yd[:total_elements].reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
-                    yd_logB[s_idx, i_idx, j_idx] = 0
-                    B_patch = B[:, i_idx, j_idx]
-                    yd_patch = yd_logB[:, i_idx, j_idx]
-                    c = -np.sum(self.C[s_idx, :] * B_patch * yd_patch)
-                    print(f"Computed c = {c:.8f} at patch ({i_idx},{j_idx}) for species {s_idx}")
-                    if c <= 0:
-                        print(f"Species {s_idx} at patch ({i_idx},{j_idx}): Sweep {c:.8f} is not positive! "
-                              f"Try reducing 'inith' parameter.")
-                        transition_to_S = True
-                    else:
-                        prob_to_S = np.exp(-bg / (BODY_MASS * (1 + math.sqrt(math.pi / (2 * c)) * MORTALITY_RATE)))
-                        print(f"prob_to_S = {prob_to_S:.8f} at patch ({i_idx},{j_idx}) for species {s_idx}")
-                        transition_to_S = (np.random.rand() <= prob_to_S)
-                    if not transition_to_S:
-                        print(f"Species {s_idx} at patch ({i_idx},{j_idx}): P ({lg:.8f}) -> D at time {current_time:.8f}")
-                        new_val = min(0, cur_logB - np.log(1 - prob_to_S))
-                        flat_index = np.ravel_multi_index((s_idx, i_idx, j_idx), (self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
-                        solver.y[flat_index] = new_val
-                    if transition_to_S:
-                        print(f"Species {s_idx} at patch ({i_idx},{j_idx}): P ({lg:.8f}) -> S at time {current_time:.8f}")
-                        sw[s_idx, i_idx, j_idx] = True
-                        flat_index = np.ravel_multi_index((s_idx, i_idx, j_idx), (self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
-                        solver.y[total_elements + flat_index] = np.log(np.random.rand())
-                else:
-                    print(f"Species {s_idx} at patch ({i_idx},{j_idx}): D -> P at time {current_time:.8f}")
-            else:
-                idx_adjusted = idx - total_elements
-                s_idx, i_idx, j_idx = np.unravel_index(idx_adjusted, (self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
-                event_val = state_info[idx]
-                cur_pclock = pclock[s_idx, i_idx, j_idx]
-                if event_val == -1:
-                    print(f"Poisson Clock {cur_pclock:.8f} declined for species {s_idx} at patch ({i_idx},{j_idx}) "
-                          f"(waiting: {sw[s_idx, i_idx, j_idx]}) at time {current_time:.8f}!")
-                else:
-                    print(f"Species {s_idx} at patch ({i_idx},{j_idx}): S ({cur_pclock:.12f}) -> D at time {current_time:.12f}")
-                    lg = local_growth[s_idx, i_idx, j_idx]
-                    if self.dispersal_type == 'adult':
-                        denom = lg + MORTALITY_RATE + self.dispersal_away_rate[i_idx, j_idx]
-                    else:
-                        denom = lg + MORTALITY_RATE
-                    if lg >= 0: # implies denom > 0
-                        est_prob = lg / denom
-                        val = BODY_MASS / est_prob if est_prob > 0 else BODY_MASS
-                        flat_index = np.ravel_multi_index((s_idx, i_idx, j_idx), (self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
-                        if val > 1:
-                            solver.y[flat_index] = 0.0
-                        else:
-                            solver.y[flat_index] = np.log(val)
-                        solver.y[total_elements + flat_index] = 1.0
-                        sw[s_idx, i_idx, j_idx] = False
-                    else:
-                        print(f"Local growth negative when pclock triggered for species {s_idx} at patch ({i_idx},{j_idx})!")
-        
-        # After processing, update solver.sw to remain consistent:
-        solver.sw = sw.flatten().tolist()
+        # ------------------------------------------------------------------
+        # 1.  Local‑growth events (lg_evt_flag ≠ 0) -------------------------
+        # ------------------------------------------------------------------
+        # 1.a  ERROR: waiting &   lg_evt_flag == +1  (growth became −ve while waiting)
+        mask_err_lg = waiting & (lg_evt_flag == +1)
+        if np.any(mask_err_lg):
+            idx   = np.vstack(np.nonzero(mask_err_lg)).T
+            print(f"[PSD2] WARNING: {idx.shape[0]} patches still waiting but growth became negative!")
 
+        # 1.b  S → P  (waiting & lg_evt_flag == −1)
+        mask_S_to_P = waiting & (lg_evt_flag == -1)
+        if np.any(mask_S_to_P):
+            sw[mask_S_to_P]      = False
+            pclock[mask_S_to_P]  = 1.0
+
+        # 1.c  P‑state sweep test (not_waiting & lg_evt_flag == +1) -------------
+        mask_P_sweep = not_waiting & (lg_evt_flag == +1)
+        if np.any(mask_P_sweep):
+            # First evaluate derivatives once for the whole grid
+            yd_full      = self._derivatives(solver.t, solver.y, sw.flatten())
+            yd_logB      = yd_full[:total].reshape(self.S, NUM_PATCHES_Y, NUM_PATCHES_X)
+
+            # Zero‑out ∂logB for own species/patch (as in scalar version)
+            yd_logB[mask_P_sweep] = 0.0
+
+            # c(s,i,j) = − Σ_m  C[s,m] · B_m · yd_logB_m
+            prod          = B * yd_logB                                # (S,Y,X)
+            c_grid        = -np.tensordot(self.C, prod, axes=([1], [0]))  # (S,Y,X)
+
+            # Probability to remain in S after sweep
+            eps           = 1e-300
+            denom         = BODY_MASS * (1 + np.sqrt(np.pi / (2*np.maximum(c_grid, eps))) * MORTALITY_RATE)
+
+            prob_to_S     = np.zeros_like(c_grid)
+            pos_c_mask    = (c_grid > 0) & mask_P_sweep
+            prob_to_S[pos_c_mask] = np.exp(-B[pos_c_mask] / denom[pos_c_mask])
+
+            # Default outcome for c≤0   → deterministic S
+            trans_to_S    = np.ones_like(prob_to_S, dtype=bool)   # default=True
+            rnd           = np.random.rand(*prob_to_S.shape)
+            trans_to_S[pos_c_mask] = rnd[pos_c_mask] <= prob_to_S[pos_c_mask]
+
+            # ----- P → D  (failed sweep) -----------------------------------
+            mask_P_to_D   = (~trans_to_S) & mask_P_sweep
+            if np.any(mask_P_to_D):
+                new_logB = np.minimum(0.0,
+                    logB[mask_P_to_D] -
+                    np.log1p(-prob_to_S[mask_P_to_D]))
+                logB[mask_P_to_D] = new_logB
+                print(f"[PSD2] {np.count_nonzero(mask_P_to_D)} ‘P → D’ transitions.")
+
+            # ----- P → S  (successful sweep) -------------------------------
+            mask_P_to_S   = trans_to_S & mask_P_sweep
+            if np.any(mask_P_to_S):
+                sw[mask_P_to_S]      = True
+                pclock[mask_P_to_S]  = np.log(np.random.rand(np.count_nonzero(mask_P_to_S)))
+                print(f"[PSD2] {np.count_nonzero(mask_P_to_S)} ‘P → S’ transitions.")
+
+        # 1.d  D → P (not_waiting & lg_evt_flag == −1) ------------------------
+        # (purely diagnostic in the original code)
+        mask_D_to_P = not_waiting & (lg_evt_flag == -1)
+        if np.any(mask_D_to_P):
+            print(f"[PSD2] {np.count_nonzero(mask_D_to_P)} ‘D → P’ transitions.")
+
+        # ------------------------------------------------------------------
+        # 2. Poisson‑clock events ------------------------------------------
+        # ------------------------------------------------------------------
+        # 2.a  Diagnostic clock declines (pc_evt_flag == −1)
+        mask_clock_decl = pc_evt_flag == -1
+        if np.any(mask_clock_decl):
+            print(f"[PSD2] {np.count_nonzero(mask_clock_decl)} Poisson clocks declined before zero.")
+
+        # 2.b  S → D  (pc_evt_flag == +1)  – establishment attempt ----------
+        mask_S_clock = (pc_evt_flag == +1)
+        if np.any(mask_S_clock):
+            # denominator for establishment probability
+            denom_pc = local_growth + MORTALITY_RATE
+            if self.dispersal_type == 'adult':
+                denom_pc = denom_pc + np.broadcast_to(self.dispersal_away_rate, denom_pc.shape)
+
+            # Only meaningful where local_growth ≥ 0
+            lg_pos_mask        = (local_growth >= 0) & mask_S_clock
+            est_prob           = np.zeros_like(local_growth)
+            est_prob[lg_pos_mask] = local_growth[lg_pos_mask] / denom_pc[lg_pos_mask]
+
+            val                = np.where(est_prob > 0, BODY_MASS / est_prob, BODY_MASS)
+
+            # Update biomass (logB)
+            set_zero_mask      = (val > 1) & mask_S_clock
+            logB[set_zero_mask]      = 0.0
+            logB[mask_S_clock & ~set_zero_mask] = np.log(val[mask_S_clock & ~set_zero_mask])
+
+            # Reset p‑clock and leave waiting state
+            pclock[mask_S_clock] = 1.0
+            sw[mask_S_clock]     = False
+
+        # ------------------------------------------------------------------
+        # 3. Write‐back to solver ------------------------------------------
+        # ------------------------------------------------------------------
+        solver.y[:total]            = logB.ravel()
+        solver.y[total:2*total]     = pclock.ravel()
+        solver.sw                   = sw.ravel().tolist()
     
     def run(self):
         logger.info("Starting PSD2 simulation with Assimulo (multi-patch)...")
@@ -380,7 +601,8 @@ class PSD2Model:
             # Calculate growth rates for all patches at once
             # C @ B_reshaped will have shape (S, NUM_PATCHES_Y * NUM_PATCHES_X)
             B_reshaped = B.reshape(self.S, -1)
-            local_growth = self.r.reshape(-1, 1, 1) - (self.C @ B_reshaped).reshape(B.shape)
+            # local_growth = r_field.reshape(-1, 1, 1) - (self.C @ B_reshaped).reshape(B.shape)
+            local_growth = self.r_field - (self.C @ B_reshaped).reshape(B.shape)
             if self.dispersal_type == 'adult':
                 local_growth = local_growth - \
                     np.broadcast_to(self.dispersal_away_rate,local_growth.shape)
@@ -434,6 +656,8 @@ class PSD2Model:
             self.invasion_rate_traj,
             self.establishment_prob_traj
         )
+        
+
 
 ############################################
 # Testing Mean and Variance in PSD2Model
@@ -464,7 +688,7 @@ if __name__ == "__main__":
         
         # Test parameters
         S = 3  # number of species
-        nsteps = 1000 # shorter simulation time for testing
+        nsteps = 250 # shorter simulation time for testing
         r = np.array([1.0, 1.0, 1.0])
         C = np.array([
             [1.0, 1.7, 0.4],
