@@ -446,6 +446,7 @@ class PSD2Model:
     #     if np.any(mask_S_to_P):
     #         sw[mask_S_to_P]      = False
     #         pclock[mask_S_to_P]  = 1.0
+    #         print(f"[PSD2] {np.count_nonzero(mask_S_to_P)} ‘S → P’ transitions.")
 
     #     # 1.c  P‑state sweep test (not_waiting & lg_evt_flag == +1) -------------
     #     mask_P_sweep = not_waiting & (lg_evt_flag == +1)
@@ -511,6 +512,7 @@ class PSD2Model:
     #         denom_pc = local_growth + MORTALITY_RATE
     #         if self.dispersal_type == 'adult':
     #             denom_pc = denom_pc + np.broadcast_to(self.dispersal_away_rate, denom_pc.shape)
+    #             print(f"[PSD2] {np.count_nonzero(mask_S_clock)} ‘S → D’ transitions.")
 
     #         # Only meaningful where local_growth ≥ 0
     #         lg_pos_mask        = (local_growth >= 0) & mask_S_clock
