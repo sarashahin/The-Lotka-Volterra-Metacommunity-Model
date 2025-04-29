@@ -14,6 +14,7 @@ dispersal, subtract an extra dispersal‐away mortality.
 import sys
 import numpy as np
 import logging
+from typing import Optional  
 from assimulo.solvers import CVode  # or use preferred solver
 from assimulo.problem import Explicit_Problem
 from euler_simple import EulerSimple  # fallback solver if needed
@@ -43,7 +44,11 @@ class PSD2Model:
     def __init__(self,
                  r,                 # either 1D array (length S) or ignored if r_field supplied
                 #  C,
-                 C=None,   
+                 C=None,
+                 *,
+                 initial_B: Optional[np.ndarray] = None,
+                 initial_wait:  Optional[np.ndarray] = None,
+                 initial_clock: Optional[np.ndarray] = None,  
                  r_field=None,      # ◀◀◀ CHANGED: expect spatial field of shape (S, Y, X)
                  length_scale=None, # ◀◀◀ CHANGED: for on‐the‐fly generation
                  var_r=None,        # ◀◀◀ CHANGED: for on‐the‐fly generation
@@ -105,16 +110,40 @@ class PSD2Model:
         self.record_step = record_step if record_step is not None else RECORDING_STEP_SIZE
 
         # Multi-patch initialization: each species is distributed over a grid of patches.
-        init_biomass = BODY_MASS / 10
-        # logB is now a (S, NUM_PATCHES_Y, NUM_PATCHES_X) array
-        self.logB = np.full((self.S, NUM_PATCHES_Y, NUM_PATCHES_X), np.log(init_biomass))
+        # init_biomass = BODY_MASS / 10
+        # # logB is now a (S, NUM_PATCHES_Y, NUM_PATCHES_X) array
+        # self.logB = np.full((self.S, NUM_PATCHES_Y, NUM_PATCHES_X), np.log(init_biomass))
+        
+        if initial_B is not None:  # ← caller DID supply counts
+            self.logB = np.log(np.maximum(initial_B, 1e-300))
+        else:
+            init_biomass = BODY_MASS / 10
+            self.logB = np.full((self.S, NUM_PATCHES_Y, NUM_PATCHES_X),
+                                np.log(init_biomass))
+            
 
         ### No species can invade like this (at least it's super unlikely)
         # self.waiting = np.ones((self.S, NUM_PATCHES_Y, NUM_PATCHES_X), dtype=bool)
         # self.poisson_clock = np.log(np.random.rand(self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
         ### Start all species at all patches in D state:
-        self.waiting = np.zeros((self.S, NUM_PATCHES_Y, NUM_PATCHES_X), dtype=bool)
-        self.poisson_clock = np.ones((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+        # self.waiting = np.zeros((self.S, NUM_PATCHES_Y, NUM_PATCHES_X), dtype=bool)
+        # self.poisson_clock = np.ones((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+        
+        # ---------- waiting flags --------------------------------------
+        if initial_wait is not None:
+            assert initial_wait.shape == (self.S, NUM_PATCHES_Y, NUM_PATCHES_X)
+            self.waiting = initial_wait.copy()
+        else:
+            # default: all populations start in D-state
+            self.waiting = np.zeros((self.S, NUM_PATCHES_Y, NUM_PATCHES_X), bool)
+
+        # ---------- Poisson clocks -------------------------------------
+        if initial_clock is not None:
+            assert initial_clock.shape == (self.S, NUM_PATCHES_Y, NUM_PATCHES_X)
+            self.poisson_clock = initial_clock.copy()
+        else:
+            # fresh exp(1) draws  ( –log U with U∈(0,1) )
+            self.poisson_clock = -np.log(np.random.rand(self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
 
         # Set dispersal parameters
         self.dispersal_type = dispersal_type
