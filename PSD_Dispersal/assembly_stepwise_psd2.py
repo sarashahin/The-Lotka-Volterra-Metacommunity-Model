@@ -1,91 +1,3 @@
-
-# -------- assembly_stepwise_psd2.py ------------------------------------
-"""
-Infinite-pool assembly for the PSD2 approximation – *vector* candidate mode
-(1 + floor(frac*γ) fresh species tested in one PSD2 window).
-"""
-from __future__ import annotations
-import numpy as np, logging, dispersal
-from typing import Tuple
-from models_psd2 import PSD2Model
-from config import NUM_PATCHES_X, NUM_PATCHES_Y, BODY_MASS
-from assembly_utils import draw_interactions, expand_RC, prune_extinct
-
-log = logging.getLogger(__name__)
-Ny, Nx = NUM_PATCHES_Y, NUM_PATCHES_X
-
-def stepwise_assembly_psd2(
-        *,
-        base_r        : float = 1.0,
-        pressure_rate : float = 1e-4,
-        window_time   : float = 1_000.,
-        record_step   : float = 50.,
-        F_sat         : int   = 2,
-        frac_multi    : float = 0.05,      # ← proportion of γ candidates/round
-        max_rounds    : int   = 50,
-        seed          : int   = 0,
-        **model_kw
-) -> Tuple[np.ndarray, np.ndarray, dict]:
-    rng = np.random.default_rng(seed)
-
-    # ── founder ─────────────────────────────────────────────────────────
-    r = np.array([base_r])
-    C = np.array([[1.0]])
-    attempts = 0
-
-    for rnd in range(max_rounds):
-        γ = len(r)
-        n_cand = 1 + int(frac_multi * γ)
-
-        # ── build enlarged (r,C) with ALL fresh candidates ──────────────
-        r_big, C_big = r.copy(), C.copy()
-        for _ in range(n_cand):
-            row, col = draw_interactions(len(r_big), rng=rng)
-            r_big, C_big = expand_RC(r_big, C_big, base_r, row, col)
-
-        # ── open propagule tap for EVERY candidate (last n_cand planes) ─
-        flux = np.zeros((len(r_big), Ny, Nx))
-        flux[-n_cand:] = pressure_rate * BODY_MASS
-        dispersal.set_invasion_pressure(flux)
-
-        # ── integrate ───────────────────────────────────────────────────
-        model = PSD2Model(r_big, C_big,
-                          tmax=window_time, record_step=record_step,
-                          dispersal_type='propagule', **model_kw)
-        _, B_traj, *_ = model.run()
-        final_B = B_traj[-1]
-
-        dispersal.set_invasion_pressure(None)   # close tap
-        attempts += n_cand
-
-        # which of the *new* species invaded?
-        estab_mask = final_B[-n_cand:].sum(axis=(1,2)) > 0
-        if estab_mask.any():
-            keep_new = np.where(estab_mask)[0] + len(r)  # indices in r_big
-            keep_all = np.r_[np.arange(len(r)), keep_new]
-            r, C = r_big[keep_all], C_big[np.ix_(keep_all, keep_all)]
-            log.info(f"[PSD2] round {rnd}: {estab_mask.sum()}/{n_cand} "
-                     f"candidates established  → γ={len(r)}")
-        else:
-            log.info(f"[PSD2] round {rnd}: no candidates established")
-
-        # prune extinct residents (rare)
-        alive = final_B[:len(r)].sum(axis=(1,2)) > 0
-        if not alive.all():
-            r, C, *_ = prune_extinct(alive, r, C)
-
-        γ = len(r)
-        if attempts >= F_sat * γ:
-            log.info(f"[PSD2] stop: attempts={attempts} ≥ {F_sat}×γ")
-            break
-
-    # -------- occupancy counts (needed for OFD) -------------------------
-    occ = (final_B[:len(r)] > 0).sum(axis=(1,2))   # patches per species
-    extra = dict(occ_counts=occ)
-
-
-
-
 # ############################################
 # # assembly_stepwise_psd2.py
 # ############################################
@@ -195,6 +107,132 @@ def stepwise_assembly_psd2(
 
 
 
+
+
+
+# -------- assembly_stepwise_psd2.py ------------------------------------
+"""
+Infinite-pool assembly for the PSD2 approximation – *vector* candidate mode
+(1 + floor(frac*γ) fresh species tested in one PSD2 window).
+"""
+from __future__ import annotations
+import numpy as np, logging, dispersal
+from typing import Tuple
+from models_psd2 import PSD2Model
+from config import NUM_PATCHES_X, NUM_PATCHES_Y, BODY_MASS
+from assembly_utils import draw_interactions, expand_RC, prune_extinct
+
+log = logging.getLogger(__name__)
+Ny, Nx = NUM_PATCHES_Y, NUM_PATCHES_X
+
+def stepwise_assembly_psd2(
+        *,
+        base_r        : float = 1.0,
+        pressure_rate : float = 1e-4,
+        window_time   : float = 1_000.,
+        record_step   : float = 50.,
+        F_sat         : int   = 2,
+        frac_multi    : float = 0.05,      # ← proportion of γ candidates/round
+        max_rounds    : int   = 50,
+        seed          : int   = 0,
+        **model_kw
+) -> Tuple[np.ndarray, np.ndarray, dict]:
+    rng = np.random.default_rng(seed)
+
+    # ── founder ─────────────────────────────────────────────────────────
+    r = np.array([base_r])
+    C = np.array([[1.0]])
+    B = np.full((1, Ny, Nx), BODY_MASS/10)           # residents’ biomass (γ = 1)
+    W  = np.zeros((1, Ny, Nx), dtype=bool)            # waiting flags
+    PC = -np.log(rng.random((1, Ny, Nx)))             # Poisson clocks
+    attempts = 0
+
+    for rnd in range(max_rounds):
+        γ = len(r)
+        n_cand = 1 + int(frac_multi * γ)
+
+        # ── build enlarged (r,C) with ALL fresh candidates ──────────────
+        r_big, C_big = r.copy(), C.copy()
+        for _ in range(n_cand):
+            row, col = draw_interactions(len(r_big), rng=rng)
+            r_big, C_big = expand_RC(r_big, C_big, base_r, row, col)
+            
+        # ---- build initial biomass tensor ------------------------------
+        # ---------- enlarge state for residents + n_cand --------------
+        B_big = np.zeros((len(r_big), Ny, Nx))
+        B_big[:γ] = B                          # keep residents
+        # candidates start at zero; propagule tap will feed them
+         # New candidates arrive in D–state, so they start with *False*.
+        W_big = np.ones_like(B_big, bool)              # new spp. start waiting
+        W_big[:γ] = W  # keep residents old
+        
+        PC_big = np.empty_like(B_big)
+        PC_big[:γ] = PC                                # keep resident clocks
+        PC_big[γ:] = -np.log(rng.random((n_cand, Ny, Nx)))
+
+
+        # ── open propagule tap for EVERY candidate (last n_cand planes) ─
+        flux = np.zeros_like(B_big)
+        flux[-n_cand:] = pressure_rate * BODY_MASS
+        dispersal.set_invasion_pressure(flux)
+
+        # ── integrate ───────────────────────────────────────────────────
+        model = PSD2Model(r_big, C_big,
+                          initial_B=B_big,
+                          initial_wait=W_big,
+                          initial_clock=PC_big,
+                          tmax=window_time, record_step=record_step,
+                          dispersal_type='propagule', **model_kw)
+        
+        # _, B_traj, *_ = model.run()
+        # final_B = B_traj[-1]
+        
+        _, B_traj, W_traj, PC_traj, *_ = model.run()
+        final_B  = B_traj[-1]
+        final_W  = W_traj[-1]
+        final_PC = PC_traj[-1]
+
+        dispersal.set_invasion_pressure(None)   # close tap
+        attempts += n_cand
+
+        # which of the *new* species invaded?
+        estab_mask = final_B[-n_cand:].sum(axis=(1,2)) > 0
+        # if estab_mask.any():
+        #     keep_new = np.where(estab_mask)[0] + len(r)  # indices in r_big
+        #     keep_all = np.r_[np.arange(len(r)), keep_new]
+        #     r, C = r_big[keep_all], C_big[np.ix_(keep_all, keep_all)]
+        #     B    = final_B[keep_all]              # <─  # preserve residents + newcomers
+        #     log.info(f"[PSD2] round {rnd}: {estab_mask.sum()}/{n_cand} "
+        #              f"candidates established  → γ={len(r)}")
+        # else:
+        #     B = final_B[:γ]                  # only residents survive
+        #     log.info(f"[PSD2] round {rnd}: no candidates established")
+        if estab_mask.any():
+            keep_new = np.where(estab_mask)[0] + γ
+            keep_all = np.r_[np.arange(γ), keep_new]
+            r, C  = r_big[keep_all], C_big[np.ix_(keep_all, keep_all)]
+            B, W, PC = final_B[keep_all], final_W[keep_all], final_PC[keep_all]
+        else:
+                # only residents survive
+            B, W, PC = final_B[:γ], final_W[:γ], final_PC[:γ]
+
+        # prune extinct residents (rare)
+        alive = B.sum(axis=(1,2)) > 0
+        if not alive.all():
+            # r, C, *_ = prune_extinct(alive, r, C)
+            r, C, B, keep_idx = prune_extinct(alive, r, C, B)
+            W, PC = W[keep_idx], PC[keep_idx]
+
+        γ = len(r)
+        if attempts >= F_sat * γ:
+            log.info(f"[PSD2] stop: attempts={attempts} ≥ {F_sat}×γ")
+            break
+
+    # -------- occupancy counts (needed for OFD) -------------------------
+    # occ = (final_B[:len(r)] > 0).sum(axis=(1,2))   # patches per species
+    # current biomass tensor B has exactly the surviving γ species
+    occ = (B > 0).sum(axis=(1,2))                  # patches per species
+    extra = dict(occ_counts=occ)
 
     return r, C, extra
 
