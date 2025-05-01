@@ -115,7 +115,7 @@ class PSD2Model:
         # self.logB = np.full((self.S, NUM_PATCHES_Y, NUM_PATCHES_X), np.log(init_biomass))
         
         if initial_B is not None:  # ← caller DID supply counts
-            self.logB = np.log(np.maximum(initial_B, 1e-300))
+            self.logB = np.log(np.maximum(initial_B, 1e-100))
         else:
             init_biomass = BODY_MASS / 10
             self.logB = np.full((self.S, NUM_PATCHES_Y, NUM_PATCHES_X),
@@ -137,13 +137,23 @@ class PSD2Model:
             # default: all populations start in D-state
             self.waiting = np.zeros((self.S, NUM_PATCHES_Y, NUM_PATCHES_X), bool)
 
+        # ---------- fix potentially inconsistent waiting flags ---------
+        initial_B = np.exp(self.logB)
+        competitive_loss = (self.C @ initial_B.reshape(self.S, -1)).\
+            reshape(self.logB.shape)
+        print(competitive_loss.shape)
+        local_growth = self.r_field - competitive_loss
+        diagB = np.diag(self.C).reshape(-1, 1, 1) * initial_B
+        non_self_growth = local_growth + diagB
+        self.waiting[non_self_growth < 0] = 0
+            
         # ---------- Poisson clocks -------------------------------------
         if initial_clock is not None:
             assert initial_clock.shape == (self.S, NUM_PATCHES_Y, NUM_PATCHES_X)
             self.poisson_clock = initial_clock.copy()
         else:
             # fresh exp(1) draws  ( –log U with U∈(0,1) )
-            self.poisson_clock = -np.log(np.random.rand(self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+            self.poisson_clock = np.log(np.random.rand(self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
 
         # Set dispersal parameters
         self.dispersal_type = dispersal_type
@@ -224,18 +234,21 @@ class PSD2Model:
 
         diagB = np.diag(self.C).reshape(-1, 1, 1) * B
         
+        # Use raw local growth for effective growth.
+        non_self_growth = local_growth + diagB
+        
         # Compute invasion flux from dispersal.
         invasion = compute_dispersal(B)
-        
-        # Use raw local growth for effective growth.
-        effective_growth = local_growth
         
         sw_reshaped = np.array(sw).reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
         # Compute derivative for logB.
         
         # Note the sign change (minus) to match the one-patch formulation.
         # The mortality/dispersal-away term is now scaled by 1 so that it aligns with the lecture derivations.
-        dlogB = effective_growth + (invasion / safeB) - 2 * sw_reshaped * (local_growth + diagB)
+        invasion_pressure = (invasion / safeB)
+        dlogB = local_growth + invasion_pressure
+        sw_reshaped = (np.array(sw).reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X)) == 1)
+        dlogB[sw_reshaped] = -non_self_growth[sw_reshaped] + invasion_pressure[sw_reshaped]
         ## With local dispersal, sudden biomass increase in
         ## neighbouring patches can lead to large invasion/safeB
         ## terms that destabilise EulerSimple.  We put a limit to the
@@ -244,8 +257,8 @@ class PSD2Model:
 
         
         # For establishment probability: include dispersal-away in effective mortality for adult dispersal.
-        non_self_growth = local_growth + diagB
-        sw_reshaped = np.array(sw).reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+        # non_self_growth = local_growth + diagB # computed above, also next line
+        # sw_reshaped = np.array(sw).reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
         non_self_growth[~sw_reshaped] = 0
         non_self_growth[non_self_growth < 0] = 0
         
@@ -568,6 +581,8 @@ class PSD2Model:
     
     def run(self):
         logger.info("Starting PSD2 simulation with Assimulo (multi-patch)...")
+        np.seterr(under='ignore')
+        #np.set_printoptions(linewidth=200)
         
         # Build initial state vector y0 by flattening logB and poisson_clock.
         y0 = np.concatenate([self.logB.flatten(), self.poisson_clock.flatten()])

@@ -60,9 +60,9 @@ THRESHOLD = 10 * BODY_MASS
 # -----------------------------
 
 # Define a 2D grid of patches.
-NUM_PATCHES_X = 10   # Number of patches horizontally
-NUM_PATCHES_Y = 10   # Number of patches vertically
+NUM_PATCHES_X = 5   # Number of patches horizontally
+NUM_PATCHES_Y = 5   # Number of patches vertically
 
 # Dispersal rate (diffusion coefficient): fraction of biomass exchanged per time step.
-DISPERSAL_RATE = 0.0002
-LONG_DISTANCE_PROB = 1  # Probability of long-distance dispersal
+DISPERSAL_RATE = BODY_MASS * 0.001
+LONG_DISTANCE_PROB = 0  # Probability of long-distance dispersal

@@ -97,7 +97,9 @@ def main(argv=None):
     if use_assembly:
         r_psd, C_psd, extra_psd = stepwise_assembly_psd2(
             window_time=args.assemble_horizon,
-            record_step=args.record)
+            record_step=args.record,
+            max_rounds=30000,
+            F_sat=6)
         data['PSD2_occ'] = extra_psd['occ_counts']          # NEW
         dispersal.set_invasion_pressure(None)            # safety
     else:
@@ -125,7 +127,8 @@ def main(argv=None):
         r_ibm, C_ibm, N_ibm, extra_ibm = stepwise_assembly_ibm(
             window_steps=int(args.assemble_horizon/STEP_SIZE),
             record_step=int(args.record/STEP_SIZE),
-            seed_size=5)
+            seed_size=5,
+            F_sat=6)
     else:
         r_ibm, C_ibm = r0, C0
         N_ibm        = None                                 # nothing to save

@@ -128,10 +128,10 @@ Ny, Nx = NUM_PATCHES_Y, NUM_PATCHES_X
 def stepwise_assembly_psd2(
         *,
         base_r        : float = 1.0,
-        pressure_rate : float = 1e-4,
+        pressure_rate : float = 1e-2,
         window_time   : float = 1_000.,
         record_step   : float = 50.,
-        F_sat         : int   = 2,
+        F_sat         : int   = 6,
         frac_multi    : float = 0.05,      # ← proportion of γ candidates/round
         max_rounds    : int   = 50,
         seed          : int   = 0,
@@ -144,9 +144,11 @@ def stepwise_assembly_psd2(
     C = np.array([[1.0]])
     B = np.full((1, Ny, Nx), BODY_MASS/10)           # residents’ biomass (γ = 1)
     W  = np.zeros((1, Ny, Nx), dtype=bool)            # waiting flags
-    PC = -np.log(rng.random((1, Ny, Nx)))             # Poisson clocks
+    PC = np.log(rng.random((1, Ny, Nx)))             # Poisson clocks
     attempts = 0
 
+    gamma_file = open("/tmp/gamma.txt","w")
+    
     for rnd in range(max_rounds):
         γ = len(r)
         n_cand = 1 + int(frac_multi * γ)
@@ -168,7 +170,7 @@ def stepwise_assembly_psd2(
         
         PC_big = np.empty_like(B_big)
         PC_big[:γ] = PC                                # keep resident clocks
-        PC_big[γ:] = -np.log(rng.random((n_cand, Ny, Nx)))
+        PC_big[γ:] = np.log(rng.random((n_cand, Ny, Nx)))
 
 
         # ── open propagule tap for EVERY candidate (last n_cand planes) ─
@@ -217,13 +219,18 @@ def stepwise_assembly_psd2(
             B, W, PC = final_B[:γ], final_W[:γ], final_PC[:γ]
 
         # prune extinct residents (rare)
-        alive = B.sum(axis=(1,2)) > 0
+        alive = B.sum(axis=(1,2)) > BODY_MASS
+        if (B.sum(axis=(1,2)) > 2*B.shape[1]*B.shape[2]).any():
+            print("LARGE B DETECTED")
+            #sys.exit()
         if not alive.all():
             # r, C, *_ = prune_extinct(alive, r, C)
             r, C, B, keep_idx = prune_extinct(alive, r, C, B)
             W, PC = W[keep_idx], PC[keep_idx]
 
         γ = len(r)
+        gamma_file.write(f"{rnd}, {attempts}, {γ}, {F_sat * γ}\n")
+        gamma_file.flush()
         if attempts >= F_sat * γ:
             log.info(f"[PSD2] stop: attempts={attempts} ≥ {F_sat}×γ")
             break
