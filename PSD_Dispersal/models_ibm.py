@@ -165,7 +165,7 @@ class IBMModel:
             local_growth_rates = local_growth_flat.reshape(B.shape)
             
             if self.dispersal_type == 'adult':
-                local_growth_rates -= np.broadcast_to(self.dispersal_away_rate, local_growth_rate.shape)
+                local_growth_rates -= np.broadcast_to(self.dispersal_away_rate, local_growth_rates.shape)
                 # local_growth_rates = local_growth_rates - \
                 #     np.broadcast_to(self.dispersal_away_rate,local_growth_rates.shape)
             
