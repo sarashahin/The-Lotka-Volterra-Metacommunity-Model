@@ -164,4 +164,4 @@ def stepwise_assembly_psd2(
 # stepwise_assembly_psd2 returns three items because the PSD‑2 model
 # only needs the biomass tensor B to start with,
 # and that tensor is trivially derivable from r & C inside PSD2Model
-# if you choose to initialise with a generic value (it is done in the constructor when initial_B is omitted).
+# if choose to initialise with a generic value (it is done in the constructor when initial_B is omitted).
