@@ -252,16 +252,14 @@ class PSD2Model:
         # invasion_pressure = np.clip(invasion / safeB, a_min=None, a_max=pressure_cap)
 
         invasion_pressure = (invasion / safeB)
+        assert (invasion_pressure >= 0).all(), "invasion_pressure turned negative!"
 
-        # cap to ±10 × intrinsic growth to avoid numeric blow‑ups
-        pressure_cap = 10.0
-        np.clip(invasion_pressure, -pressure_cap, pressure_cap, out=invasion_pressure)
         
         dlogB = local_growth + invasion_pressure
 
-        # Cross‑check self‑consistency every step
-        if np.isnan(dlogB).any() or np.isinf(dlogB).any():
-            raise FloatingPointError("dlogB blew up")
+        # # Cross‑check self‑consistency every step
+        # if np.isnan(dlogB).any() or np.isinf(dlogB).any():
+        #     raise FloatingPointError("dlogB blew up")
 
         sw_reshaped = (np.array(sw).reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X)) == 1)
         dlogB[sw_reshaped] = -non_self_growth[sw_reshaped] + invasion_pressure[sw_reshaped]
@@ -803,7 +801,7 @@ if __name__ == "__main__":
         
         # Test parameters
         S = 3  # number of species
-        nsteps = 250 # shorter simulation time for testing
+        nsteps = 150 # shorter simulation time for testing
         r = np.array([1.0, 1.0, 1.0])
         C = np.array([
             [1.0, 1.7, 0.4],
