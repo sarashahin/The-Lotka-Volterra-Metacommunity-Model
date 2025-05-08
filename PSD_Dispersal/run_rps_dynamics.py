@@ -1,7 +1,5 @@
-
-
 ############################################
-# run_rps_dynamics.py
+# run_rps_dynamics.py  —  fixed version
 ############################################
 
 import numpy as np
@@ -12,127 +10,122 @@ import matplotlib
 from models_psd2 import PSD2Model
 from models_ibm import IBMModel
 
-# Helper to extract dominant oscillation period via FFT
+# --- global “well‑mixed’’ dispersal ---------------------------------
+import config
+from config import NUM_PATCHES_X, NUM_PATCHES_Y, BODY_MASS, DISPERSAL_RATE        # link all 25 patches
+# -------------------------------------------------------------------
+
+# ----------------‑‑ utility ----------------------------------------
 def dominant_period(t, x):
+    """Return the period of the dominant FFT peak of 1‑D signal x(t)."""
     from scipy.fft import rfftfreq, rfft
     dt = np.mean(np.diff(t))
-    freqs = rfftfreq(len(t), dt)[1:]
-    spec = np.abs(rfft(x))[1:]
-    peak = np.argmax(spec)
-    return 1.0 / freqs[peak]
+    freqs = rfftfreq(len(t), dt)[1:]          # skip the zero mode
+    spec  = np.abs(rfft(x))[1:]
+    return 1.0 / freqs[np.argmax(spec)]
 
-# Rock–paper–scissors competition matrix
-# Rock-Paper-Scissors parameters
-a, b = 1.7, 0.4     # cyclic competition: species 0 beats 1, 1 beats 2, 2 beats 0
+# ----------------‑‑ LV parameters ----------------------------------
 r = np.ones(3)
-C = np.array([[1, a, b],  # 0 suffers less from 1 (a), more from 2 (b)
-              [b, 1, a],   # 1 suffers less from 2, more from 0
-              [a, b, 1]])
+C = np.eye(3)
+C[C == 0] = 0.4          # off‑diagonal interaction strength
 
-# Simulation settings
-tmax = 1200
-record_step = 10
+# ----------------‑‑ simulation control -----------------------------
+tmax        = 20_000
+record_step = 100
+# -------------------------------------------------------------------
 
-def test_psd2_model():
+def run_psd2():
     np.random.seed(0)
     model = PSD2Model(r, C, tmax=tmax, record_step=record_step,
                       seed=42, dispersal_type='propagule')
-    
-    # small random perturbation around the equilibrium
     model.logB += 0.01 * (np.random.rand(*model.logB.shape) - 0.5)
-    
     t, traj, *_ = model.run()
-    mean_ts = traj.mean(axis=(2,3))
+
+    mean_ts = traj.sum(axis=1).mean(axis=(1, 2))     # community mean biomass
     plt.figure()
-    for i in range(3):
-        plt.plot(t, mean_ts[:,i], label=f'sp {i}')
-    plt.legend(); plt.title('PSD2 mean biomasses'); plt.show()
-    print("PSD2 dominant period:", dominant_period(t, mean_ts[:,0]))
+    plt.plot(t, mean_ts, label='PSD2')
+    plt.xlabel('time'); plt.ylabel('mean biomass'); plt.legend(); plt.title('PSD2')
+    plt.show()
+    print("PSD2 dominant period:", dominant_period(t, mean_ts))
     return t, traj
 
-def test_ibm_model():
+def run_ibm():
     np.random.seed(1)
     model = IBMModel(r, C, nsteps=tmax, record_step=record_step,
                      seed=1, dispersal_type='propagule')
-    
     traj = model.run()
-    times = np.arange(record_step, tmax+1, record_step)
-    mean_ts = traj.mean(axis=(2,3))
+    times = np.arange(record_step, tmax + 1, record_step)
+
+    mean_ts = traj.sum(axis=1).mean(axis=(1, 2))
     plt.figure()
-    for i in range(3):
-        plt.plot(times, mean_ts[:,i], label=f'sp {i}')
-    plt.legend(); plt.title('IBM mean biomasses'); plt.show()
-    print("IBM dominant period:", dominant_period(times, mean_ts[:,0]))
+    plt.plot(times, mean_ts, label='IBM', color='g')
+    plt.xlabel('time'); plt.ylabel('mean biomass'); plt.legend(); plt.title('IBM')
+    plt.show()
+    print("IBM dominant period:", dominant_period(times, mean_ts))
     return times, traj
 
-def animate_spatial(traj, title='', filename=None, fps=30):
-    """
-    Create an animation showing spatial patterns over time
-    """
+# ----------------‑‑ animation helper --------------------------------
+def animate_spatial(traj, title='', filename=None, fps=50):
+    """Animate spatial biomass maps stored as traj[t, sp, y, x]."""
     n_t, S, ny, nx = traj.shape
-    
-    # Limit figure width to avoid FFmpeg issues
-    max_width = 1920  # Standard HD width
-    
-    # Determine how many species per row based on max width
-    species_per_row = min(8, S)  # Maximum 8 species per row
-    rows = int(np.ceil(S / species_per_row))
-    cols = min(S, species_per_row)
-    
-    # Create appropriate sized figure (limit size)
-    fig_width = min(max_width / 100, cols * 4)  # 4 inches per subplot width max
-    fig_height = rows * 3  # 3 inches per subplot height
-    
-    fig, axes = plt.subplots(rows, cols, figsize=(fig_width, fig_height))
-    if S == 1:
-        axes = np.array([axes])
+
+    # ---- layout: ≤8 panels per row ---------------------------------
+    cols = min(8, S)
+    rows = int(np.ceil(S / cols))
+
+    fig, axes = plt.subplots(rows, cols,
+                             figsize=(4 * cols, 3 * rows),
+                             squeeze=False)
     axes = axes.flatten()
-    
-    # Hide unused subplots
+
+    # hide unused panes
     for i in range(S, len(axes)):
         axes[i].set_visible(False)
-    
-    # Set up initial frame/ – guarantee vmax > 0 to avoid divide-by-zero
-    vmax = [max(np.max(traj[:, i]), 1e-12) for i in range(S)]
+
+    vmax = [max(traj[:, i].max(), 1e-12) for i in range(S)]
+    ims  = []
     for i in range(S):
-        im = axes[i].imshow(traj[0,i], vmin=0, vmax=vmax[i] or 1)
+        im = axes[i].imshow(traj[0, i], vmin=0, vmax=vmax[i], animated=True)
         axes[i].set_title(f'Species {i}')
         axes[i].axis('off')
-    
-    plt.tight_layout(pad=0.5)
+        ims.append(im)
+
     plt.suptitle(title, y=1.02)
+    plt.tight_layout()
 
     def update(frame):
-        artists = []
-        for i in range(S):
-            im = axes[i].images[0]
-            im.set_data(traj[frame,i])
-            artists.append(im)
-        return artists
+        for i, im in enumerate(ims):
+            im.set_array(traj[frame, i])
+        return ims
 
     ani = animation.FuncAnimation(fig, update, frames=n_t,
-                                  blit=True, interval=100, repeat_delay=500)
-    plt.suptitle(title)
+                                  blit=True, interval=200)
 
     if filename:
-        if filename.endswith('.mp4'):
-            Writer = animation.writers['ffmpeg']
-            ani.save(filename, writer=Writer(fps=fps))
-        elif filename.endswith('.gif'):
-            ani.save(filename, writer='imagemagick', fps=fps)
-        else:
-            with open(filename, 'w') as f:
-                f.write(ani.to_jshtml())
-        print("Saved animation to", filename)
+        try:
+            if filename.endswith('.mp4'):
+                Writer = animation.writers['ffmpeg']
+                ani.save(filename, writer=Writer(fps=fps))
+            elif filename.endswith('.gif'):
+                ani.save(filename, writer='pillow', fps=fps)
+            else:                       # HTML for notebooks
+                with open(filename, 'w') as f:
+                    f.write(ani.to_jshtml())
+            print(f"Saved animation to {filename}")
+        except (KeyError, RuntimeError):   # FFmpeg unavailable
+            print("⚠️  FFmpeg not found – falling back to GIF via Pillow")
+            ani.save(filename.replace('.mp4', '.gif'), writer='pillow', fps=fps)
     else:
         plt.show()
 
     plt.close(fig)
     return ani
 
+# ----------------‑‑ main --------------------------------------------
 if __name__ == '__main__':
-    t_psd, traj_psd = test_psd2_model()
-    animate_spatial(traj_psd, 'PSD2 Spatial RPS', filename='psd2_rps.mp4')
+    t_psd, traj_psd = run_psd2()
+    animate_spatial(traj_psd, 'PSD2 spatial dynamics', filename='psd2_rps.mp4')
 
-    t_ibm, traj_ibm = test_ibm_model()
-    animate_spatial(traj_ibm, 'IBM Spatial RPS', filename='ibm_rps.mp4')
+    t_ibm, traj_ibm = run_ibm()
+    animate_spatial(traj_ibm, 'IBM spatial dynamics', filename='ibm_rps.mp4')
+    # animate_spatial(traj_ibm, 'IBM spatial dynamics', filename='ibm_rps.gif')
