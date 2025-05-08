@@ -11,20 +11,33 @@ Quick CI smoke-test        :  python run_all_rps.py --dry-run
 Outputs → results/{data,plots,movies}/
 """
 from __future__ import annotations
+import cupy, os
+print("CuPy OK on device:", cupy.cuda.runtime.getDevice())
+print("LD_LIBRARY_PATH =", os.getenv("LD_LIBRARY_PATH","<unset>"))
 import argparse, json, time, pathlib, datetime as _dt
 import numpy as np, matplotlib.pyplot as plt
+import scipy
 from  scipy.fft import rfft, rfftfreq
+import gpu_patch
 import sys
+
+
+
+
 
 # ─── project modules ─────────────────────────────────────────────────────
 import dispersal
-from config import BODY_MASS, NUM_PATCHES_X, NUM_PATCHES_Y, STEP_SIZE
+from config import BODY_MASS, NUM_PATCHES_X, NUM_PATCHES_Y, STEP_SIZE, DISPERSAL_RATE,LONG_DISTANCE_PROB
 from models_psd2 import PSD2Model
 from models_ibm  import IBMModel
 from models_ode  import ODEModel
 from assembly_stepwise_psd2 import stepwise_assembly_psd2
 from assembly_stepwise_ibm  import stepwise_assembly_ibm
 from run_rps_dynamics       import animate_spatial
+# visualisation helpers  <‑‑ add these two lines
+from utils_vis import make_mosaic
+from colour_bank import random_colour_table
+
 # ─────────────────────────────────────────────────────────────────────────
 
 # ─── helpers ─────────────────────────────────────────────────────────────
@@ -73,6 +86,13 @@ def main(argv=None):
         args.no_movie = True
         print("[dry-run] tmax set to 100, record_step to 20, movies disabled.")
 
+    # ---------------------------------------------------------------
+    # COMMON RANDOM STARTING MOSAIC  (same biomass everywhere)
+    rng      = np.random.default_rng(123)
+    B_seed   =  (rng.random((3, NUM_PATCHES_Y, NUM_PATCHES_X)) < 0.5).astype(float) * BODY_MASS
+    N_ibm   = (B_seed / BODY_MASS).astype(int)         # integer counts for IBM
+    # ---------------------------------------------------------------
+
     # ------- scenario selection ------------------------------------------
     if args.pool is None:                                  # 3-species RPS
         a, b = 1.7, 0.4
@@ -82,7 +102,11 @@ def main(argv=None):
     else:                                                  # infinite pool
         tag, use_assembly = f'pool{args.pool}', True       # exact size decided later
 
-    dispersal.LONG_DISTANCE_PROB = 1.0                    # well-mixed reference
+    # choose colours ONCE, so PSD & IBM panels share them
+    # choose colours ONCE, but pick as many as you need
+    max_richness_est = 50 if not use_assembly else 2*args.pool
+    colour_table = random_colour_table(max_richness_est)
+                    
 
     # ------- folders ------------------------------------------------------
     root      = pathlib.Path('results')
@@ -97,17 +121,36 @@ def main(argv=None):
     if use_assembly:
         r_psd, C_psd, extra_psd = stepwise_assembly_psd2(
             window_time=args.assemble_horizon,
-            record_step=args.record)
-        data['PSD2_occ'] = extra_psd['occ_counts']          # NEW
+            record_step=args.record,
+            max_rounds=30000,
+            F_sat=6)
+        # data['PSD2_occ'] = extra_psd['occ_counts']          # NEW
+        B_seed  = extra_psd['B_seed']
+        data['PSD2_occ'] = extra_psd['occ_counts']
         dispersal.set_invasion_pressure(None)            # safety
     else:
         r_psd, C_psd = r0, C0
+        # B_seed      = None           # start from default biomass
         extra_psd = {}  # Empty dict to avoid errors when referenced
 
-    m_psd = PSD2Model(r_psd, C_psd,
+    m_psd = PSD2Model(r_psd, C_psd, initial_B=B_seed,
                       tmax=args.tmax, record_step=args.record,
                       dispersal_type='propagule', seed=42)
     t_psd, B_psd, w_psd, pc_psd, g_psd, inv_psd, est_psd = m_psd.run()
+
+    # -------- snapshots for the 4×2 patchy mosaic --------------------------
+    snap_times = [0, 0.25*args.tmax, 0.5*args.tmax, 0.75*args.tmax,
+                0.85*args.tmax, 0.9*args.tmax, 0.95*args.tmax, args.tmax]
+    snap_idx   = [np.abs(t_psd - tt).argmin() for tt in snap_times]
+    frames_psd = [B_psd[i] for i in snap_idx]    # each is (S,Ny,Nx)
+
+    if len(r_psd) > colour_table.shape[0]:
+        colour_table = random_colour_table(len(r_psd))
+
+    make_mosaic(frames_psd, snap_times,
+                colour_table[:len(r_psd)],        # truncate to richness
+                save_to=d_plot / f"{tag}_PSD2_panels.png", ncols=4, dpi=300)
+
 
     meta['PSD2'] = dict(S=len(r_psd),
                         period=dominant_period(t_psd, B_psd.mean((2,3))[:,0]))
@@ -125,18 +168,29 @@ def main(argv=None):
         r_ibm, C_ibm, N_ibm, extra_ibm = stepwise_assembly_ibm(
             window_steps=int(args.assemble_horizon/STEP_SIZE),
             record_step=int(args.record/STEP_SIZE),
-            seed_size=5)
+            seed_size=5,
+            F_sat=6)
     else:
         r_ibm, C_ibm = r0, C0
-        N_ibm        = None                                 # nothing to save
+        # N_ibm        = None                                 # nothing to save
         extra_ibm     = {}          # nothing to add later
 
-    m_ibm = IBMModel(r_ibm, C_ibm,
+    m_ibm = IBMModel(r_ibm, C_ibm, initial_N=N_ibm,
                      nsteps=int(args.tmax/STEP_SIZE),
                      record_step=int(args.record/STEP_SIZE),
                      dispersal_type='propagule', seed=1)
     B_ibm = m_ibm.run()
     t_ibm = np.arange(args.record, args.tmax + args.record, args.record)
+
+    snap_idx   = [np.abs(t_ibm - tt).argmin() for tt in snap_times]  # reuse same times
+    frames_ibm = [B_ibm[i] for i in snap_idx]
+
+    if len(r_ibm) > colour_table.shape[0]:
+        colour_table = random_colour_table(len(r_ibm))
+    make_mosaic(frames_ibm, snap_times,
+                colour_table[:len(r_ibm)],
+                save_to=d_plot / f"{tag}_IBM_panels.png")
+    # # -------- snapshots for the 4×2 patchy mosaic --------------------------
 
     meta['IBM'] = dict(S=len(r_ibm),
                        period=dominant_period(t_ibm, B_ibm.mean((2,3))[:,0]))
@@ -183,8 +237,8 @@ def main(argv=None):
     # =====================================================================
     if not args.no_movie and not args.dry_run:
         plt.figure(figsize=(8,6))
-        plt.plot(t_psd, B_psd.mean((2,3))[:,0], 'b', label='PSD2')
-        plt.plot(t_ibm, B_ibm.mean((2,3))[:,0], 'g', label='IBM')
+        plt.plot(t_psd,  B_psd.mean((1,2,3)), 'b', label='PSD2')
+        plt.plot(t_ibm,  B_ibm.mean((1,2,3)), 'g', label='IBM')
         if 'ODE_t' in data:
             plt.plot(data['ODE_t'],
                      data['ODE_B'].mean((2,3))[:,0], 'r', label='ODE')
