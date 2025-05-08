@@ -7,7 +7,7 @@ import os
 
 # Determine the base directory 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
-DATA_FILE = os.path.join(BASE_DIR, "results", "data", "rps_dataset_full.npz")
+DATA_FILE = os.path.join(BASE_DIR, "results", "data", "rps_dataset.npz")
 data      = np.load(DATA_FILE, allow_pickle=True)
 
 
