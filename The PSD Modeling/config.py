@@ -14,8 +14,12 @@ import numpy as np
 # Biomass unit
 BODY_MASS = 1e-4
 
-# Invasion rate
-INV = 1e-8
+# cfg_low.py
+# INV = 1e-10          # << tiny immigration
+
+# cfg_high.py
+INV = 1e-6           # << large immigration
+
 
 # Mortality rate (for large negative growth offsets)
 MORTALITY_RATE = 0.2
@@ -33,7 +37,7 @@ TARGET_RICHNESS = 300
 T_RELAX = 300
 
 #: Max simulation time
-TMAX =  200000  # (like 200000 in R)
+TMAX =  3000  # (like 200000 in R)
 
 #: Step size per iteration in the simpler discrete loops
 STEP_SIZE = 1
@@ -58,13 +62,4 @@ THRESHOLD = 10 * BODY_MASS
 # We also define maximum steps for Assimulo
 MAX_STEPS = 100000
 
-# -----------------------------
-# Consumer Parameters
-# -----------------------------
-NUM_CONSUMERS = 1
-TOTAL_SPECIES = TARGET_RICHNESS + NUM_CONSUMERS
 
-ATTACK_RATE = 0.3             # Base attack rate for consumer on resources
-SIGMA = 0.6                  # Sigma parameter for consumer dietary breadth
-CONVERSION_EFFICIENCY = 0.1    # Conversion efficiency for consumer biomass gain
-RESPIRATION_RATE = 0.1         # Respiration rate for consumers
