@@ -12,6 +12,12 @@ import numpy as np
 import logging
 from assimulo.solvers import CVode
 from assimulo.problem import Explicit_Problem
+from config import (
+    BODY_MASS,
+    MORTALITY_RATE,
+    STEP_SIZE,
+    RECORDING_STEP_SIZE,
+    TMAX, INV, RTOL, ATOL)
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +38,8 @@ class ODEModel:
         init_biomass = BODY_MASS/10
         self.logB = np.full(self.S, np.log(init_biomass))
 
-        self.nrecords = self.tmax // self.record_step if self.record_step>0 else 1
+        # self.nrecords = self.tmax // self.record_step if self.record_step>0 else 1
+        self.nrecords = int(self.tmax // self.record_step) if self.record_step > 0 else 1
         self.trajectory = np.full((self.nrecords+1, self.S), 0.0)
         self.time_points = np.zeros(self.nrecords+1)
         self.record_idx = 0
@@ -41,9 +48,17 @@ class ODEModel:
         B = np.exp(logB)
         # localGrowthRate = (r - C@B)
         local_growth = self.r - self.C.dot(B)
-        # dlogB_i/dt = local_growth[i] + exp(log(INV) - logB[i])
-        # Because i_i can be species-specific, we do an array of i's => INV for each species
+
+        # --- softened invasion ----------------------------------------------
+        # instead of  INV * exp(-logB)   use   INV / (B + B0)
+        # B0       = BODY_MASS /100       #  tiny “seed biomass” ≈ carrying A‑x seed
+        # inv_term = INV / (B + B0)   # always finite, never huge
+        # --------------------------------------------------------------------
         dlogB = local_growth + np.exp(np.log(INV) - logB)
+        # dlogB    = local_growth + inv_term
+        # dlogB_i/dt = local_growth[i] + exp(log(INV) - logB[i])
+        # Because i_i can be species-specific, we do an array of i's => let's just do INV for each species
+        # dlogB = local_growth + np.exp(np.log(INV) - logB)
         logger.debug(f"[ODEModel _deriv] t={t:.2f}, sample logB={logB[:10]}, local_growth~={local_growth[:10]}")
         return dlogB
 
