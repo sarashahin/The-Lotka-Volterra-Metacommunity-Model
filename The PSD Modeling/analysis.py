@@ -16,6 +16,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 import logging
 from utils import mav, bav, mean_se
+from config import (
+    BODY_MASS,
+    MORTALITY_RATE,
+    STEP_SIZE,
+    RECORDING_STEP_SIZE,
+    TMAX, INV, RTOL, ATOL)
 
 logger = logging.getLogger(__name__)
 
@@ -36,23 +42,8 @@ def turnover_rate(trajectory, recording_step):
     diffs = np.abs(np.diff(presence, axis=0))
     changes = np.sum(diffs, axis=1)
     rate = changes / float(recording_step)
-    return rate
-
-def plot_total_biomasses(trajectories, labels, title, filename):
-    """
-    Multi-trajectory line plot: total biomass versus time.
-    """
-    plt.figure(figsize=(10,6))
-    for traj, label in zip(trajectories, labels):
-        total_biomass = np.sum(traj, axis=1)
-        plt.plot(total_biomass, label=label)
-    plt.xlabel("Time Index")
-    plt.ylabel("Total Biomass")
-    plt.title(title)
-    plt.legend()
-    plt.savefig(filename)
-    plt.close()
-    logger.info(f"Saved figure {filename}")
+    return rate    
+##############################################################################
 
 def plot_trajectories(trajectories, labels, title, filename_base):
     """
@@ -69,46 +60,76 @@ def plot_trajectories(trajectories, labels, title, filename_base):
         plt.savefig(filename)
         plt.close()
         logger.info(f"Saved figure {filename}")
+        
 
-def histogram_biomass(trajectories, labels, filename):
-    """
-    Overlaid histograms (log10 scale) for biomass distributions.
-    """
-    plt.figure(figsize=(10,6))
-    for traj, label in zip(trajectories, labels):
-        data = traj.flatten()
-        data = data[data >= BODY_MASS]
-        if len(data) == 0:
-            continue
-        plt.hist(np.log10(data), bins=50, alpha=0.4, label=label, density=True)
-    plt.xlabel("log10(Biomass)")
-    plt.ylabel("Density")
-    plt.title("Biomass Distribution")
-    plt.legend()
-    plt.savefig(filename)
-    plt.close()
-    logger.info(f"Saved figure {filename}")
+# ───────────────────────────── histogram helpers ─────────────────────────
+def _auto_bins(data: np.ndarray, rule: str = "FD", max_bins: int = 200) -> int:
+    """Scott / Freedman–Diaconis bin selector (upper-capped)."""
+    if data.size < 5:
+        return 5
+    if rule.upper().startswith("S"):
+        # Scott
+        bw = np.histogram_bin_edges(data, bins="scott")
+    else:
+        # Freedman-Diaconis
+        bw = np.histogram_bin_edges(data, bins="fd")
+    # np.histogram_bin_edges returns the EDGE array → #bins = len(edges)-1
+    n_bins = len(bw) - 1
+    return max(5, min(n_bins, max_bins))
 
-def covariance_matrix_plot(trajectory, title, filename):
+def _draw_hist(ax, biomass: np.ndarray, label: str,
+               bins="auto", color=None, **kw):
+    biomass = biomass[biomass >= BODY_MASS]
+    if biomass.size == 0:
+        return None
+    x = np.log10(biomass)
+    if bins == "auto" or (isinstance(bins, tuple) and bins[0] == "auto"):
+        rule = "FD" if bins == "auto" else bins[1]
+        bins = _auto_bins(x, rule=rule)
+    return ax.hist(x, bins=bins, density=True, alpha=.45,
+                   label=label, color=color, **kw)[0]
+
+
+def histogram_biomass(trajectories, labels, filename,
+                      *, bins="auto", comparison: bool = False, burn_in_frac: float = 0.0):
     """
-    Plot the covariance matrix computed from the latter half of the trajectory.
+    Parameters
+    ----------
+    trajectories : list[np.ndarray]   flattened biomass arrays
+    labels       : list[str]
+    bins         : int | "auto" | ("auto","Scott") | ("auto","FD")
+    comparison   : if True, the first two curves are compared via KS statistic
     """
-    half = trajectory.shape[0] // 2
-    portion = trajectory[half:, :]
-    covmat = np.cov(portion.T)
-    plt.figure(figsize=(6,5))
-    plt.imshow(covmat, aspect='auto', origin='lower', cmap='viridis')
-    plt.colorbar(label='Covariance')
-    plt.title(title)
-    plt.savefig(filename)
-    plt.close()
-    logger.info(f"Saved figure {filename}")
+    fig, ax = plt.subplots(figsize=(9, 5))
+    curves = []
+    for traj, lab in zip(trajectories, labels):
+        # --- discard the first burn_in_frac of records -----------------
+        if burn_in_frac > 0:
+            cut = int(traj.shape[0] * burn_in_frac)
+            traj = traj[cut:]
+        n = _draw_hist(ax, traj.flatten(), lab, bins=bins)
+        curves.append(n)
+
+    if comparison and len(curves) >= 2 and curves[0] is not None and curves[1] is not None:
+        cdf1 = np.cumsum(curves[0]) / curves[0].sum()
+        cdf2 = np.cumsum(curves[1]) / curves[1].sum()
+        ks   = np.max(np.abs(cdf1 - cdf2))
+        ax.set_title(f"Biomass distribution – KS = {ks:.3f}")
+    else:
+        ax.set_title("Biomass distribution")
+        
+
+    ax.set_xlabel("log\u2081\u2080(Biomass)");  ax.set_ylabel("Density")
+    ax.legend(frameon=False);  fig.tight_layout()
+    fig.savefig(filename, dpi=300);  plt.close(fig)
+    logger.info("Saved figure %s", filename)
+
 
 def save_model_output(ibm_trajectory, psd_trajectory, psd2_trajectory, psd2_waiting,
                       psd2_poisson_clock, psd2_growth_rate, psd2_invasion_rate, psd2_est_prob,
                       ode_trajectory):
     """
-    Save all model outputs (including PSD2 diagnostics) to a .npz file.
+    Save all model outputs (including PSD diagnostics) to a .npz file.
     """
     np.savez(
         "model_outputs.npz",
