@@ -11,7 +11,7 @@ import os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Build the relative path to the data file
-data_file = os.path.join(BASE_DIR, "model_outputs.npz")
+data_file = os.path.join(BASE_DIR, "results_seed101/model_outputs.npz")
 
 # Load the data using NumPy
 data = np.load(data_file, allow_pickle=True)
@@ -44,3 +44,9 @@ print(data['ODE'])
 # print(data['xMat'].shape)
 # extinction_log = data['extinction_log'].item()  # retrieve the dictionary
 # print("extinction_log", extinction_log)
+
+
+from numpy import load	
+rows = load("results_seed101/model_outputs.npz")['PSD2'].shape[0]	
+print('PSD2')
+print(rows) # should be 2001 (2 000 000 / 1 000 + 1)
