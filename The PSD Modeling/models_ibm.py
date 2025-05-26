@@ -7,6 +7,14 @@ using binomial & Poisson draws each step.
 """
 import numpy as np
 import logging
+import argparse
+import config_utils
+from config import (
+    BODY_MASS,
+    MORTALITY_RATE,
+    STEP_SIZE,
+    RECORDING_STEP_SIZE,
+    TMAX, INV, RTOL, ATOL)
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +36,13 @@ class IBMModel:
         self.r = r
         self.C = C
         self.S = len(r)  # number of species
-        self.nsteps = nsteps if nsteps is not None else TMAX
-        self.record_step = record_step if record_step is not None else RECORDING_STEP_SIZE
+        # self.nsteps = nsteps if nsteps is not None else TMAX
+        # self.record_step = record_step if record_step is not None else RECORDING_STEP_SIZE
+        
+        # make sure both are *integers* so we can use them in range()
+        self.nsteps = int(nsteps if nsteps is not None else TMAX)
+        self.record_step = int(record_step if record_step is not None
+                               else RECORDING_STEP_SIZE)
 
         np.random.seed(seed)
 
@@ -41,7 +54,8 @@ class IBMModel:
         self.N = np.full(self.S, int(init_biomass / BODY_MASS), dtype=int)
 
         # Storage for trajectory
-        self.nrecords = self.nsteps // self.record_step
+        # self.nrecords = self.nsteps // self.record_step
+        self.nrecords = int(self.nsteps // self.record_step)  # or math.ceil(…)
         self.trajectory = np.full((self.nrecords, self.S), np.nan, dtype=float)
 
     def run(self):
