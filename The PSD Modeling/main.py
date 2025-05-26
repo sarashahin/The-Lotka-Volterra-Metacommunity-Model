@@ -2,7 +2,7 @@
 # main.py
 ############################################
 """
-Main driver script: sets up parameters, runs all four models (IBM, PSD, PSD2, ODE),
+Main driver script: sets up parameters, runs all four models (IBM, PSD, ODE),
 performs basic analysis, and saves data for advanced usage.
 """
 
@@ -22,17 +22,18 @@ import models_psd
 import models_psd2
 import models_ode
 import analysis
+from models_ode import ODEModel
 from models_ibm import IBMModel
 from models_psd import PSDModel
 from models_psd2 import PSD2Model
-from models_ode import ODEModel
+
 from analysis import (
     alpha_diversity,
     turnover_rate,
     plot_trajectories,
-    plot_total_biomasses,
+    # plot_total_biomasses,
     histogram_biomass,
-    covariance_matrix_plot,
+    # covariance_matrix_plot,
     save_model_output,
     mav, bav, mean_se
 )
@@ -87,20 +88,51 @@ def main():
                         default="config.py",
                         nargs='?', # fall back to default if not present
                         help="Path to the configuration .py file.")
+    
+    parser.add_argument("--run-time", type=float, default=None,
+                        help="override TMAX (model units)")
+    parser.add_argument("--bins", default="auto",
+                        help="histogram bins: int | auto | auto:Scott | auto:FD")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="random seed for THIS run (overrides RANDOM_SEED ""in config.py)")
+    
+    parser.add_argument("--burn-in", type=float, default=0.2,
+                    help="fraction of the trajectory to discard "
+                         "before histogramming (0‒1, default 0.2)")
+
     args = parser.parse_args()
-    config_path = args.config_file
+    
+    # ------------------------------------------------------------------
+    # 1 · load the config file  (this defines TMAX, RECORDING_STEP_SIZE, …)
+    # ------------------------------------------------------------------
+    config_path   = args.config_file
     config_module = config_utils.load_config(config_path)
+    if not config_module:
+        sys.exit(f"Could not read config file {config_path!r}")
+    config_utils.assign_all_config_variables(config_module, globals(), verbose=True)
 
-    # Load configuration file
-    if config_module:
-        print(f"Read configuration file {config_path}")
+    # ------------------------------------------------------------------
+    # 2 · optionally override seed and TMAX
+    # ------------------------------------------------------------------
+    if args.seed is not None:
+        RANDOM_SEED = args.seed
+        logger.info("Overriding RANDOM_SEED → %d", RANDOM_SEED)
+
+    # ------------------------------------------------------------------
+    # 3 · turn the --bins string into an object for histogram_biomass
+    # ------------------------------------------------------------------
+    if str(args.bins).isdigit():
+        bin_setting = int(args.bins)
+    elif str(args.bins).lower().startswith("auto"):
+        rule = "FD" if ":" not in args.bins else args.bins.split(":")[1]
+        bin_setting = ("auto", rule)          # e.g. ("auto","Scott")
     else:
-        sys.exit("Could not read config file provided as parameter.")
+        raise ValueError("--bins must be int or auto[:Rule]")
 
-    config_utils.assign_all_config_variables(config_module, globals(),verbose=True)
-
-    # Configure also the following modules:
-    modules_to_configure = [models_ibm, models_psd, models_psd2, models_ode, analysis]
+    # ------------------------------------------------------------------
+    # 4 · configure helper modules that rely on globals from config.py
+    # ------------------------------------------------------------------
+    modules_to_configure = [models_ibm, models_psd, models_psd2, analysis]
     config_utils.configure_modules(config_module, modules_to_configure)
 
     # Define number of species (TARGET_RICHNESS)
@@ -116,6 +148,12 @@ def main():
     np.fill_diagonal(C, 1.0)
 
     logger.info(f"Initial growth rates (r) and competition matrix (C) set for S={S} species.")
+    
+    # RUN ODE Model
+    logger.info("Running ODE Model...")
+    ode_model = ODEModel(r=r, C=C, tmax=TMAX, record_step=RECORDING_STEP_SIZE, seed=RANDOM_SEED)
+    ode_times, ode_trajectory = ode_model.run()
+
 
     # RUN IBM Model
     logger.info("Running IBM Model...")
@@ -134,53 +172,47 @@ def main():
     (psd2_times, psd2_trajectory, psd2_waiting,
      psd2_poisson_clock, psd2_growth_rate, psd2_invasion_rate, psd2_est_prob) = psd2_model.run()
 
-    # RUN ODE Model
-    logger.info("Running ODE Model...")
-    ode_model = ODEModel(r=r, C=C, tmax=TMAX, record_step=RECORDING_STEP_SIZE, seed=RANDOM_SEED)
-    ode_times, ode_trajectory = ode_model.run()
-
     # Basic analysis and plotting
     logger.info("Generating basic analysis plots...")
 
     plot_trajectories(
-        trajectories=[ibm_trajectory, psd_trajectory, psd2_trajectory, ode_trajectory],
-        labels=["IBM", "PSD", "PSD2", "ODE"],
+        trajectories=[ode_trajectory, ibm_trajectory, psd_trajectory],
+        labels=["ODE", "IBM", "PSD"],
         title="Population Dynamics",
         filename_base="Trajectory.png"
     )
 
-    plot_total_biomasses(
-        trajectories=[ibm_trajectory, psd_trajectory, psd2_trajectory, ode_trajectory],
-        labels=["IBM", "PSD", "PSD2", "ODE"],
-        title="Population Dynamics: Total Biomass Comparison",
-        filename="All_Models_Trajectory.png"
-    )
+    # plot_total_biomasses(
+    #     trajectories=[ode_trajectory, ibm_trajectory, psd_trajectory, psd2_trajectory],
+    #     labels=["ODE", "IBM", "PSD", "PSD2"],
+    #     title="Population Dynamics: Total Biomass Comparison",
+    #     filename="All_Models_Trajectory.png"
+    # )
+    
+
+
 
     histogram_biomass(
-        trajectories=[ibm_trajectory, psd_trajectory, psd2_trajectory, ode_trajectory],
-        labels=["IBM", "PSD", "PSD2", "ODE"],
-        filename="Biomass_Distribution_Histogram.png"
+        trajectories=[ode_trajectory, ibm_trajectory, psd_trajectory],
+        labels=["ODE", "IBM", "PSD"],
+        filename="Biomass_Distribution_Histogram.png",
+        bins=40,
+        burn_in_frac=args.burn_in
     )
 
-    ibm_turnover = turnover_rate(ibm_trajectory, RECORDING_STEP_SIZE)
-    psd_turnover = turnover_rate(psd_trajectory, RECORDING_STEP_SIZE)
-    psd2_turnover = turnover_rate(psd2_trajectory, RECORDING_STEP_SIZE)
-    ode_turnover = turnover_rate(ode_trajectory, RECORDING_STEP_SIZE)
 
     ibm_alpha = alpha_diversity(ibm_trajectory)
     psd_alpha = alpha_diversity(psd_trajectory)
     psd2_alpha = alpha_diversity(psd2_trajectory)
-    ode_alpha = alpha_diversity(ode_trajectory)
 
     logger.info("Alpha diversity medians:")
-    logger.info(f"IBM: {np.median(ibm_alpha)}, PSD: {np.median(psd_alpha)}, PSD2: {np.median(psd2_alpha)}, ODE: {np.median(ode_alpha)}")
+    logger.info(f"IBM: {np.median(ibm_alpha)}, PSD2: {np.median(psd2_alpha)}")
     logger.info("Mean+SE alpha (blockwise average, n=50) for IBM:")
-    logger.info(mean_se(psd_alpha))
-
-    covariance_matrix_plot(ibm_trajectory, "IBM Cov Matrix", "IBM_CovMatrix.png")
-    covariance_matrix_plot(psd_trajectory, "PSD Cov Matrix", "PSD_CovMatrix.png")
-    covariance_matrix_plot(psd2_trajectory, "PSD2 Cov Matrix", "PSD2_CovMatrix.png")
-    covariance_matrix_plot(ode_trajectory, "ODE Cov Matrix", "ODE_CovMatrix.png")
+    logger.info(mean_se(ibm_alpha))
+    # logger.info("Mean+SE alpha (blockwise average, n=50) for PSD:")
+    # logger.info(mean_se(psd_alpha))
+    logger.info("Mean+SE alpha (blockwise average, n=50) for PSD2:")
+    logger.info(mean_se(psd2_alpha))
 
     # Save outputs for advanced visualization including PSD2 diagnostics
     save_model_output(
