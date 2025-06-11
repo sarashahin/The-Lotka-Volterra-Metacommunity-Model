@@ -609,8 +609,8 @@ class PSD2Model:
             
             # new blow up guard for B
             # ─── ecological cap ───────────────────────────────────────────────
-            # B_CAP = BODY_MASS           # 1 × adult biomass  (= r/C11 if r≈C11≈1)
-            # val = np.minimum(val, B_CAP)
+            B_CAP = BODY_MASS           # 1 × adult biomass  (= r/C11 if r≈C11≈1)
+            val = np.minimum(val, B_CAP)
             # ------------------------------------------------------------------
 
 
