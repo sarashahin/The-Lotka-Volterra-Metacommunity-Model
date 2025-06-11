@@ -20,7 +20,8 @@ Ny, Nx = NUM_PATCHES_Y, NUM_PATCHES_X
 def stepwise_assembly_psd2(
         *,
         base_r        : float = 1.0,
-        pressure_rate : float = 1e-2,
+        pressure_rate : float = 3e-3,  # per patch per time step
+        # pressure_rate : float = 1e-2,
         window_time   : float = 5_000.,
         record_step   : float = 50.,
         F_sat         : int   = 12,
@@ -126,7 +127,9 @@ def stepwise_assembly_psd2(
         # prune extinct residents (rare)
         alive = B.sum(axis=(1,2)) > BODY_MASS
         if (B.sum(axis=(1,2)) > 2*B.shape[1]*B.shape[2]).any():
-            print("LARGE B DETECTED")
+            # B[B > 2] = 2
+            # print("LARGE B DETECTED")
+            log.warning(f"[PSD2] round {rnd}: large B detected")
             #sys.exit()
         if not alive.all():
             # r, C, *_ = prune_extinct(alive, r, C)
