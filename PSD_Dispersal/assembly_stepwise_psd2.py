@@ -21,9 +21,9 @@ def stepwise_assembly_psd2(
         *,
         base_r        : float = 1.0,
         pressure_rate : float = 1e-2,
-        window_time   : float = 1_000.,
+        window_time   : float = 5_000.,
         record_step   : float = 50.,
-        F_sat         : int   = 6,
+        F_sat         : int   = 12,
         frac_multi    : float = 0.05,      # ← proportion of γ candidates/round
         max_rounds    : int   = 50,
         seed          : int   = 0,
