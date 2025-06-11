@@ -1,6 +1,7 @@
 ############################################
-# models_psd2.py
+# models_psd2.py  
 ############################################
+# note: any comment with only new means it was added only for inifinit pool assembly
 
 """
 PSD2 approach with multi‐patch dynamics, ‘chunked’ assimilation,
@@ -38,6 +39,7 @@ from config import (
 )
 # Import dispersal routine and precomputed matrix
 from dispersal import compute_dispersal, LOCAL_DISPERSAL_MATRIX
+from config import LOG_B_CAP
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +61,8 @@ class PSD2Model:
                  seed=123,
                  dispersal_type='propagule',
                  dispersal_away_rate=None):
+        
+        
 
         """
         :param r: 1D array of intrinsic growth rates (length S).
@@ -77,7 +81,7 @@ class PSD2Model:
         # ◀◀◀ CHANGED: build competition matrix if not provided
         if C is None:
             rng = np.random.default_rng(seed)
-            C = np.eye(self.S, dtype=float)
+            C = np.eye(self.S, dtype= float) 
             # off‐diagonals: nonzero with prob=CONNECTANCE
             for i in range(self.S):
                 for j in range(self.S):
@@ -142,7 +146,7 @@ class PSD2Model:
         initial_B = np.exp(self.logB)
         competitive_loss = (self.C @ initial_B.reshape(self.S, -1)).\
             reshape(self.logB.shape)
-        print(competitive_loss.shape)
+        # print(competitive_loss.shape)
         local_growth = self.r_field - competitive_loss
         diagB = np.diag(self.C).reshape(-1, 1, 1) * initial_B
         non_self_growth = local_growth + diagB
@@ -167,6 +171,8 @@ class PSD2Model:
             
         # For storing results (trajectory arrays now have an extra spatial dimension)
         self.nrecords = int(max(1, self.tmax // self.record_step))
+        # new
+        # self.nrecords = int(math.ceil(self.tmax / self.record_step))
         self.trajectory = np.zeros((self.nrecords + 1, self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
         self.wait_trajectory = np.zeros((self.nrecords + 1, self.S, NUM_PATCHES_Y, NUM_PATCHES_X), dtype=bool)
         self.time_points = np.zeros(self.nrecords + 1)
@@ -215,6 +221,19 @@ class PSD2Model:
         logB = y[:total].reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
         pclock = y[total:2*total].reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
 
+        # ------------------------------------------------------------------
+        # 1.  Numerical guards (overflow / inf×0 / NaN)new
+        # ------------------------------------------------------------------
+        # LOGB_MAX = 700.0                     # np.exp(709) ≈ float64 max
+        # logB     = np.clip(logB, None, LOGB_MAX)
+        # new
+        # logB = np.clip(logB, None, LOG_B_CAP)   # never allow log-B > log(B_max)
+        # B = np.exp(logB)
+        # B = np.nan_to_num(B, nan=0., posinf=1e300)
+        # # Compute the biomass for each species in each patch.
+        # epsilon = 1e-300
+        # safeB = np.maximum(B, epsilon)
+
         B = np.exp(logB)
         # Compute the biomass for each species in each patch.
         epsilon = 1e-300
@@ -239,6 +258,7 @@ class PSD2Model:
         non_self_growth = local_growth + diagB
         
         # Compute invasion flux from dispersal.
+        # invasion = compute_dispersal(B)
         invasion = compute_dispersal(B)
         
         # sw_reshaped = np.array(sw).reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
@@ -248,12 +268,15 @@ class PSD2Model:
         # The mortality/dispersal-away term is now scaled by 1 so that it aligns with the lecture derivations.
 
         # clip the pressure _before_ adding it
-        # pressure_cap = 5.0           
+        # pressure_cap = 10.0           
         # invasion_pressure = np.clip(invasion / safeB, a_min=None, a_max=pressure_cap)
 
         invasion_pressure = (invasion / safeB)
+        # new
+        # invasion_pressure = np.nan_to_num(invasion / safeB, nan=0., posinf=0.)
         assert (invasion_pressure >= 0).all(), "invasion_pressure turned negative!"
-
+        # clip any tiny negative numerical artefacts
+        invasion_pressure = np.clip(invasion_pressure, a_min=0.0, a_max=None)
         
         dlogB = local_growth + invasion_pressure
 
@@ -267,7 +290,7 @@ class PSD2Model:
         ## neighbouring patches can lead to large invasion/safeB
         ## terms that destabilise EulerSimple.  We put a limit to the
         ## impact here.
-        dlogB = np.clip(dlogB, a_min=None, a_max=10)
+        dlogB = np.clip(dlogB, a_min=None, a_max=5)
 
         
 
@@ -316,7 +339,108 @@ class PSD2Model:
         # Add back intraspecific effect:
         local_growth = local_growth + np.diag(self.C).reshape(-1, 1, 1) * B
         return np.concatenate([local_growth.flatten(), pclock.flatten()])
-    
+
+
+    # ─────────────────────────────────────────────────────────────
+    #  FULLY‑VECTORISED EVENT HANDLER
+    # ─────────────────────────────────────────────────────────────
+    # def _handle_event_fn(self, solver, event_info, *, max_print: int = 5):
+    #     """
+    #     Vectorised multi‑patch event handler for PSD2.
+
+    #     * All growth‑sign crossings and Poisson‑clock events are processed
+    #       simultaneously with boolean masks – no per‑event Python loops.
+    #     * A short diagnostic summary is printed; individual examples are
+    #       shown only for the first `max_print` critical events so that runs
+    #       stay fast even when thousands of events fire at once.
+    #     """
+    #     Ny, Nx = NUM_PATCHES_Y, NUM_PATCHES_X
+    #     S      = self.S
+    #     tot    = S * Ny * Nx
+
+    #     # ---------- unpack current solver state -------------------------
+    #     y      = solver.y          # 1‑D view (length 2*tot)
+    #     logB   = y[      :tot  ].reshape(S, Ny, Nx)
+    #     pclock = y[tot  :2*tot].reshape(S, Ny, Nx)
+    #     B      = np.exp(logB)
+    #     sw     = np.asarray(solver.sw, bool).reshape(S, Ny, Nx)
+
+    #     # ---------- local growth g_loc ----------------------------------
+    #     B_lin  = B.reshape(S, -1)
+    #     g_loc  = self.r_field - (self.C @ B_lin).reshape(S, Ny, Nx)
+    #     if self.dispersal_type == 'adult':
+    #         g_loc -= self.dispersal_away_rate
+    #     g_loc += np.diag(self.C).reshape(-1, 1, 1) * B
+
+    #     # ---------- event field -----------------------------------------
+    #     ev_vec = np.asarray(event_info[0], int)        # 1‑D (length 2*tot)
+    #     ev_g   = ev_vec[:tot   ].reshape(S, Ny, Nx)    # growth sign events
+    #     ev_pc  = ev_vec[tot:].reshape(S, Ny, Nx)       # p‑clock events
+
+    #     # Masks
+    #     grow_neg   = ev_g == +1      # S/P → D      (growth became <0)
+    #     grow_pos   = ev_g == -1      # D   → P      (growth became >0)
+    #     pc_hit     = ev_pc == +1     # P   → S      (pclock crossed 0)
+    #     pc_down    = ev_pc == -1     # sanity debug
+
+    #     t_now = solver.t
+
+    #     # ---------- 1.  growth‑sign transitions -------------------------
+    #     # (a) waiting & growth went negative  → switch S→D
+    #     mask_SD = grow_neg & sw
+    #     if mask_SD.any():
+    #         sw[mask_SD] = False
+    #         # pclock stays unchanged (still ≤0)
+
+    #     # (b) waiting & growth stayed positive – nothing happens
+    #     # (c) growth became positive while waiting (S)  → S→P
+    #     mask_SP = grow_pos & sw
+    #     if mask_SP.any():
+    #         sw[mask_SP]      = False
+    #         pclock[mask_SP]  = 1.0   # new P state
+
+    #     # ---------- 2.  Poisson‑clock transitions -----------------------
+    #     # P→S  (clock hits zero and was NOT waiting)
+    #     mask_PS = pc_hit & (~sw)
+    #     if mask_PS.any():
+    #         sw[mask_PS] = True
+    #         pclock[mask_PS] = np.log(np.random.rand(mask_PS.sum()))
+
+    #     # ---------- 3.  impossible waiting states ----------------------
+    #     sw[g_loc < 0] = False        # growth negative ⇒ cannot be S
+
+    #     # ---------- 4.  diagnostics ------------------------------------
+    #     def _first_coords(mask, n=max_print):
+    #         """Return up to n (s,i,j) tuples from True‑mask for printing."""
+    #         if not mask.any(): return []
+    #         idx = np.argwhere(mask)
+    #         return [tuple(x) for x in idx[:n]]
+
+    #     if mask_SD.any() or mask_SP.any() or mask_PS.any() or pc_down.any():
+    #         print(f"[PSD2 event]  t={t_now:8.2f}  "
+    #               f"S→D:{mask_SD.sum():4d}  "
+    #               f"S→P:{mask_SP.sum():4d}  "
+    #               f"P→S:{mask_PS.sum():4d}  "
+    #               f"clock↓:{pc_down.sum():4d}")
+
+    #         # show a few illustrative examples
+    #         for cat, m in [('S→D', mask_SD),
+    #                        ('S→P', mask_SP),
+    #                        ('P→S', mask_PS)]:
+    #             for (s,i,j) in _first_coords(m):
+    #                 lg = g_loc[s,i,j]
+    #                 print(f"   · {cat}  sp={s}  patch=({i},{j})  g={lg:+.3e}")
+
+    #         if pc_down.any():
+    #             for (s,i,j) in _first_coords(pc_down):
+    #                 print(f"   · clock↓ sp={s} patch=({i},{j})  "
+    #                       f"pclock={pclock[s,i,j]:.3e}")
+
+    #     # ---------- 5.  write back to solver ----------------------------
+    #     solver.y[:tot]      = np.log(np.maximum(B, 1e-300)).ravel()
+    #     solver.y[tot:2*tot] = pclock.ravel()
+    #     solver.sw           = sw.ravel().tolist()
+
 
     def _handle_event_fn(self, solver, event_info):
         """
@@ -383,8 +507,8 @@ class PSD2Model:
                 lg = local_growth[s, i, j]
                 cur_logB = logB[s, i, j]
                 cur_pclock = pclock[s, i, j]
-                print(f"Local growth rate {lg:.12f} of species {s} at patch ({i},{j}) was negative while waiting "
-                      f"({cur_logB:.12f}, {cur_pclock:.12f}) at time {solver.t:.8f}!")
+                # print(f"Local growth rate {lg:.12f} of species {s} at patch ({i},{j}) was negative while waiting "
+                #       f"({cur_logB:.12f}, {cur_pclock:.12f}) at time {solver.t:.8f}!")
 
         # 1.b  S → P  (waiting & lg_evt_flag == −1)
         mask_S_to_P = waiting & (lg_evt_flag == -1)
@@ -392,7 +516,7 @@ class PSD2Model:
             idx = np.vstack(np.nonzero(mask_S_to_P)).T
             for s, i, j in idx:
                 lg = local_growth[s, i, j]
-                print(f"Species {s} at patch ({i},{j}): S ({lg:.12f}) -> P at time {solver.t:.12f}")
+                # print(f"Species {s} at patch ({i},{j}): S ({lg:.12f}) -> P at time {solver.t:.12f}")
             sw[mask_S_to_P]      = False
             pclock[mask_S_to_P]  = 1.0
 
@@ -429,7 +553,7 @@ class PSD2Model:
                 idx = np.vstack(np.nonzero(mask_P_to_D)).T
                 for s, i, j in idx:
                     lg = local_growth[s, i, j]
-                    print(f"Species {s} at patch ({i},{j}): P ({lg:.8f}) -> D at time {solver.t:.8f}")
+                    # print(f"Species {s} at patch ({i},{j}): P ({lg:.8f}) -> D at time {solver.t:.8f}")
                 new_logB = np.minimum(0.0,
                     logB[mask_P_to_D] -
                     np.log1p(-prob_to_S[mask_P_to_D]))
@@ -441,7 +565,7 @@ class PSD2Model:
                 idx = np.vstack(np.nonzero(mask_P_to_S)).T
                 for s, i, j in idx:
                     lg = local_growth[s, i, j]
-                    print(f"Species {s} at patch ({i},{j}): P ({lg:.8f}) -> S at time {solver.t:.8f}")
+                    # print(f"Species {s} at patch ({i},{j}): P ({lg:.8f}) -> S at time {solver.t:.8f}")
                 sw[mask_P_to_S]      = True
                 pclock[mask_P_to_S]  = np.log(np.random.rand(np.count_nonzero(mask_P_to_S)))
 
@@ -449,8 +573,8 @@ class PSD2Model:
         mask_D_to_P = not_waiting & (lg_evt_flag == -1)
         if np.any(mask_D_to_P):
             idx = np.vstack(np.nonzero(mask_D_to_P)).T
-            for s, i, j in idx:
-                print(f"Species {s} at patch ({i},{j}): D -> P at time {solver.t:.8f}")
+            # for s, i, j in idx:
+            #     print(f"Species {s} at patch ({i},{j}): D -> P at time {solver.t:.8f}")
 
         # ------------------------------------------------------------------
         # 2. Poisson‑clock events ------------------------------------------
@@ -461,8 +585,8 @@ class PSD2Model:
             idx = np.vstack(np.nonzero(mask_clock_decl)).T
             for s, i, j in idx:
                 cur_pclock = pclock[s, i, j]
-                print(f"Poisson Clock {cur_pclock:.8f} declined for species {s} at patch ({i},{j}) "
-                      f"(waiting: {sw[s, i, j]}) at time {solver.t:.8f}!")
+                # print(f"Poisson Clock {cur_pclock:.8f} declined for species {s} at patch ({i},{j}) "
+                #       f"(waiting: {sw[s, i, j]}) at time {solver.t:.8f}!")
 
         # 2.b  S → D  (pc_evt_flag == +1)  – establishment attempt ----------
         mask_S_clock = (pc_evt_flag == +1)
@@ -477,7 +601,20 @@ class PSD2Model:
             est_prob           = np.zeros_like(local_growth)
             est_prob[lg_pos_mask] = local_growth[lg_pos_mask] / denom_pc[lg_pos_mask]
 
-            val                = np.where(est_prob > 0, BODY_MASS / est_prob, BODY_MASS)
+            # val = np.where(est_prob > 0, BODY_MASS / est_prob, BODY_MASS)
+            # new
+            val = np.divide(BODY_MASS, est_prob,
+                            out=np.full_like(est_prob, BODY_MASS),
+                            where=est_prob > 0)
+            
+            # new blow up guard for B
+            # ─── ecological cap ───────────────────────────────────────────────
+            # B_CAP = BODY_MASS           # 1 × adult biomass  (= r/C11 if r≈C11≈1)
+            # val = np.minimum(val, B_CAP)
+            # ------------------------------------------------------------------
+
+
+
 
             # Update biomass (logB)
             set_zero_mask      = (val > 1) & mask_S_clock
@@ -492,14 +629,14 @@ class PSD2Model:
             idx = np.vstack(np.nonzero(mask_S_clock)).T
             for s, i, j in idx:
                 cur_pclock = pclock[s, i, j]
-                print(f"Species {s} at patch ({i},{j}): S ({cur_pclock:.12f}) -> D at time {solver.t:.12f}")
+                # print(f"Species {s} at patch ({i},{j}): S ({cur_pclock:.12f}) -> D at time {solver.t:.12f}")
 
             # Log negative growth cases
             neg_growth_mask = (local_growth < 0) & mask_S_clock
             if np.any(neg_growth_mask):
                 idx = np.vstack(np.nonzero(neg_growth_mask)).T
-                for s, i, j in idx:
-                    print(f"Local growth negative when pclock triggered for species {s} at patch ({i},{j})!")
+                # for s, i, j in idx:
+                #     print(f"Local growth negative when pclock triggered for species {s} at patch ({i},{j})!")
 
         # ------------------------------------------------------------------
         # 3. Write‑back to solver ------------------------------------------
@@ -663,7 +800,7 @@ class PSD2Model:
         # solver.options['verbosity'] = 30
 
         solver = EulerSimple(problem)
-        solver.options['inith'] = 1
+        solver.options['inith'] = 0.1
         solver.options['maxsteps'] = 10000000
         solver.store_event_points = False
 
