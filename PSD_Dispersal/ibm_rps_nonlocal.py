@@ -7,10 +7,10 @@ import matplotlib.pyplot as plt
 import config
 config.LONG_DISTANCE_PROB = 1.0
 
-# ——— 2. Import the IBMModel (assumes you're in the same directory or installed) ———
+# ——— 2. Import the IBMModel (the same directory or installed) ———
 from models_ibm import IBMModel
 from config import NUM_PATCHES_X, NUM_PATCHES_Y, BODY_MASS, STEP_SIZE  # grid size & units
-from utils_analysis import count_invasions  # optional, for summary stats
+from utils_analysis import count_invasions  # for summary stats
 from utils_vis import make_mosaic       # to build the mosaic at the end
 
 # ——— 3. Set up 3‐species RPS parameters ———
@@ -29,7 +29,7 @@ Ny, Nx = NUM_PATCHES_Y, NUM_PATCHES_X
 # For “well‐mixed” flavor, you can choose Ny=Nx=1 or small. 
 # Usually RPS requires more than one patch to see spatial heterogeneity,
 # but with 100% non‐local dispersal, patches will mix quickly. 
-# We’ll keep the default grid (e.g. 5×5 or whatever your config uses).
+
 # Record every 100 IBM steps, run for 10 000 steps in total.
 
 nsteps = 2000
