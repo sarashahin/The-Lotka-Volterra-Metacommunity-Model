@@ -27,6 +27,8 @@ from assimulo.problem import Explicit_Problem
 from euler_simple import EulerSimple  # Import your own solver
 from dispersal import compute_dispersal, LOCAL_DISPERSAL_MATRIX   # Use our dispersal module
 from environment import generate_spatial_r     # ◀◀◀
+# add at the very top, together with the other imports
+from utils_analysis import count_invasions 
 
 
 # It is recommended to remove any constant INV from config now,
@@ -51,6 +53,7 @@ class ODEModel:
                 #  C,
                  C=None,               # ◀◀◀ can auto‐generate
                  r_field=None,         # ◀◀◀ spatial override
+                 initial_B=None, 
                  length_scale=None,
                  var_r=None,
                  seed_field=None,
@@ -58,7 +61,8 @@ class ODEModel:
                  record_step=None,
                  seed=123,
                  dispersal_type='propagule',
-                 dispersal_away_rate=None):
+                 dispersal_away_rate=None
+                ):
         
     
         np.random.seed(seed)
@@ -110,9 +114,18 @@ class ODEModel:
 
         # Initialize biomass in each patch.
         # Use initial biomass = BODY_MASS/10 for each species in every patch.
-        init_biomass = BODY_MASS / 10
-        # Initialize logB as a 3D array of shape (S, NUM_PATCHES_Y, NUM_PATCHES_X)
-        self.logB = np.full((self.S, NUM_PATCHES_Y, NUM_PATCHES_X), np.log(init_biomass))
+        # init_biomass = BODY_MASS / 10
+        # # Initialize logB as a 3D array of shape (S, NUM_PATCHES_Y, NUM_PATCHES_X)
+        # self.logB = np.full((self.S, NUM_PATCHES_Y, NUM_PATCHES_X), np.log(init_biomass))
+
+        if initial_B is not None:
+            assert initial_B.shape == (self.S, NUM_PATCHES_Y, NUM_PATCHES_X)
+            # add 1e‑100 so log() is safe even if some patches are empty
+            self.logB = np.log(np.maximum(initial_B, 1e-100))
+        else:
+            init_biomass = BODY_MASS / 10
+            self.logB = np.full((self.S, NUM_PATCHES_Y, NUM_PATCHES_X),
+                                np.log(init_biomass))
         
 
         # Determine number of records based on tmax and record_step.
@@ -138,6 +151,8 @@ class ODEModel:
         """
         # Reshape the flat state vector to (S, NUM_PATCHES_Y, NUM_PATCHES_X)
         logB = logB_flat.reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+        np.clip(logB, -50.0, 50.0, out=logB)
+        # B = np.exp(logB, dtype=float) 
         B = np.exp(logB)  # Compute biomass from logB
 
         # Calculate local growth for every patch:
@@ -163,8 +178,16 @@ class ODEModel:
         # both having the same shape as B.
         
         incoming_flux = compute_dispersal(B)
+
+        # ---------- invasion pressure (cap ≃ 10 like in PSD2) ----------
+        invasion_pressure = incoming_flux / (B + 1e-300)
+        # invasion_pressure = np.clip(invasion_pressure, a_min=None, a_max=10.0)
         # build d(logB)/dt
-        dlogB = local_growth + incoming_flux / (B + 1e-300) 
+        # dlogB = local_growth + incoming_flux / (B + 1e-300)
+        # 
+        dlogB = local_growth + invasion_pressure
+        # very stiff systems can still diverge – put a final guard
+        np.clip(dlogB, -20.0, 20.0, out=dlogB) 
 
         # Debug information (can be commented out if too verbose)
         logger.debug(f"[ODEModel _deriv] t={t:.2f}, sample logB (flattened)={logB.flatten()[:10]}")
@@ -178,26 +201,49 @@ class ODEModel:
         all species over all patches.
         """
         logger.info("Starting ODE simulation with EulerSimple (multi-patch and dispersal)...")
+
+        # try:
+        #     from assimulo.solvers import CVode
+        #     HAVE_CVODE = True
+        # except Exception:
+        #     HAVE_CVODE = False
         
-        # Flatten the initial state (logB) to a 1D vector.
+        # # Flatten the initial state (logB) to a 1D vector.
         y0 = self.logB.flatten()
         sw0 = np.zeros_like(y0)   # dummy, because _deriv ignores it
         problem = Explicit_Problem(self._deriv, y0, 0.0, sw0=sw0)
-        problem.name = 'ODEModel'
-        
-        # Initialize EulerSimple solver (imported from euler_simple.py)
-        from euler_simple import EulerSimple
+        problem.name = 'ODEModel' 
         solver = EulerSimple(problem)
         # Set solver options:
         solver.options['inith'] = 1
-        solver.options['maxsteps'] = 10000000
+        solver.options['maxsteps'] = 10000000  # large enough for tmax=2000
         solver.store_event_points = False
+
+        # ── choose solver ───────────────────────────────────────────────
+        # if HAVE_CVODE:
+        #     solver = CVode(problem)           # adaptive, stiff
+        #     solver.discr          = 'BDF'
+        #     solver.iter           = 'Newton'
+        #     solver.linear_solver  = 'SPGMR'
+        #     solver.rtol           = RTOL
+        #     solver.atol           = ATOL
+        #     solver.store_event_points = False
+        #     solver.options['maxsteps'] = MAX_STEPS
+        # else:                                 # fixed step fallback
+        #     solver = EulerSimple(problem)
+        #     solver.options['inith']    = 0.1   # *** much smaller step ***
+        #     solver.options['maxsteps'] = int(self.tmax/0.1)+10
+        #     solver.store_event_points = False
 
         # Define the record times based on tmax and record_step.
         times = np.arange(0, self.tmax + self.record_step, self.record_step, dtype=float)
 
         # Record the initial biomass trajectory.
-        self.trajectory[0, :, :, :] = np.exp(y0.reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X)))
+        # self.trajectory[0, :, :, :] = np.exp(y0.reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X)))
+        # Record the initial biomass trajectory (clipped to avoid overflow). new
+        init_logB = y0.reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+        np.clip(init_logB, -50.0, 50.0, out=init_logB)
+        self.trajectory[0, ...] = np.exp(init_logB)
         self.time_points[0] = 0.0
         self.record_idx = 1
 
@@ -214,6 +260,7 @@ class ODEModel:
             y_rec = y[rec_idx, :]
             logB = y_rec[:total_elements].reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
             # (If your model uses additional state, this part might include pclock, etc.)
+            np.clip(logB, -50.0, 50.0, out=logB)
             B = np.exp(logB)
             self.trajectory[step, :, :, :] = B
             self.time_points[step] = t[rec_idx]
@@ -308,3 +355,9 @@ if __name__ == "__main__":
             print("Relative error from analytical equilibrium:", rel_error)
     
     test_ode_model()
+
+
+
+
+
+
