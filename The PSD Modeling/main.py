@@ -15,6 +15,14 @@ import numpy as np
 # To import configuration file:
 import argparse
 import config_utils
+global BODY_MASS, INV, TMAX, RANDOM_SEED
+from config import (
+    BODY_MASS,
+    MORTALITY_RATE,
+    STEP_SIZE, RECORDING_STEP_SIZE,
+    CONNECTANCE, INTERACTION_STRENGTH,TARGET_RICHNESS,
+    TMAX, INV, RTOL, ATOL)
+
 
 from utils import setup_logging as setup_utils_logging
 import models_ibm
@@ -31,7 +39,7 @@ from analysis import (
     alpha_diversity,
     turnover_rate,
     plot_trajectories,
-    # plot_total_biomasses,
+    plot_total_biomasses,
     histogram_biomass,
     # covariance_matrix_plot,
     save_model_output,
@@ -80,6 +88,7 @@ logger.info("Logging is set up. Debug logs will be stored in the 'logs' folder."
 # Main Function
 ############################################################
 def main():
+    global BODY_MASS, INV, TMAX, RANDOM_SEED
     logger.info("Setting up parameters and initial conditions...")
 
     # Parse command-line arguments. Currently only for loading config file.
@@ -99,6 +108,15 @@ def main():
     parser.add_argument("--burn-in", type=float, default=0.2,
                     help="fraction of the trajectory to discard "
                          "before histogramming (0‒1, default 0.2)")
+    
+    parser.add_argument("--body-mass", type=float,
+                        help="override BODY_MASS (g biomass of 1 individual)")
+    parser.add_argument("--inv", type=float,
+                        help="override INV (immigration rate per unit biomass/time)")
+    parser.add_argument('--skip-ibm', type=float,
+                    help='do not run the IBM model')
+    parser.add_argument('--only-model PSD2', type=float,
+                    help='do not run the PSD2 model')
 
     args = parser.parse_args()
     
@@ -110,6 +128,33 @@ def main():
     if not config_module:
         sys.exit(f"Could not read config file {config_path!r}")
     config_utils.assign_all_config_variables(config_module, globals(), verbose=True)
+
+    # ------------------------------------------------------------------
+    # 2 ·override seed, BODY_MASS, INV and TMAX
+    # ------------------------------------------------------------------
+    # ----- run-time overrides ------------------------------------------------
+
+    if args.body_mass is not None:
+        BODY_MASS = args.body_mass
+        logger.info("BODY_MASS overridden → %.2e", BODY_MASS)
+
+    if args.inv is not None:
+        INV = args.inv
+        logger.info("INV overridden → %.2e", INV)
+
+    if args.run_time is not None:
+        TMAX = int(args.run_time)
+        logger.info("TMAX overridden → %d", TMAX)
+
+    # propagate into already-imported model modules
+    for modname in ["models_ibm", "models_psd", "models_psd2", "models_ode"]:
+        if modname in sys.modules:
+            mod = sys.modules[modname]
+            mod.BODY_MASS = BODY_MASS
+            mod.INV = INV
+            mod.TMAX = TMAX           # all three models read this
+
+
 
     # ------------------------------------------------------------------
     # 2 · optionally override seed and TMAX
@@ -161,10 +206,10 @@ def main():
     ibm_trajectory = ibm_model.run()
 
     # RUN PSD Model
-    logger.info("Running PSD Model...")
-    psd_model = PSDModel(r=r, C=C, nsteps=TMAX, record_step=RECORDING_STEP_SIZE, seed=RANDOM_SEED)
-    psd_trajectory_log, psd_waiting = psd_model.run()
-    psd_trajectory = np.exp(psd_trajectory_log) * (~psd_waiting)
+    # logger.info("Running PSD Model...")
+    # psd_model = PSDModel(r=r, C=C, nsteps=TMAX, record_step=RECORDING_STEP_SIZE, seed=RANDOM_SEED)
+    # psd_trajectory_log, psd_waiting = psd_model.run()
+    # psd_trajectory = np.exp(psd_trajectory_log) * (~psd_waiting)
 
     # RUN PSD2 Model ( with extra diagnostic outputs)
     logger.info("Running PSD2 Model...")
@@ -176,33 +221,38 @@ def main():
     logger.info("Generating basic analysis plots...")
 
     plot_trajectories(
-        trajectories=[ode_trajectory, ibm_trajectory, psd_trajectory],
+        trajectories=[ode_trajectory, ibm_trajectory, psd2_trajectory],
         labels=["ODE", "IBM", "PSD"],
         title="Population Dynamics",
         filename_base="Trajectory.png"
     )
 
-    # plot_total_biomasses(
-    #     trajectories=[ode_trajectory, ibm_trajectory, psd_trajectory, psd2_trajectory],
-    #     labels=["ODE", "IBM", "PSD", "PSD2"],
-    #     title="Population Dynamics: Total Biomass Comparison",
-    #     filename="All_Models_Trajectory.png"
-    # )
+    plot_total_biomasses(
+        trajectories=[ode_trajectory, ibm_trajectory, psd2_trajectory],
+        labels=["ODE", "IBM", "PSD"],
+        title="Population Dynamics: Total Biomass Comparison",
+        filename="All_Models_Trajectory.png"
+    )
     
 
 
 
     histogram_biomass(
-        trajectories=[ode_trajectory, ibm_trajectory, psd_trajectory],
+        trajectories=[ode_trajectory, ibm_trajectory, psd2_trajectory],
         labels=["ODE", "IBM", "PSD"],
         filename="Biomass_Distribution_Histogram.png",
-        bins=40,
-        burn_in_frac=args.burn_in
+        bins=30,
+        burn_in_frac=0.05
+        # burn_in_frac=args.burn_in
     )
 
+    ibm_turnover = turnover_rate(ibm_trajectory, RECORDING_STEP_SIZE)
+    # psd_turnover = turnover_rate(psd_trajectory, RECORDING_STEP_SIZE)
+    psd2_turnover = turnover_rate(psd2_trajectory, RECORDING_STEP_SIZE)
+    ode_turnover = turnover_rate(ode_trajectory, RECORDING_STEP_SIZE)
 
     ibm_alpha = alpha_diversity(ibm_trajectory)
-    psd_alpha = alpha_diversity(psd_trajectory)
+    # psd_alpha = alpha_diversity(psd_trajectory)
     psd2_alpha = alpha_diversity(psd2_trajectory)
 
     logger.info("Alpha diversity medians:")
@@ -214,10 +264,23 @@ def main():
     logger.info("Mean+SE alpha (blockwise average, n=50) for PSD2:")
     logger.info(mean_se(psd2_alpha))
 
+    # nz_ibm = ibm_trajectory[ibm_trajectory>0]
+    # nz_psd = psd2_trajectory[psd2_trajectory>0]
+    # logger.info("Median>0  IBM %.3g  PSD %.3g", np.median(nz_ibm), np.median(nz_psd))
+
+
+    # # Add sanity printouts (temporary)
+    # non_waiting = psd2_trajectory > 2e-10        # anything above the tiny floor
+    # logger.info("Median>floor  IBM %.3g  PSD %.3g",
+    #             np.median(ibm_trajectory[ibm_trajectory > 2e-10]),
+    #             np.median(psd2_trajectory[non_waiting]))
+
+
+
     # Save outputs for advanced visualization including PSD2 diagnostics
     save_model_output(
         ibm_trajectory,
-        psd_trajectory,
+        # psd_trajectory,
         psd2_trajectory,
         psd2_waiting,
         psd2_poisson_clock,
