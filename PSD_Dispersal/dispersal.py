@@ -80,11 +80,11 @@ def compute_dispersal(B):
     
     For each species (each 2D slice in B):
       - Local dispersal is computed based on a biomass excess: patches with biomass higher than the
-        average of their eight neighbors contribute dispersers.
+        average of their four neighbors contribute dispersers.
       - A fraction LONG_DISTANCE_PROB of the dispersal flux is allocated to long-distance dispersal,
         which is then distributed uniformly across all patches.
     
-    This implementation uses a precomputed local dispersal matrix for the local (8-neighbor)
+    This implementation uses a precomputed local dispersal matrix for the local (4-neighbor)
     component.
     
     Parameters:
@@ -98,7 +98,11 @@ def compute_dispersal(B):
     S = B.shape[0]
     total_num_patches = B.size // S
 
-    dispersal_flux = B.reshape((S, -1)) @ LOCAL_DISPERSAL_MATRIX
+    # new
+    B_safe  = np.nan_to_num(B, nan=0., posinf=1e300)
+    # for each species, the biomass sitting in each source patch is converted into outgoing fluxes to neighboring patches according to the matrix
+    dispersal_flux = B_safe.reshape((S, -1)) @ LOCAL_DISPERSAL_MATRIX
+    # dispersal_flux = B.reshape((S, -1)) @ LOCAL_DISPERSAL_MATRIX
 
     ## Long-distance flux:
     ldd_incoming = LONG_DISTANCE_PROB * dispersal_flux.sum(axis=1) / total_num_patches
@@ -111,4 +115,6 @@ def compute_dispersal(B):
         incoming_flux += _EXTRA_INVASION.reshape(S, -1)
     # --------------------------------------------------------------------
     
-    return incoming_flux.reshape(B.shape)
+    # return incoming_flux.reshape(B.shape)
+    # new
+    return np.nan_to_num(incoming_flux, nan=0., posinf=0.).reshape(B.shape)
