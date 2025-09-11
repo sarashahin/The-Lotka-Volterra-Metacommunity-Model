@@ -10,8 +10,10 @@ We replicate the logic from the R code in a continuous sense.
 """
 import numpy as np
 import logging
+import time  # ### NEW
 from assimulo.solvers import CVode
 from assimulo.problem import Explicit_Problem
+from euler_simple import EulerSimple
 from config import (
     BODY_MASS,
     MORTALITY_RATE,
@@ -29,6 +31,7 @@ class ODEModel:
     """
     def __init__(self, r, C, tmax=None, record_step=None, seed=123):
         np.random.seed(seed)
+        self.runtime_seconds = None  # ### NEW
         self.r = r
         self.C = C
         self.S = len(r)
@@ -36,6 +39,7 @@ class ODEModel:
         self.record_step = record_step if record_step is not None else RECORDING_STEP_SIZE
 
         init_biomass = BODY_MASS/10
+        # Initialize logB with a small positive value
         self.logB = np.full(self.S, np.log(init_biomass))
 
         # self.nrecords = self.tmax // self.record_step if self.record_step>0 else 1
@@ -51,8 +55,9 @@ class ODEModel:
 
         # --- softened invasion ----------------------------------------------
         # instead of  INV * exp(-logB)   use   INV / (B + B0)
-        # B0       = BODY_MASS /100       #  tiny “seed biomass” ≈ carrying A‑x seed
+        # B0       = BODY_MASS       #  tiny “seed biomass” ≈ carrying A‑x seed
         # inv_term = INV / (B + B0)   # always finite, never huge
+        # dlogB = local_growth + inv_term
         # --------------------------------------------------------------------
         dlogB = local_growth + np.exp(np.log(INV) - logB)
         # dlogB    = local_growth + inv_term
@@ -64,6 +69,7 @@ class ODEModel:
 
     def run(self):
         logger.info("Starting ODE simulation with Assimulo...")
+        t0 = time.perf_counter()  # ### NEW
 
         y0 = self.logB.copy()
         problem = Explicit_Problem(self._deriv, y0, 0.0)
@@ -76,6 +82,11 @@ class ODEModel:
         solver.rtol = RTOL
         solver.atol = ATOL
         # solver.options['maxsteps'] = 300
+
+        # solver = EulerSimple(problem)
+        # solver.options['inith'] = 1
+        # solver.options['maxsteps'] = 10000000
+        # solver.store_event_points = False
 
         times = np.arange(0, self.tmax+self.record_step, self.record_step, dtype=float)
 
@@ -98,5 +109,6 @@ class ODEModel:
             if t_next >= self.tmax:
                 break
 
-        logger.info("ODE simulation completed.")
+        self.runtime_seconds = time.perf_counter() - t0  # ### NEW
+        logger.info(f"ODE simulation completed in {self.runtime_seconds:.3f} s.")  # ### NEW
         return self.time_points[:self.record_idx], self.trajectory[:self.record_idx, :]
