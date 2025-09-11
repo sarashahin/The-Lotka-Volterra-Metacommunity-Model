@@ -14,9 +14,11 @@ import gpu_patch
 # Biomass unit
 BODY_MASS = 1e-4
 
-# Invasion rate
-INV = 1e-10
+# BODY_MASS = 1e-11
 
+# Invasion rate
+# INV = 1e-10
+INV = 0
 # Mortality rate (for large negative growth offsets)
 MORTALITY_RATE = 0.2
 
@@ -33,13 +35,13 @@ CONNECTANCE = 0.4
 INTERACTION_STRENGTH = 0.4
 
 #: Max simulation time
-TMAX = 200000  # (like 200000 in R)
+TMAX = 20000  # (like 200000 in R)100000
 
 #: Step size per iteration in the simpler discrete loops
 STEP_SIZE = 1
 
 #: Recording step size
-RECORDING_STEP_SIZE = 1000  # e.g., 1000
+RECORDING_STEP_SIZE = 100  # e.g., 1000
 
 #: Number of records to keep
 N_RECORDS = TMAX // RECORDING_STEP_SIZE
@@ -64,11 +66,12 @@ NUM_PATCHES_X = 50 # Number of patches horizontally
 NUM_PATCHES_Y = 50   # Number of patches vertically
 
 # Dispersal rate (diffusion coefficient): fraction of biomass exchanged per time step.
-# DISPERSAL_RATE = BODY_MASS * 0.00002
-# DISPERSAL_RATE = 0.02
-# LONG_DISTANCE_PROB = 1  # Probability of long-distance dispersal
-DISPERSAL_RATE = BODY_MASS * 0.005
-LONG_DISTANCE_PROB = 0  # Probability of long-distance dispersal
+
+# DISPERSAL_RATE = BODY_MASS * 0.0025 # half rate is 0.0025,Axel is expected,only for nonlocal  oscillation 2.5e-7
+DISPERSAL_RATE = BODY_MASS * 0.005 # full rate is 0.005,Axel is expected,only nonlocal  oscillation 5e-7
+# LONG_DISTANCE_PROB = 0  # Probability of local-distance dispersal
+
+LONG_DISTANCE_PROB = 1.0  # Probability of long-distance dispersal- only nonlocal  oscillation 
 
 
 
