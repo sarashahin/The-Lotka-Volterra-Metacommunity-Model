@@ -7,8 +7,10 @@ using binomial & Poisson draws each step.
 """
 import numpy as np
 import logging
+import time
 import argparse
 import config_utils
+import time  # ### NEW
 from config import (
     BODY_MASS,
     MORTALITY_RATE,
@@ -36,9 +38,7 @@ class IBMModel:
         self.r = r
         self.C = C
         self.S = len(r)  # number of species
-        # self.nsteps = nsteps if nsteps is not None else TMAX
-        # self.record_step = record_step if record_step is not None else RECORDING_STEP_SIZE
-        
+
         # make sure both are *integers* so we can use them in range()
         self.nsteps = int(nsteps if nsteps is not None else TMAX)
         self.record_step = int(record_step if record_step is not None
@@ -47,26 +47,25 @@ class IBMModel:
         np.random.seed(seed)
 
         # Initialize counts (N)
-        # In the R code, we had an initial 'BRelaxed' for each species.
-        # Suppose each species starts with N[i], we do a small biomass:
-        #we want them all to start at BODY_MASS/10 biomass => N = biomass / BODY_MASS
-        init_biomass = BODY_MASS/10
+        init_biomass = BODY_MASS / 10
         self.N = np.full(self.S, int(init_biomass / BODY_MASS), dtype=int)
 
         # Storage for trajectory
-        # self.nrecords = self.nsteps // self.record_step
-        self.nrecords = int(self.nsteps // self.record_step)  # or math.ceil(…)
+        self.nrecords = int(self.nsteps // self.record_step)
         self.trajectory = np.full((self.nrecords, self.S), np.nan, dtype=float)
+
+        self.runtime_seconds = None  # ### NEW: will be set after run()
 
     def run(self):
         """
         Run the IBM simulation. 
         """
         logger.info("Starting IBM simulation...")
+        t0 = time.perf_counter()  # ### NEW: start timer
+
         record_idx = 0
         for s in range(self.nsteps):
             B = self.N * BODY_MASS
-            # localGrowthRate = (r - C @ B)
             local_growth_rate = self.r - self.C.dot(B)
 
             # handle fastDying: localGrowthRate < - MORTALITY_RATE
@@ -75,7 +74,6 @@ class IBMModel:
             full_mortality[fast_dying] = -local_growth_rate[fast_dying]
             local_growth_rate[fast_dying] = -MORTALITY_RATE
 
-            # Step
             # death
             survival_prob = np.exp(-full_mortality * STEP_SIZE)
             new_N = np.random.binomial(self.N, survival_prob)
@@ -90,11 +88,13 @@ class IBMModel:
             self.N = new_N + birth_values + invasion_values
 
             # Recording
-            if (s+1) % self.record_step == 0:
+            if (s + 1) % self.record_step == 0:
                 self.trajectory[record_idx, :] = self.N * BODY_MASS
                 record_idx += 1
                 if record_idx % 10 == 0:
                     logger.info(f"IBM Progress: {record_idx}/{self.nrecords} records recorded.")
 
-        logger.info("IBM simulation completed.")
+        self.runtime_seconds = time.perf_counter() - t0  # ### NEW: stop timer
+        logger.info(f"IBM simulation completed in {self.runtime_seconds:.3f} s.")  # ### NEW
         return self.trajectory
+
