@@ -1,6 +1,7 @@
 ############################################
 # run_all_rps.py
 ############################################
+# note: any comment with only new means it was added only for inifinit pool assembly
 """
 run_all_rps.py  – benchmark RPS OR infinite-pool assembly pipeline
 ------------------------------------------------------------------
@@ -11,16 +12,24 @@ Quick CI smoke-test        :  python run_all_rps.py --dry-run
 Outputs → results/{data,plots,movies}/
 """
 from __future__ import annotations
-import cupy, os
-print("CuPy OK on device:", cupy.cuda.runtime.getDevice())
-print("LD_LIBRARY_PATH =", os.getenv("LD_LIBRARY_PATH","<unset>"))
+import os
+# import cupy, os
+# print("CuPy OK on device:", cupy.cuda.runtime.getDevice())
+# print("LD_LIBRARY_PATH =", os.getenv("LD_LIBRARY_PATH","<unset>"))
 import argparse, json, time, pathlib, datetime as _dt
 import numpy as np, matplotlib.pyplot as plt
 import scipy
 from  scipy.fft import rfft, rfftfreq
-import gpu_patch
 import sys
 
+import gpu_patch
+
+
+# ─── logging setup ──────────────────────────────────────────────────────
+import logging, sys
+logging.basicConfig(level=logging.INFO,
+                    format='[%(levelname)s] %(message)s',
+                    handlers=[logging.StreamHandler(sys.stdout)])
 
 
 
@@ -36,6 +45,7 @@ from assembly_stepwise_ibm  import stepwise_assembly_ibm
 from run_rps_dynamics       import animate_spatial
 # visualisation helpers  <‑‑ add these two lines
 from utils_vis import make_mosaic
+from utils_analysis import count_invasions 
 from colour_bank import random_colour_table
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -73,6 +83,13 @@ def cli(argv=None):
                    help='CI / smoke-test: tmax=100, record=20, skip movies/plots')
     p.add_argument('--skip-ode', action='store_true',
                    help='do not run the ODE reference model')
+    p.add_argument('--ode-only', action='store_true',
+                   help='run ONLY the ODE benchmark (skip PSD2 & IBM)')
+    p.add_argument('--skip-psd2', action='store_true',
+               help='do not run the PSD‑2 model')
+    p.add_argument('--skip-ibm',  action='store_true',
+               help='do not run the IBM model')
+
     return p.parse_args(argv)
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -123,7 +140,8 @@ def main(argv=None):
             window_time=args.assemble_horizon,
             record_step=args.record,
             max_rounds=30000,
-            F_sat=6)
+            F_sat=12)  # saturation factor)
+        
         # data['PSD2_occ'] = extra_psd['occ_counts']          # NEW
         B_seed  = extra_psd['B_seed']
         data['PSD2_occ'] = extra_psd['occ_counts']
@@ -138,6 +156,17 @@ def main(argv=None):
                       dispersal_type='propagule', seed=42)
     t_psd, B_psd, w_psd, pc_psd, g_psd, inv_psd, est_psd = m_psd.run()
 
+     # --- invasion statistics -------------------------------------------
+    meta['PSD2'] = dict(
+    S=len(r_psd),
+    period=dominant_period(t_psd, B_psd.mean((2,3))[:,0])
+    )
+    tot_inv_psd, inv_sp_px_psd, rich_px_psd = count_invasions(B_psd)
+    meta['PSD2']['total_invasions']     = tot_inv_psd
+    data['PSD2_inv_per_sp_patch']       = inv_sp_px_psd
+    data['PSD2_richness_per_patch']     = rich_px_psd
+    print(f"[PSD2] total invasions: {tot_inv_psd}")
+
     # -------- snapshots for the 4×2 patchy mosaic --------------------------
     snap_times = [0, 0.25*args.tmax, 0.5*args.tmax, 0.75*args.tmax,
                 0.85*args.tmax, 0.9*args.tmax, 0.95*args.tmax, args.tmax]
@@ -149,7 +178,7 @@ def main(argv=None):
 
     make_mosaic(frames_psd, snap_times,
                 colour_table[:len(r_psd)],        # truncate to richness
-                save_to=d_plot / f"{tag}_PSD2_panels.png", ncols=4, dpi=300)
+                save_to=d_plot / f"{tag}_PSD_panels.png", ncols=4, dpi=300)
 
 
     meta['PSD2'] = dict(S=len(r_psd),
@@ -169,7 +198,7 @@ def main(argv=None):
             window_steps=int(args.assemble_horizon/STEP_SIZE),
             record_step=int(args.record/STEP_SIZE),
             seed_size=5,
-            F_sat=6)
+            F_sat=12)
     else:
         r_ibm, C_ibm = r0, C0
         # N_ibm        = None                                 # nothing to save
@@ -180,7 +209,26 @@ def main(argv=None):
                      record_step=int(args.record/STEP_SIZE),
                      dispersal_type='propagule', seed=1)
     B_ibm = m_ibm.run()
+
+    # → we need the time vector before we can compute periods etc.
     t_ibm = np.arange(args.record, args.tmax + args.record, args.record)
+    # new
+    # t_ibm = args.record * np.arange(1, B_ibm.shape[0] + 1)
+
+    meta['IBM'] = dict(
+    S=len(r_ibm),
+    period=dominant_period(t_ibm, B_ibm.mean((2,3))[:,0])
+    )
+
+    tot_inv_ibm, inv_sp_px_ibm, rich_px_ibm = count_invasions(B_ibm)
+    meta['IBM']['total_invasions']     = tot_inv_ibm
+    data['IBM_inv_per_sp_patch']       = inv_sp_px_ibm
+    data['IBM_richness_per_patch']     = rich_px_ibm
+    print(f"[IBM]  total invasions: {tot_inv_ibm}")
+
+    # t_ibm = np.arange(args.record, args.tmax + args.record, args.record)
+    # new
+    t_ibm = args.record * np.arange(1, B_ibm.shape[0] + 1)
 
     snap_idx   = [np.abs(t_ibm - tt).argmin() for tt in snap_times]  # reuse same times
     frames_ibm = [B_ibm[i] for i in snap_idx]
@@ -207,17 +255,47 @@ def main(argv=None):
     if not args.no_movie:
         animate_spatial(B_ibm, f'IBM {tag}', str(d_mov/f'IBM_{tag}.mp4'), args.fps)
 
-    # # =====================================================================
-    # #  ODE (benchmark only)
-    # # =====================================================================
-    # if not use_assembly:
-    #     m_ode = ODEModel(r0, C0,
-    #                      tmax=args.tmax, record_step=args.record,
-    #                      dispersal_type='propagule', seed=7)
-    #     t_ode, B_ode = m_ode.run()
-    #     meta['ODE'] = dict(S=3,
-    #                        period=dominant_period(t_ode, B_ode.mean((2,3))[:,0]))
-    #     data.update({'ODE_t': t_ode, 'ODE_B': B_ode})
+    # =====================================================================
+    #  ODE (benchmark only)
+    # =====================================================================
+    # ======================================================================
+    #  ODE  (always 3‑species benchmark, so only if not use_assembly *and*
+    #        the user did not ask for --skip-ode)
+    # ======================================================================
+    # if (not use_assembly) and (not args.skip_ode):
+    if (not args.skip_ode) and (not use_assembly or args.ode_only):
+        m_ode = ODEModel(r0, C0,
+                        tmax=args.tmax,
+                        record_step=args.record,
+                        seed=7,                           # reproducible
+                        dispersal_type='propagule',
+                        initial_B=B_seed
+                        )
+        t_ode, B_ode = m_ode.run()                        # (T,S,Ny,Nx)
+
+        # ---------- invasion statistics ----------------------------------
+        meta['ODE'] = dict(
+            S=3,
+            period=dominant_period(t_ode, B_ode.mean((2, 3))[:, 0])
+        )
+        tot_inv_ode, inv_sp_px_ode, rich_px_ode = count_invasions(B_ode)
+        meta['ODE']['total_invasions'] = tot_inv_ode
+        data['ODE_inv_per_sp_patch']   = inv_sp_px_ode
+        data['ODE_richness_per_patch'] = rich_px_ode
+        print(f"[ODE]  total invasions: {tot_inv_ode}")
+
+        # ---------- mosaic ------------------------------------------------
+        snap_idx_ode = [np.abs(t_ode - tt).argmin() for tt in snap_times]
+        frames_ode   = [B_ode[i] for i in snap_idx_ode]
+
+        make_mosaic(frames_ode, snap_times,
+                    colour_table[:3],                     # three species
+                    save_to=d_plot / f"{tag}_ODE_panels.png",
+                    ncols=4, dpi=300)
+
+        # ---------- store raw arrays --------------------------------------
+        data.update({f'ODE_{k}': v for k, v in dict(t=t_ode, B=B_ode).items()})
+
 
     # # =====================================================================
     #  SAVE
