@@ -1,6 +1,6 @@
 
 
-
+# only for RPS 
 ############################################
 # models_psd2.py
 ############################################
@@ -784,96 +784,96 @@ class PSD2Model:
         
 
 
-# ############################################
-# # Testing Mean and Variance in PSD2Model
-# ############################################
-# if __name__ == "__main__":
-#     import matplotlib.pyplot as plt
-#     import numpy as np
+############################################
+# Testing Mean and Variance in PSD2Model
+############################################
+if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+    import numpy as np
 
-#     def test_psd2_model():
-#         """
-#         Runs the PSD2Model simulation, computes the mean and variance of biomass
-#         for each species over time, and compares these with the theoretical expectations.
-#         """
-#         # Set random seed for reproducibility.
-#         np.random.seed(42)
+    def test_psd2_model():
+        """
+        Runs the PSD2Model simulation, computes the mean and variance of biomass
+        for each species over time, and compares these with the theoretical expectations.
+        """
+        # Set random seed for reproducibility.
+        np.random.seed(42)
         
-#         # # Test parameters
-#         # S = 3  # number of species
-#         # nsteps = 25000  # extended simulation time
+        # # Test parameters
+        # S = 3  # number of species
+        # nsteps = 25000  # extended simulation time
         
-#         # # Define growth rates and competition matrix
-#         # r = np.array([0.8, 0.6, 0.7])
-#         # C = np.array([
-#         #     [0.2, 0.1, 0.1],
-#         #     [0.1, 0.2, 0.1],
-#         #     [0.1, 0.1, 0.2]
-#         # ])
+        # # Define growth rates and competition matrix
+        # r = np.array([0.8, 0.6, 0.7])
+        # C = np.array([
+        #     [0.2, 0.1, 0.1],
+        #     [0.1, 0.2, 0.1],
+        #     [0.1, 0.1, 0.2]
+        # ])
         
-#         # Test parameters
-#         S = 3  # number of species
-#         nsteps = 250 # shorter simulation time for testing
-#         r = np.array([1.0, 1.0, 1.0])
-#         C = np.array([
-#             [1.0, 1.7, 0.4],
-#             [0.4, 1.0, 1.7],
-#             [1.7, 0.4, 1.0]
-#         ])
+        # Test parameters
+        S = 3  # number of species
+        nsteps = 250 # shorter simulation time for testing
+        r = np.array([1.0, 1.0, 1.0])
+        C = np.array([
+            [1.0, 1.7, 0.4],
+            [0.4, 1.0, 1.7],
+            [1.7, 0.4, 1.0]
+        ])
 
-#         # Compute analytical equilibrium (for reference)
-#         print("\nAnalytical Equilibrium Analysis:")
-#         try:
-#             C_inv = np.linalg.inv(C)
-#             B_eq = C_inv @ r
-#             print(f"Analytical equilibrium biomass: {B_eq}")
-#             growth_rates_eq = r - C @ B_eq
-#             print(f"Growth rates at equilibrium: {growth_rates_eq}")
-#             print(f"Max absolute growth rate at equilibrium: {np.max(np.abs(growth_rates_eq))}")
-#             print(f"All components positive: {np.all(B_eq > 0)}")
-#         except np.linalg.LinAlgError:
-#             print("Warning: Competition matrix is not invertible")
-#             B_eq = None
+        # Compute analytical equilibrium (for reference)
+        print("\nAnalytical Equilibrium Analysis:")
+        try:
+            C_inv = np.linalg.inv(C)
+            B_eq = C_inv @ r
+            print(f"Analytical equilibrium biomass: {B_eq}")
+            growth_rates_eq = r - C @ B_eq
+            print(f"Growth rates at equilibrium: {growth_rates_eq}")
+            print(f"Max absolute growth rate at equilibrium: {np.max(np.abs(growth_rates_eq))}")
+            print(f"All components positive: {np.all(B_eq > 0)}")
+        except np.linalg.LinAlgError:
+            print("Warning: Competition matrix is not invertible")
+            B_eq = None
         
-#         print("\nTesting PSD2Model with dispersal injection:")
-#         model = PSD2Model(r=r, C=C, tmax=nsteps, record_step=10, seed=42, dispersal_type='propagule')
+        print("\nTesting PSD2Model with dispersal injection:")
+        model = PSD2Model(r=r, C=C, tmax=nsteps, record_step=10, seed=42, dispersal_type='propagule')
 
-#         # Randomise initial state a bit:
-#         model.logB = model.logB + 0.5*(np.random.random_sample(model.logB.shape) - 0.5)
+        # Randomise initial state a bit:
+        model.logB = model.logB + 0.5*(np.random.random_sample(model.logB.shape) - 0.5)
         
-#         t_points, traj, wait_traj, pclock_traj, growth_traj, inv_rate_traj, estab_prob_traj = model.run()
+        t_points, traj, wait_traj, pclock_traj, growth_traj, inv_rate_traj, estab_prob_traj = model.run()
 
-#         # Calculate mean and variance over patches at every recorded time.
-#         # traj is an array of shape (n_records, S, NUM_PATCHES_Y, NUM_PATCHES_X)
-#         mean_time_series = np.mean(traj, axis=(2, 3))  # shape: (n_records, S)
-#         var_time_series  = np.var(traj, axis=(2, 3))    # shape: (n_records, S)
+        # Calculate mean and variance over patches at every recorded time.
+        # traj is an array of shape (n_records, S, NUM_PATCHES_Y, NUM_PATCHES_X)
+        mean_time_series = np.mean(traj, axis=(2, 3))  # shape: (n_records, S)
+        var_time_series  = np.var(traj, axis=(2, 3))    # shape: (n_records, S)
         
-#         # Example: Compute final (steady-state) mean and variance for each species
-#         final_biomass = traj[-1, :, :, :]  # biomass at final recorded time
-#         mean_final = np.mean(final_biomass, axis=(1, 2))  # mean per species
-#         var_final  = np.var(final_biomass, axis=(1, 2))   # variance per species
+        # Example: Compute final (steady-state) mean and variance for each species
+        final_biomass = traj[-1, :, :, :]  # biomass at final recorded time
+        mean_final = np.mean(final_biomass, axis=(1, 2))  # mean per species
+        var_final  = np.var(final_biomass, axis=(1, 2))   # variance per species
         
-#         print("\nFinal Mean biomass for each species:", mean_final)
-#         print("Final Variance for each species:", var_final)
+        print("\nFinal Mean biomass for each species:", mean_final)
+        print("Final Variance for each species:", var_final)
         
-#         # Plot the time series for the first species (Species 0)
-#         plt.figure()
-#         plt.plot(t_points, mean_time_series[:, 0], label='Mean biomass (Species 0)')
-#         # Plot ± one standard deviation around the mean
-#         std_dev_species0 = np.sqrt(var_time_series[:, 0])
-#         plt.fill_between(t_points,
-#                          mean_time_series[:, 0] - std_dev_species0,
-#                          mean_time_series[:, 0] + std_dev_species0,
-#                          color='blue', alpha=0.2, label='Std. Dev.')
-#         plt.xlabel("Time")
-#         plt.ylabel("Biomass")
-#         plt.title("Time series of Mean Biomass and Variance (Species 0)")
-#         plt.legend()
-#         plt.show()
+        # Plot the time series for the first species (Species 0)
+        plt.figure()
+        plt.plot(t_points, mean_time_series[:, 0], label='Mean biomass (Species 0)')
+        # Plot ± one standard deviation around the mean
+        std_dev_species0 = np.sqrt(var_time_series[:, 0])
+        plt.fill_between(t_points,
+                         mean_time_series[:, 0] - std_dev_species0,
+                         mean_time_series[:, 0] + std_dev_species0,
+                         color='blue', alpha=0.2, label='Std. Dev.')
+        plt.xlabel("Time")
+        plt.ylabel("Biomass")
+        plt.title("Time series of Mean Biomass and Variance (Species 0)")
+        plt.legend()
+        plt.show()
         
-#         if B_eq is not None:
-#             # Compare final simulation means with the analytical equilibrium (if available)
-#             rel_error = (mean_final - B_eq) / B_eq
-#             print(f"\nRelative error from analytical equilibrium: {rel_error}")
+        if B_eq is not None:
+            # Compare final simulation means with the analytical equilibrium (if available)
+            rel_error = (mean_final - B_eq) / B_eq
+            print(f"\nRelative error from analytical equilibrium: {rel_error}")
     
-#     test_psd2_model()
+    test_psd2_model()
