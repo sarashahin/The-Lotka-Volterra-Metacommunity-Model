@@ -34,7 +34,7 @@ initial_B[0].flat[chosen] += BODY_MASS
 
 # ——— 4. Simulation parameters ———
 tmax = 2000.0
-record_step = 10.0
+record_step = 10
 
 # ——— 5. Instantiate and run ODEModel ———
 model = ODEModel(
@@ -49,19 +49,20 @@ model = ODEModel(
 times, traj = model.run()
 # traj shape = (nrecords, S, Ny, Nx)
 
-# ——— 6. Compute mean biomass time series ———
+# ——— 6. Compute mean biomass time series ———new
 mean_ts = traj.mean(axis=(2, 3))  # (nrecords, S)
+
 
 # ——— 7. Plot ODE time series ———
 plt.figure(figsize=(8, 5))
 for s in range(S):
     plt.plot(times, mean_ts[:, s], label=f"Species {s}")
-plt.xlabel("Time (ODE units)")
+plt.xlabel("t")
 plt.ylabel("Mean biomass per patch")
-plt.title("ODE RPS - full dispersal(D = 5.000e-07) (100% non‐local)")
+plt.title("ODE RPS - full dispersal(D = 5e-7): 3‐species RPS\nInitial bias sets amplitude of slow oscillations")
 plt.legend()
 plt.tight_layout()
-plt.savefig("ode_rps_fixed_timeseries_full.png", dpi=300)
+plt.savefig("ode_rps_fixed_timeseries_full1.png", dpi=300)
 plt.show()
 
 # ——— 8. (Optional) mosaic of snapshots ———
@@ -70,21 +71,9 @@ snapshot_times = np.linspace(times[0], times[-1], 6)
 snapshot_idxs  = [np.abs(times - tt).argmin() for tt in snapshot_times]
 frames         = [traj[i] for i in snapshot_idxs]  # each is (S, Ny, Nx)
 
-colour_table = np.array([
-    [1.0, 0.0, 0.0],  # species 0: red
-    [0.0, 1.0, 0.0],  # species 1: green
-    [0.0, 0.0, 1.0],  # species 2: blue
-])
 
-make_mosaic(
-    frames,
-    snapshot_times,               # pass floats, not strings
-    colour_table,
-    save_to="ode_rps_fixed_mosaic_full.png",
-    ncols=3,
-    dpi=300
-)
+
 
 print("✔ ODE RPS (100% non‐local) complete. Outputs:")
-print("  • ode_rps_fixed_timeseries_full.png")
-print("  • ode_rps_fixed_mosaic_full.png")
+print("  • ode_rps_fixed_timeseries_full1.png")
+
