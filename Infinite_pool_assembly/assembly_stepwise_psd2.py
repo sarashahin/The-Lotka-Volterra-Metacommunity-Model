@@ -14,6 +14,7 @@ from typing import Tuple
 # from models_psd2 import PSD2Model
 from config import NUM_PATCHES_X, NUM_PATCHES_Y, BODY_MASS
 from assembly_utils import draw_interactions, expand_RC, prune_extinct
+from models_psd2 import PSD2Model # Ensure PSD2Model is imported
 
 log = logging.getLogger(__name__)
 Ny, Nx = NUM_PATCHES_Y, NUM_PATCHES_X
@@ -25,9 +26,9 @@ def stepwise_assembly_psd2(
         pressure_rate : float = 3e-3,
         window_time   : float = 5_000.,
         record_step   : float = 50.,
-        F_sat         : int   = 6, # saturation factor for γ
+        F_sat         : int | None  = 6, # <<< CHANGED: Allow None
         frac_multi    : float = 0.05,      # ← proportion of γ candidates/round
-        max_rounds    : int   = 50,
+        max_rounds    : int | None = 50,   # <<< CHANGED: Allow None
         seed          : int   = 0,
         **model_kw
 ) -> Tuple[np.ndarray, np.ndarray, dict]:
@@ -48,7 +49,10 @@ def stepwise_assembly_psd2(
 
     gamma_file = open("/tmp/gamma.txt","w")
     
-    for rnd in range(max_rounds):
+    # <<< CHANGED: Handle None for max_rounds
+    rounds_iter = range(max_rounds if max_rounds is not None else 10**12) 
+    
+    for rnd in rounds_iter:
         γ = len(r)
         n_cand = 1 + int(frac_multi * γ)
 
@@ -142,9 +146,12 @@ def stepwise_assembly_psd2(
             W, PC = W[keep_idx], PC[keep_idx]
 
         γ = len(r)
-        gamma_file.write(f"{rnd}, {attempts}, {γ}, {F_sat * γ}\n")
+        
+        # <<< CHANGED: Handle None for F_sat in log write
+        gamma_file.write(f"{rnd}, {attempts}, {γ}, {F_sat * γ if F_sat is not None else 'None'}\n")
         gamma_file.flush()
-        if attempts >= F_sat * γ:
+        
+        if (F_sat is not None) and (attempts >= F_sat * γ): # <<< CHANGED: Check for None
             log.info(f"[PSD2] stop: attempts={attempts} ≥ {F_sat}×γ")
             break
 

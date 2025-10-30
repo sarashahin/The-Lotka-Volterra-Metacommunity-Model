@@ -5,8 +5,10 @@
 run_all_rps.py  – benchmark RPS OR infinite-pool assembly pipeline
 ------------------------------------------------------------------
 Examples
-  3-sp benchmark           :  python run_all_rps.py
-  infinite pool (120)      :  python run_all_rps.py --pool 120 --tmax 20000
+  3-sp benchmark (IBM)     :  python run_all_rps.py --engine ibm
+  3-sp benchmark (PSD2)    :  python run_all_rps.py --engine psd2
+  infinite pool (IBM)      :  python run_all_rps.py --engine ibm --pool 120 --tmax 20000
+  infinite pool (PSD2)     :  python run_all_rps.py --engine psd2 --pool 120 --tmax 20000
 Quick CI smoke-test        :  python run_all_rps.py --dry-run
 Outputs → results/{data,plots,movies}/
 """
@@ -19,7 +21,7 @@ import itertools as _it
 # import numpy as np                    # ← already CuPy here      # pyplot sits on MPL core → safe
 import scipy   # ok to keep, but avoid scipy.* numerics on GPU path
 import gpu_patch
-# from  scipy.fft import rfft, rfftfreq
+# from  scipy.fft import rfft, rfftreq
 from gpu_patch import np, fft
 rfft = fft.rfft
 rfftfreq = fft.rfftfreq         # cupyx.scipy.fft or real SciPy
@@ -44,10 +46,10 @@ logging.basicConfig(level=logging.INFO,
 # ─── project modules ─────────────────────────────────────────────────────
 import dispersal
 from config import BODY_MASS, NUM_PATCHES_X, NUM_PATCHES_Y, STEP_SIZE
-# from models_psd2 import PSD2Model
+from models_psd2 import PSD2Model
 from models_ibm  import IBMModel
-# from models_ode  import ODEModel
-# from assembly_stepwise_psd2 import stepwise_assembly_psd2
+from models_ode  import ODEModel
+from assembly_stepwise_psd2 import stepwise_assembly_psd2
 from assembly_stepwise_ibm  import stepwise_assembly_ibm
 from run_rps_dynamics       import animate_spatial
 # visualisation helpers  <‑‑ add these two lines
@@ -329,6 +331,8 @@ def _atomic_save_npz(path: pathlib.Path, **arrays):
 
 def cli(argv=None):
     p = argparse.ArgumentParser(allow_abbrev=False)   # allow_abbrev=False to avoid issues with long options
+    p.add_argument('--engine', type=str, choices=['ibm', 'psd2', 'ode'], default='ibm',
+                   help='Simulation engine to use for assembly and dynamics.')
     p.add_argument('--tmax',    type=float, default=1200)
     p.add_argument('--record',  type=float, default=10.)
     p.add_argument('--fps',     type=int,   default=10)
@@ -347,6 +351,8 @@ def cli(argv=None):
             help='do not run the PSD reference model')
     p.add_argument('--skip', nargs='+', choices=['psd', 'ibm', 'ode'],
                    metavar='MODEL', help='space-separated list of models to skip')
+    
+    # --- IBM specific ---
     p.add_argument('--ibm-frac-multi',  type=float, default=0.05,
                    help='candidate fraction (Jack: 0.05)')
     p.add_argument('--ibm-window-steps', type=int, default=500,
@@ -361,6 +367,10 @@ def cli(argv=None):
                    help='gamma cap; usually leave at None')
     p.add_argument('--ibm-record-mode', choices=['full','mean','none'],
                default='mean', help='grid, per-species mean, or nothing')
+    
+    # --- PSD2 specific ---
+    p.add_argument('--psd2-pressure-rate', type=float, default=3e-3,
+                   help='Propagule pressure rate for psd2 assembly.')
     
     # -------- NEW: AI export knobs ------------------------------------
     p.add_argument('--C-topk', type=int, default=16,                 # ← NEW
@@ -379,16 +389,16 @@ def cli(argv=None):
     # ---------------------------------------------------------------------
     
     # ---------- NEW: wire detection threshold + checkpointing/resume -----
-    p.add_argument('--ibm-detection-threshold', type=str, default='None',   # ← NEW
+    p.add_argument('--ibm-detection-threshold', type=str, default='None',   # ← NEW (used as generic threshold)
                    help="override detection threshold for establish/prune (e.g. 3)")
     p.add_argument('--save-every-rounds', type=int, default=50,             # ← NEW
-                   help='checkpoint every K assembly rounds')
+                   help='checkpoint every K assembly rounds (ibm only)')
     p.add_argument('--save-every-seconds', type=float, default=180.0,       # ← NEW
-                   help='checkpoint at least every T seconds')
+                   help='checkpoint at least every T seconds (ibm only)')
     p.add_argument('--checkpoint-with-N', action='store_true',              # ← NEW
-                   help='include N in checkpoints (bigger files)')
+                   help='include N in checkpoints (ibm only, bigger files)')
     p.add_argument('--resume', type=str, default=None,                      # ← NEW
-                   help='path to assembly checkpoint .npz to resume from')
+                   help='path to assembly checkpoint .npz to resume from (ibm only)')
     
     # ---------- NEW: spatially heterogeneous r-field --------------
     
@@ -402,7 +412,7 @@ def cli(argv=None):
                 help='Include ENV_r_field in outputs')
     
     p.add_argument('--fp16-time-series', action='store_true',            # ← NEW
-               help='store IBM_B as float16 in the training .npz')
+               help='store B_dynamics as float16 in the training .npz')
     p.add_argument('--obs-budgets', type=str, default='5,10,25',         # ← NEW
                 help='comma-separated budgets for sparse observation masks')
 
@@ -421,8 +431,12 @@ def main(argv=None):
     args.ibm_max_rounds  = cast(args.ibm_max_rounds,  int)
     args.ibm_max_attempts= cast(args.ibm_max_attempts,int)
     args.ibm_richness_cap= cast(args.ibm_richness_cap,int)
-    args.ibm_det_thr       = cast(args.ibm_detection_threshold, float)   # ← NEW
-    args.no_movie = True  # default to no movie, unless --no-movie is set
+    args.ibm_det_thr       = cast(args.ibm_detection_threshold, float)   # ← NEW (used as generic threshold)
+    
+    # This was inverted, fixed:
+    if args.no_movie:
+        logging.info("Movies disabled via --no-movie.")
+    # args.no_movie = True  # default to no movie, unless --no-movie is set
 
     # Map the unified  --skip  list onto the individual booleans     # ← NEW
     if getattr(args, 'skip', None):
@@ -464,7 +478,7 @@ def main(argv=None):
     # COMMON RANDOM STARTING MOSAIC  (same biomass everywhere)
     rng      = np.random.default_rng(123)
     B_seed   =  (rng.random((3, NUM_PATCHES_Y, NUM_PATCHES_X)) < 0.5).astype(float) * BODY_MASS
-    N_ibm   = (B_seed / BODY_MASS).astype(int)         # integer counts for IBM
+    N_ibm_seed = (B_seed / BODY_MASS).astype(int)         # integer counts for IBM
     # ---------------------------------------------------------------
 
     # ------- scenario selection ------------------------------------------
@@ -496,103 +510,76 @@ def main(argv=None):
 
     data, meta = {}, {}
 
-    # # =====================================================================
-    # #  PSD2
-    # # =====================================================================
-    # if not args.skip_psd:
-    #     from models_psd2             import PSD2Model
-    #     from assembly_stepwise_psd2  import stepwise_assembly_psd2
-    #     if use_assembly:
-    #         r_psd, C_psd, extra_psd = stepwise_assembly_psd2(
-    #             window_time=args.assemble_horizon,
-    #             record_step=args.record,
-    #             max_rounds=30000,
-    #             F_sat=6)
-    #         # data['PSD2_occ'] = extra_psd['occ_counts']          # NEW
-    #         B_seed  = extra_psd['B_seed']
-    #         data['PSD2_occ'] = extra_psd['occ_counts']
-    #         dispersal.set_invasion_pressure(None)            # safety
-    #     else:
-    #         r_psd, C_psd = r0, C0
-    #         # B_seed      = None           # start from default biomass
-    #         extra_psd = {}  # Empty dict to avoid errors when referenced
-
-    #     m_psd = PSD2Model(r_psd, C_psd, initial_B=B_seed,
-    #                     tmax=args.tmax, record_step=args.record,
-    #                     dispersal_type='propagule', seed=42)
-    #     t_psd, B_psd, w_psd, pc_psd, g_psd, inv_psd, est_psd = m_psd.run()
-
-    #     # -------- snapshots for the 4×2 patchy mosaic --------------------------
-    #     snap_idx   = [np.abs(t_psd - tt).argmin() for tt in snap_times]  # ← CHANGED
-    #     frames_psd = [B_psd[i] for i in snap_idx]    # each is (S,Ny,Nx)
-
-    #     if len(r_psd) > colour_table.shape[0]:
-    #         colour_table = random_colour_table(len(r_psd))
-
-    #     make_mosaic(frames_psd, snap_times,
-    #                 colour_table[:len(r_psd)],        # truncate to richness
-    #                 save_to=d_plot / f"{tag}_PSD2_panels.png", ncols=4, dpi=300)
-
-
-    #     meta['PSD2'] = dict(S=len(r_psd),
-    #                         period=dominant_period(t_psd, B_psd.mean((2,3))[:,0]))
-    #     data.update({f'PSD2_{k}': v for k,v in dict(
-    #         t=t_psd, B=B_psd, wait=w_psd, pclock=pc_psd,
-    #         growth=g_psd, invasion=inv_psd, est_prob=est_psd).items()})
-
-    #     if not args.no_movie:
-    #         animate_spatial(B_psd, f'PSD2 {tag}', str(d_mov/f'PSD2_{tag}.mp4'), args.fps)
 
     # =====================================================================
-    #  IBM
+    #  Refactored Engine-Specific Logic
     # =====================================================================
-    if not args.skip_ibm:
-        # ---------- NEW: checkpointing/resume --------------------------------
+
+    # --- Define generic vars
+    r_final = None
+    C_final = None
+    B_final_assembly = None # This will be N for IBM, B for PSD2
+    dynamics_model = None
+    t_dynamics = None
+    B_dynamics = None
+    runtime_s = 0.0
+    extra_assembly_outputs = {}
+    model_specific_outputs = {} # For psd2's extra return values
+    
+    # --- Build world tag (must be done before engine block)
+    world_tag = build_world_tag(
+        base=f"{tag}_{args.engine}" + (f"_{args.world_tag_extra}" if args.world_tag_extra else ""),
+        ls=args.env_length_scale, vr=args.env_var_r, thr=args.ibm_det_thr, # Use ibm_det_thr as the generic 'thr'
+        env_seed=args.env_seed_field, grid_y=NUM_PATCHES_Y, grid_x=NUM_PATCHES_X,
+        disp=float(dispersal.DISPERSAL_RATE), ldd=float(dispersal.LONG_DISTANCE_PROB)
+    )
+    ckpt_path = d_ckpt / f"{world_tag}_assembly_latest.npz"
+
+
+    if args.engine == 'ibm':
+        if args.skip_ibm:
+            logging.info("Skipping IBM engine as requested.")
+            sys.exit(0)
+            
+        # --- IBM Checkpointing & Resume ---
         init_r = init_C = init_N = None
         init_attempts = 0
-        init_round    = -1
-
-        # ---- make a unique world tag so sweeps don't overwrite -------------
-        world_tag = build_world_tag(
-            base=tag + (f"_{args.world_tag_extra}" if args.world_tag_extra else ""),
-            ls=args.env_length_scale, vr=args.env_var_r, thr=args.ibm_det_thr,
-            env_seed=args.env_seed_field, grid_y=NUM_PATCHES_Y, grid_x=NUM_PATCHES_X,
-            disp=float(dispersal.DISPERSAL_RATE), ldd=float(dispersal.LONG_DISTANCE_PROB)
-        )                                                                  # ← NEW
-
-        # ---------- NEW: resume from checkpoint ---------------------------
-        if args.resume:                                             # ← NEW
-            ck = np.load(args.resume)
-            init_r = ck['r']; init_C = ck['C']
-            init_N = ck['N'] if 'N' in ck.files else None
-            init_attempts = int(ck['attempts']) if 'attempts' in ck.files else 0
-            init_round    = int(ck['round']) if 'round' in ck.files else -1
-            logging.info(f"[resume] loaded {args.resume} with γ={len(init_r)}, round={init_round}, attempts={init_attempts}")
-
-        # ---------- NEW: checkpoint callback ------------------------------
-        last_save_t = time.time()                                   # ← NEW
-        ckpt_path   = d_ckpt / f"{world_tag}_assembly_latest.npz"         # ← NEW
-
-        def on_round(state):                                        # ← NEW
+        init_round = -1
+        if args.resume:
+            try:
+                ck = np.load(args.resume)
+                init_r = ck['r']; init_C = ck['C']
+                init_N = ck['N'] if 'N' in ck.files else None
+                init_attempts = int(ck['attempts']) if 'attempts' in ck.files else 0
+                init_round    = int(ck['round']) if 'round' in ck.files else -1
+                logging.info(f"[resume] loaded {args.resume} with γ={len(init_r)}, round={init_round}, attempts={init_attempts}")
+            except Exception as e:
+                logging.error(f"Failed to load resume checkpoint {args.resume}: {e}")
+                sys.exit(1)
+        
+        # --- IBM Checkpoint Callback ---
+        last_save_t = time.time()
+        def on_round(state):
             nonlocal last_save_t
             do_round = (state['round'] % max(1, args.save_every_rounds) == 0)
             do_time  = (time.time() - last_save_t) >= max(1.0, args.save_every_seconds)
-            if do_round or do_time:
+            if (do_round or do_time) and state['round'] > init_round: # Dont save on first round if resuming
                 payload = dict(
                     r=state['r'], C=state['C'],
                     occ_counts=state['occ'],
                     attempts=state['attempts'], round=state['round'],
-                    gamma=np.int64(state['gamma']),
-                    detection_threshold=np.float64(state['thr'])
+                    gamma=_np.int64(state['gamma']),
+                    detection_threshold=_np.float64(state['thr'])
                 )
                 if args.checkpoint_with_N:
                     payload['N'] = state['N']
                 _atomic_save_npz(ckpt_path, **payload)
                 last_save_t = time.time()
                 logging.info(f"[checkpoint] γ={state['gamma']} round={state['round']} attempts={state['attempts']} → {ckpt_path.name}")
-        # ------------------------------------------------------------------
+        
         if use_assembly:
-            r_ibm, C_ibm, N_ibm, extra_ibm = stepwise_assembly_ibm(
+            logging.info("Running assembly with IBM engine...")
+            r_final, C_final, N_final_assembly, extra_assembly_outputs = stepwise_assembly_ibm(
                 window_steps=args.ibm_window_steps,
                 record_step=int(args.record/STEP_SIZE),
                 seed_size=5,
@@ -602,331 +589,446 @@ def main(argv=None):
                 richness_cap=args.ibm_richness_cap,       
                 frac_multi=args.ibm_frac_multi, 
                 seed=1,
-                detection_threshold=args.ibm_det_thr,     # ← NEW
-                checkpoint_fn=on_round,                   # ← NEW
+                detection_threshold=args.ibm_det_thr,
+                checkpoint_fn=on_round,
                 init_r=init_r, init_C=init_C, init_N=init_N,
                 init_attempts=init_attempts, init_round=init_round,
                 length_scale=args.env_length_scale,
                 var_r=args.env_var_r,
-                seed_field=args.env_seed_field)
+                seed_field=args.env_seed_field
+            )
+            B_final_assembly = N_final_assembly # Store N here
         else:
-            r_ibm, C_ibm = r0, C0
-            # N_ibm        = None                                 # nothing to save
-            extra_ibm     = {}          # nothing to add later
+            logging.info("Running 3-species RPS with IBM engine...")
+            r_final, C_final = r0, C0
+            B_final_assembly = N_ibm_seed # This is the (3,Y,X) seed
+            extra_assembly_outputs = {}
 
-        #-----------------------------------------------------------------
-        m_ibm = IBMModel(r_ibm, C_ibm, initial_N=N_ibm,
-                        nsteps=int(args.tmax/STEP_SIZE),
-                        record_step=int(args.record/STEP_SIZE),
-                        record_mode=args.ibm_record_mode, # ← CHANGED: use 'mean' mode
-                        dispersal_type='propagule', seed=1,
-                        length_scale=args.env_length_scale,
-                        var_r=args.env_var_r,
-                        seed_field=args.env_seed_field,)
+        # --- IBM Dynamics Run ---
+        logging.info("Running dynamics with IBM engine...")
+        dynamics_model = IBMModel(r_final, C_final, initial_N=B_final_assembly,
+                            nsteps=int(args.tmax/STEP_SIZE),
+                            record_step=int(args.record/STEP_SIZE),
+                            record_mode=args.ibm_record_mode,
+                            dispersal_type='propagule', seed=1,
+                            length_scale=args.env_length_scale,
+                            var_r=args.env_var_r,
+                            seed_field=args.env_seed_field)
         
         t_run0 = time.time()
-        B_ibm = m_ibm.run()
-        ibm_runtime_s = time.time() - t_run0
-
-
-        B_ibm = _to_host(B_ibm)  # NEW: ensure CPU array for analysis/plots/saving
-        # t_ibm = _np.arange(args.record, args.tmax + args.record, args.record)  # host timeline
-        # t_ibm = np.arange(args.record, args.tmax + args.record, args.record)
-        # Ensure assembly outputs are on host before downstream utilities
-        r_ibm = _to_host(r_ibm)
-        C_ibm = _to_host(C_ibm)
-        N_ibm = _to_host(N_ibm)
-        # NEW: interaction magnitude summaries (on host)
-        C_host = _to_host(C_ibm)
-        Aabs = _np.abs(C_host)
-        _np.fill_diagonal(Aabs, 0.0)
-        alpha_mu  = Aabs.mean(axis=1).astype(_np.float32)
-        alpha_med = _np.median(Aabs, axis=1).astype(_np.float32)
-        alpha_p95 = _np.quantile(Aabs, 0.95, axis=1).astype(_np.float32)
-
-
-        # capture environment from model (host array)
-        ENV_r_field = _to_host(getattr(m_ibm, "r_field", None))
-
-        # correct timeline length to what was actually recorded
-        T_rec = getattr(m_ibm, "nrecords", None)
+        B_dynamics = dynamics_model.run() # This is (T,S,Y,X) or (T,S)
+        runtime_s = time.time() - t_run0
+        
+        B_dynamics = _to_host(B_dynamics)
+        T_rec = getattr(dynamics_model, "nrecords", None)
         if T_rec is None:
-            # fallback if not present
-            T_rec = B_ibm.shape[0] if B_ibm is not None else int(args.tmax // args.record)
-        IBM_t = _np.arange(1, T_rec + 1, dtype=_np.int64) * _np.int64(args.record)
+            T_rec = B_dynamics.shape[0] if B_dynamics is not None else int(args.tmax // args.record)
+        t_dynamics = _np.arange(1, T_rec + 1, dtype=_np.int64) * _np.int64(args.record)
+        
+        # Store N_final_assembly in the dict to save it
+        model_specific_outputs['N_final_assembly'] = B_final_assembly
 
-        # --- species features from r-field --------------------------------add species r-stats
-        r_mean = r_std = None
-        if ENV_r_field is not None and ENV_r_field.ndim == 3:
-            r_mean = ENV_r_field.mean(axis=(1,2)).astype(_np.float32)  # (S,)
-            r_std  =  ENV_r_field.std (axis=(1,2)).astype(_np.float32)  # (S,)
 
-        # ---------------------------------------------------------------------
-        # --- NEW: compute extinction times BEFORE adding to train_out ------------
-        IBM_ext_step = None
-        if (B_ibm is not None) and hasattr(B_ibm, "ndim") and (getattr(B_ibm, "ndim", 0) == 4):
-            thr_for_ext = args.ibm_det_thr if (args.ibm_det_thr is not None) \
-              else float(extra_ibm.get('detection_threshold', 1.0))
-            IBM_ext_step = _extinction_times_thresholded(
-                B_ibm, IBM_t, thr_mass=thr_for_ext * BODY_MASS
+    elif args.engine == 'psd2':
+        if args.skip_psd:
+            logging.info("Skipping PSD2 engine as requested.")
+            sys.exit(0)
+        
+        if args.resume:
+            logging.warning(f"Resume is not supported for 'psd2' engine. Starting fresh.")
+        
+        if use_assembly:
+            logging.info("Running assembly with PSD2 engine...")
+            # Note: assembly_stepwise_psd2 does not support heterogeneous r_field
+            if args.env_length_scale is not None:
+                logging.warning("PSD2 assembly does not support heterogeneous environments. Using base_r=1.0.")
+            
+            r_final, C_final, extra_assembly_outputs = stepwise_assembly_psd2(
+                base_r=1.0, 
+                pressure_rate=args.psd2_pressure_rate,
+                window_time=args.assemble_horizon,
+                record_step=args.record,
+                F_sat=args.ibm_F_sat, # Reuse
+                frac_multi=args.ibm_frac_multi, # Reuse
+                max_rounds=args.ibm_max_rounds, # Reuse
+                seed=1
+            )
+            B_final_assembly = extra_assembly_outputs.get('B_seed') # This is (S,Y,X) biomass
+        else:
+            logging.info("Running 3-species RPS with PSD2 engine...")
+            r_final, C_final = r0, C0
+            B_final_assembly = B_seed # This is the (3,Y,X) seed
+            extra_assembly_outputs = {}
+        
+        # --- PSD2 Dynamics Run ---
+        logging.info("Running dynamics with PSD2 engine...")
+        dynamics_model = PSD2Model(r_final, C_final, initial_B=B_final_assembly,
+                                tmax=args.tmax, record_step=args.record,
+                                dispersal_type='propagule', seed=1,
+                                length_scale=args.env_length_scale,
+                                var_r=args.env_var_r,
+                                seed_field=args.env_seed_field)
+        
+        t_run0 = time.time()
+        t_psd2, B_psd2, w_psd2, pc_psd2, g_psd2, inv_psd2, est_psd2 = dynamics_model.run()
+        runtime_s = time.time() - t_run0
+        
+        t_dynamics = _to_host(t_psd2)
+        B_dynamics = _to_host(B_psd2) # (T,S,Y,X)
+        
+        model_specific_outputs = {
+            'PSD2_wait': _to_host(w_psd2),
+            'PSD2_pclock': _to_host(pc_psd2),
+            'PSD2_growth': _to_host(g_psd2),
+            'PSD2_invasion': _to_host(inv_psd2),
+            'PSD2_est_prob': _to_host(est_psd2),
+            'B_final_assembly': _to_host(B_final_assembly)
+        }
+
+    elif args.engine == 'ode':
+        if args.skip_ode:
+            logging.info("Skipping ODE engine as requested.")
+            sys.exit(0)
+            
+        if use_assembly:
+            logging.error("Assembly with 'ode' engine is not supported. Halting.")
+            sys.exit(1)
+        else:
+            logging.info("Running 3-species RPS with ODE engine...")
+            r_final, C_final = r0, C0
+            # B_final_assembly is None, ODEModel initializes itself from config
+            B_final_assembly = None 
+            extra_assembly_outputs = {}
+
+        # --- ODE Dynamics Run ---
+        logging.info("Running dynamics with ODE engine...")
+        dynamics_model = ODEModel(r_final, C_final,
+                                tmax=args.tmax, record_step=args.record,
+                                dispersal_type='propagule', seed=1,
+                                length_scale=args.env_length_scale,
+                                var_r=args.env_var_r,
+                                seed_field=args.env_seed_field)
+
+        t_run0 = time.time()
+        t_ode, B_ode = dynamics_model.run()
+        runtime_s = time.time() - t_run0
+        
+        t_dynamics = _to_host(t_ode)
+        B_dynamics = _to_host(B_ode)
+        
+        # ODE model has no extra outputs
+        model_specific_outputs = {}
+
+    else:
+        logging.error(f"Unknown engine: {args.engine}")
+        sys.exit(1)
+
+
+    # =====================================================================
+    #  GENERIC POST-PROCESSING & SAVING
+    # =====================================================================
+    logging.info("Post-processing and saving results...")
+
+    # Ensure assembly outputs are on host
+    r_final = _to_host(r_final)
+    C_final = _to_host(C_final)
+    if B_final_assembly is not None:
+         B_final_assembly = _to_host(B_final_assembly)
+
+    # NEW: interaction magnitude summaries (on host)
+    C_host = _to_host(C_final)
+    Aabs = _np.abs(C_host)
+    _np.fill_diagonal(Aabs, 0.0)
+    alpha_mu  = Aabs.mean(axis=1).astype(_np.float32)
+    alpha_med = _np.median(Aabs, axis=1).astype(_np.float32)
+    alpha_p95 = _np.quantile(Aabs, 0.95, axis=1).astype(_np.float32)
+
+
+    # capture environment from model (host array)
+    ENV_r_field = _to_host(getattr(dynamics_model, "r_field", None))
+
+    # --- species features from r-field --------------------------------add species r-stats
+    r_mean = r_std = None
+    if ENV_r_field is not None and ENV_r_field.ndim == 3:
+        r_mean = ENV_r_field.mean(axis=(1,2)).astype(_np.float32)  # (S,)
+        r_std  =  ENV_r_field.std (axis=(1,2)).astype(_np.float32)  # (S,)
+
+    # ---------------------------------------------------------------------
+    # --- NEW: compute extinction times BEFORE adding to train_out ------------
+    extinction_step_times = None
+    if (B_dynamics is not None) and (B_dynamics.ndim == 4):
+        thr_for_ext = args.ibm_det_thr if (args.ibm_det_thr is not None) \
+            else float(extra_assembly_outputs.get('detection_threshold', 1.0))
+        extinction_step_times = _extinction_times_thresholded(
+            B_dynamics, t_dynamics, thr_mass=thr_for_ext * BODY_MASS
     )
 
 
 
-        # ---------- TRAINING DATA EXPORT (NEW) -----------------------------------
-        # last snapshots
-        B_last = None; P_last = None; B_k = None; t_k = None
-        if (B_ibm is not None) and (B_ibm.ndim == 4):
-            B_last_raw = B_ibm[-1] # (S,Y,X)
-            B_k, t_k = take_last_snapshots(B_ibm, IBM_t, k=4)  # (K,S,Y,X), (K,)
-            if B_k is not None:
-                B_k = B_k.astype(_np.float16)
-        elif N_ibm is not None:
-            B_last = (N_ibm * BODY_MASS).astype(_np.float16)  # (S,Y,X)
+    # ---------- TRAINING DATA EXPORT (NEW) -----------------------------------
+    B_last = None; P_last_final = None; B_k = None; t_k = None
+    
+    # Use generic threshold from --ibm-detection-threshold arg
+    thr = args.ibm_det_thr if (args.ibm_det_thr is not None) \
+        else float(extra_assembly_outputs.get('detection_threshold', 1.0))
 
-
-        # presence/absence with threshold
-        # presence/absence at detection threshold
-        # NEW
-        thr = args.ibm_det_thr if (args.ibm_det_thr is not None) \
-            else float(extra_ibm.get('detection_threshold', 1.0))
-        # if N_ibm is not None:
-        #     P_last = (N_ibm >= int(thr)).astype(_np.uint8)        # (S,Y,X)
-        # elif B_last is not None:
-        #     P_last = (B_last >= (thr * BODY_MASS)).astype(_np.uint8)
-
-        P_last_final = None
-        if 'B_last_raw' in locals() and B_last_raw is not None:
-            P_last_final = (B_last_raw >= (thr * BODY_MASS)).astype(_np.uint8)
-            B_last = B_last_raw.astype(_np.float16)
+    if (B_dynamics is not None) and (B_dynamics.ndim == 4):
+        B_last_raw = B_dynamics[-1] # (S,Y,X)
+        B_k, t_k = take_last_snapshots(B_dynamics, t_dynamics, k=4)
+        if B_k is not None:
+            B_k = B_k.astype(_np.float16)
+        
+        P_last_final = (B_last_raw >= (thr * BODY_MASS)).astype(_np.uint8)
+        B_last = B_last_raw.astype(_np.float16)
+        
+    elif B_final_assembly is not None:
+        if args.engine == 'ibm': # B_final_assembly is N
+            B_last = (B_final_assembly * BODY_MASS).astype(_np.float16)
+            P_last_final = (B_final_assembly >= int(thr)).astype(_np.uint8)
+        else: # For psd2, B_final_assembly is B
+            B_last = B_final_assembly.astype(_np.float16)
+            P_last_final = (B_last >= (thr * BODY_MASS)).astype(_np.uint8)
             
 
-        P_init_assembly = None
-        if N_ibm is not None:
-            P_init_assembly = (N_ibm >= int(thr)).astype(_np.uint8)
+    P_init_assembly = None
+    if B_final_assembly is not None:
+        if args.engine == 'ibm': # B_final_assembly is N
+            P_init_assembly = (B_final_assembly >= int(thr)).astype(_np.uint8)
+        else: # psd2, B_final_assembly is B
+            P_init_assembly = (B_final_assembly >= (thr * BODY_MASS)).astype(_np.uint8)
 
-        P_t = None
-        if (B_ibm is not None) and (getattr(B_ibm, "ndim", 0) == 4):
-            P_t = (B_ibm >= (thr * BODY_MASS)).astype(_np.uint8)
+    P_t = None
+    if (B_dynamics is not None) and (B_dynamics.ndim == 4):
+        P_t = (B_dynamics >= (thr * BODY_MASS)).astype(_np.uint8)
 
-        # ---------- temporal summaries (guarded) ----------
-        RSD_t = gamma_t = T_first_occ = persist_steps = None
-        if P_t is not None:
-            # (T,S) fraction of patches occupied
-            RSD_t = P_t.reshape(P_t.shape[0], P_t.shape[1], -1).mean(axis=2).astype(_np.float32)
+    # ---------- temporal summaries (guarded) ----------
+    RSD_t = gamma_t = T_first_occ = persist_steps = None
+    if P_t is not None:
+        # (T,S) fraction of patches occupied
+        RSD_t = P_t.reshape(P_t.shape[0], P_t.shape[1], -1).mean(axis=2).astype(_np.float32)
 
-            # (T,) regional richness (any patch occupied)
-            gamma_t = P_t.reshape(P_t.shape[0], P_t.shape[1], -1).any(axis=2).sum(axis=1).astype(_np.int32)
+        # (T,) regional richness (any patch occupied)
+        gamma_t = P_t.reshape(P_t.shape[0], P_t.shape[1], -1).any(axis=2).sum(axis=1).astype(_np.int32)
 
-            # per-patch colonization time & persistence length
-            T_idx = IBM_t  # (T,)
-            S, Y, X = P_t.shape[1:]
-            T_first_occ  = _np.full((S, Y, X), -1, dtype=_np.int32)
-            persist_steps= _np.zeros((S, Y, X), dtype=_np.int32)
-            pt = P_t.transpose(1,2,3,0)  # (S,Y,X,T)
-            for s in range(S):
-                for y in range(Y):
-                    for x in range(X):
-                        series = pt[s,y,x]
-                        if series.any():
-                            first = series.argmax()
-                            T_first_occ[s,y,x]  = int(T_idx[first])
-                            persist_steps[s,y,x]= int(series.sum())
+        # per-patch colonization time & persistence length
+        T_idx = t_dynamics  # (T,)
+        S, Y, X = P_t.shape[1:]
+        T_first_occ  = _np.full((S, Y, X), -1, dtype=_np.int32)
+        persist_steps= _np.zeros((S, Y, X), dtype=_np.int32)
+        pt = P_t.transpose(1,2,3,0)  # (S,Y,X,T)
+        for s in range(S):
+            for y in range(Y):
+                for x in range(X):
+                    series = pt[s,y,x]
+                    if series.any():
+                        first = series.argmax()
+                        T_first_occ[s,y,x]  = int(T_idx[first])
+                        persist_steps[s,y,x]= int(series.sum())
 
-        # -----------------------------------------------------------------------------------
-        # NEW: species-level turnover features
-        SP_events = species_event_times(P_t, IBM_t) if P_t is not None else None
+    # -----------------------------------------------------------------------------------
+    # NEW: species-level turnover features
+    SP_events = species_event_times(P_t, t_dynamics) if P_t is not None else None
 
-        # ---------- obs masks & range size from final labels ----------
-        obs_masks = sample_obs_masks(P_last_final, budgets=obs_budgets) if P_last_final is not None else None
+    # ---------- obs masks & range size from final labels ----------
+    obs_masks = sample_obs_masks(P_last_final, budgets=obs_budgets) if P_last_final is not None else None
 
-        RSD = rsd_from_presence(P_last_final) if P_last_final is not None else None
+    RSD = rsd_from_presence(P_last_final) if P_last_final is not None else None
 
-        # ---------- co-occurrence (sampled) ----------
-        # ---------- co-occurrence (sampled, stratified by prevalence) ----------
-        # *** NEW: any-time presence & prevalence ***
-        P_any = None; prev_final = None; prev_any = None; w_invprev_final = None; w_invprev_any = None
-        if P_t is not None:
-            # presence at any time across the run
-            P_any = P_t.any(axis=0).astype(_np.uint8)  # (S,Y,X)
-            prev_any = P_any.reshape(P_any.shape[0], -1).mean(axis=1).astype(_np.float32)  # (S,)
-        if P_last_final is not None:
-            prev_final = P_last_final.reshape(P_last_final.shape[0], -1).mean(axis=1).astype(_np.float32)
+    # ---------- co-occurrence (sampled) ----------
+    # ---------- co-occurrence (sampled, stratified by prevalence) ----------
+    # *** NEW: any-time presence & prevalence ***
+    P_any = None; prev_final = None; prev_any = None; w_invprev_final = None; w_invprev_any = None
+    if P_t is not None:
+        # presence at any time across the run
+        P_any = P_t.any(axis=0).astype(_np.uint8)  # (S,Y,X)
+        prev_any = P_any.reshape(P_any.shape[0], -1).mean(axis=1).astype(_np.float32)  # (S,)
+    if P_last_final is not None:
+        prev_final = P_last_final.reshape(P_last_final.shape[0], -1).mean(axis=1).astype(_np.float32)
 
-        # suggested inverse-prevalence weights (rare species ↑)
-        _eps = _np.float32(1e-6)
-        if prev_final is not None:
-            w_invprev_final = (1.0 / (prev_final + _eps)).astype(_np.float32)
-            w_invprev_final /= w_invprev_final.mean()  # normalize ~1
-        if prev_any is not None:
-            w_invprev_any = (1.0 / (prev_any + _eps)).astype(_np.float32)
-            w_invprev_any /= w_invprev_any.mean()
+    # suggested inverse-prevalence weights (rare species ↑)
+    _eps = _np.float32(1e-6)
+    if prev_final is not None:
+        w_invprev_final = (1.0 / (prev_final + _eps)).astype(_np.float32)
+        w_invprev_final /= w_invprev_final.mean()  # normalize ~1
+    if prev_any is not None:
+        w_invprev_any = (1.0 / (prev_any + _eps)).astype(_np.float32)
+        w_invprev_any /= w_invprev_any.mean()
 
-        # *** NEW: co-occurrence on any-time presence (stratified) ***
-        CO_J_any = None
-        if P_any is not None and int(args.coocc_sample) > 0:
-            rng = _np.random.default_rng(123)
-            S = P_any.shape[0]
-            pr_any = P_any.reshape(S, -1).astype(bool)
-            prev_a = pr_any.mean(axis=1)
-            bins = _np.clip((prev_a * 10).astype(int), 0, 9)
-            pairs_per_bin = max(1, args.coocc_sample // 12)
-            js_any = []
-            for a_bin in range(10):
-                for b_bin in range(a_bin, 10):
-                    cand_a = _np.flatnonzero(bins == a_bin)
-                    cand_b = _np.flatnonzero(bins == b_bin)
-                    if cand_a.size == 0 or cand_b.size == 0:
-                        continue
-                    # draw equal-length aligned samples
-                    L = min(pairs_per_bin, max(1, cand_a.size), max(1, cand_b.size))
-                    A = rng.choice(cand_a, size=L, replace=True)
-                    B = rng.choice(cand_b, size=L, replace=True)
+    # *** NEW: co-occurrence on any-time presence (stratified) ***
+    CO_J_any = None
+    if P_any is not None and int(args.coocc_sample) > 0:
+        rng = _np.random.default_rng(123)
+        S = P_any.shape[0]
+        pr_any = P_any.reshape(S, -1).astype(bool)
+        prev_a = pr_any.mean(axis=1)
+        bins = _np.clip((prev_a * 10).astype(int), 0, 9)
+        pairs_per_bin = max(1, args.coocc_sample // 12)
+        js_any = []
+        for a_bin in range(10):
+            for b_bin in range(a_bin, 10):
+                cand_a = _np.flatnonzero(bins == a_bin)
+                cand_b = _np.flatnonzero(bins == b_bin)
+                if cand_a.size == 0 or cand_b.size == 0:
+                    continue
+                # draw equal-length aligned samples
+                L = min(pairs_per_bin, max(1, cand_a.size), max(1, cand_b.size))
+                A = rng.choice(cand_a, size=L, replace=True)
+                B = rng.choice(cand_b, size=L, replace=True)
 
-                    # only drop self-pairs when sampling within the same bin
-                    if a_bin == b_bin:
-                        keep = (A != B)               # 1-D boolean mask, same length as A and B
-                        A, B = A[keep], B[keep]
-                    if A.size == 0:                    # nothing left to score in this (a_bin,b_bin)
-                        continue
+                # only drop self-pairs when sampling within the same bin
+                if a_bin == b_bin:
+                    keep = (A != B)               # 1-D boolean mask, same length as A and B
+                    A, B = A[keep], B[keep]
+                if A.size == 0:                    # nothing left to score in this (a_bin,b_bin)
+                    continue
 
-                    inter = (pr_any[A] & pr_any[B]).sum(axis=1)
-                    uni   = (pr_any[A] | pr_any[B]).sum(axis=1)
-                    js_any.append((inter / _np.maximum(1, uni)).astype(_np.float32))
+                inter = (pr_any[A] & pr_any[B]).sum(axis=1)
+                uni   = (pr_any[A] | pr_any[B]).sum(axis=1)
+                js_any.append((inter / _np.maximum(1, uni)).astype(_np.float32))
 
-            if js_any:
-                CO_J_any = _np.concatenate(js_any, axis=0)
+        if js_any:
+            CO_J_any = _np.concatenate(js_any, axis=0)
 
-        # ---------------------------------------------------------------
-        # ---------- interactions & grid ----------
-        deg_in, deg_out = summarize_interactions(C_ibm)
-        C_top_idx, C_top_w = topk_interactions(C_ibm, k=max(1, int(args.C_topk)))
-        G_u, G_v, G_w, G_deg = torus_laplacian_edges(NUM_PATCHES_Y, NUM_PATCHES_X)
+    # ---------------------------------------------------------------
+    # ---------- interactions & grid ----------
+    deg_in, deg_out = summarize_interactions(C_final)
+    C_top_idx, C_top_w = topk_interactions(C_final, k=max(1, int(args.C_topk)))
+    G_u, G_v, G_w, G_deg = torus_laplacian_edges(NUM_PATCHES_Y, NUM_PATCHES_X)
 
-        # -----------------------------------------------------------------------------
-        # NEW: QA checks
-        assert B_ibm is None or B_ibm.shape[0] == len(IBM_t), "IBM_B/T mismatch"
-        if B_k is not None and t_k is not None:
-            assert len(t_k) == B_k.shape[0], "B_lastK/t_lastK mismatch"
-        if P_t is not None:
-            assert P_t.shape[0] == len(IBM_t), "P_t/T mismatch"
-        # ---------------------------------------------------------------
+    # -----------------------------------------------------------------------------
+    # NEW: QA checks
+    if B_dynamics is not None:
+        assert B_dynamics.shape[0] == len(t_dynamics), f"B_dynamics/t_dynamics mismatch: {B_dynamics.shape[0]} vs {len(t_dynamics)}"
+    if B_k is not None and t_k is not None:
+        assert len(t_k) == B_k.shape[0], "B_lastK/t_lastK mismatch"
+    if P_t is not None:
+        assert P_t.shape[0] == len(t_dynamics), "P_t/t_dynamics mismatch"
+    # ---------------------------------------------------------------
 
-        IBM_B_to_save = B_ibm.astype(_np.float16) if args.fp16_time_series else B_ibm
-
-        # ---------- build payload ONCE, then save ----------
-        train_out = {
-            "B_last": B_last,
-            "P_last_final": P_last_final,
-            "P_init_assembly": P_init_assembly,
-            "P_t": P_t,
-            "B_lastK": B_k,
-            "t_lastK": t_k,
-            "deg_in": deg_in, "deg_out": deg_out,
-            "gamma": _np.int64(len(r_ibm)),
-            "Y": _np.int64(NUM_PATCHES_Y),
-            "X": _np.int64(NUM_PATCHES_X),
-
-            "BODY_MASS": _np.float32(BODY_MASS),
-
-            # *** FIX: read from 'dispersal' module so CLI overrides are recorded ***
-            "DISPERSAL_RATE": _np.float32(float(dispersal.DISPERSAL_RATE)),
-            "LONG_DISTANCE_PROB": _np.float32(float(dispersal.LONG_DISTANCE_PROB)),
-
-            "detection_threshold": _np.float32(thr),
-            "window_steps": _np.int64(extra_ibm.get("window_steps", -1)),
-            "seed_size": _np.int64(extra_ibm.get("seed_size", -1)),
-            "attempts_total": _np.int64(extra_ibm.get("attempts_total", -1)),
-            "round_last": _np.int64(extra_ibm.get("round_last", -1)),
-            "seed": _np.int64(1),
-
-            "IBM_t": IBM_t,
-            "IBM_B": IBM_B_to_save,
-            "IBM_ext_step": IBM_ext_step,
-            "runtime_s": _np.float32(ibm_runtime_s),
-
-            # extras for AI
-            "C_topk_idx": C_top_idx, "C_topk_w": C_top_w,
-            "GRID_u": G_u, "GRID_v": G_v, "GRID_w": G_w, "GRID_deg": G_deg,
-            "r_base": r_ibm.astype(_np.float32),
-            "r_mean": r_mean, "r_std": r_std,
-            "RSD": RSD,
-            "RSD_t": RSD_t, "gamma_t": gamma_t,
-            "T_first_occ": T_first_occ, "persist_steps": persist_steps,
-
-            # *** NEW: species event summaries (now saved) ***
-            "SP_T_first_any": SP_events["T_first_any"] if SP_events else None,
-            "SP_T_last_any":  SP_events["T_last_any"] if SP_events else None,
-            "SP_T_first_ext_after_any": SP_events["T_first_ext_after_any"] if SP_events else None,
-            "SP_n_recolonizations": SP_events["n_recolonizations"] if SP_events else None,
-            "SP_frac_time_occupied": SP_events["frac_time_occupied"] if SP_events else None,
-
-            # *** NEW: any-time presence & prevalence/weights ***
-            "P_any": P_any,
-            "prevalence_final": prev_final,
-            "prevalence_any": prev_any,
-            "w_invprev_final": w_invprev_final,
-            "w_invprev_any": w_invprev_any,
-        }
-        # ----------------New---------------------------
-        # attach alpha summaries here  # *** FIX ***
-        train_out["alpha_abs_mean"]   = alpha_mu
-        train_out["alpha_abs_median"] = alpha_med
-        train_out["alpha_abs_p95"]    = alpha_p95
-
-        # *** NEW: any-time co-occurrence ***
-        if CO_J_any is not None:
-            train_out["COOCC_Jaccard_anytime"] = CO_J_any
+    dynamics_B_to_save = None
+    if B_dynamics is not None:
+        # Handle different record modes
+        if args.engine == 'ibm' and args.ibm_record_mode != 'full':
+             dynamics_B_to_save = B_dynamics.astype(_np.float16) # Already (T,S) or None
+        elif B_dynamics.ndim == 4: # Full dynamics run
+             dynamics_B_to_save = B_dynamics.astype(_np.float16) if args.fp16_time_series else B_dynamics
+        else:
+             dynamics_B_to_save = B_dynamics # Fallback
 
 
-        # NEW: optionally include environment in training file (unchanged idea)
-        if args.save_env_field and ENV_r_field is not None:
-            train_out.update({
-                "ENV_r_field": ENV_r_field.astype(_np.float32),
-                "ENV_length_scale": _np.float32(args.env_length_scale if args.env_length_scale is not None else -1.0),
-                "ENV_var_r": _np.float32(args.env_var_r if args.env_var_r is not None else 0.0),
-                "ENV_seed_field": _np.int64(args.env_seed_field if args.env_seed_field is not None else -1),
-                "ENV_type": _np.array(["sqrt-exp GRF"], dtype=object),
-            })
-            # attach assembly history (single loop)
-            for key in ("ASM_round", "ASM_attempts", "ASM_established",
-                        "ASM_gamma", "ASM_alpha_bar", "ASM_alpha_patches"):
-                
-                if key in extra_ibm:
-                    train_out[key] = _to_host(extra_ibm[key])
+    # ---------- build payload ONCE, then save ----------
+    train_out = {
+        "B_last": B_last,
+        "P_last_final": P_last_final,
+        "P_init_assembly": P_init_assembly,
+        "P_t": P_t,
+        "B_lastK": B_k,
+        "t_lastK": t_k,
+        "deg_in": deg_in, "deg_out": deg_out,
+        "gamma": _np.int64(len(r_final)),
+        "Y": _np.int64(NUM_PATCHES_Y),
+        "X": _np.int64(NUM_PATCHES_X),
 
-        if obs_masks:
-            train_out.update(obs_masks)
+        "BODY_MASS": _np.float32(BODY_MASS),
 
-        train_path = d_data / f"{world_tag.lower()}_training.npz"
-        _atomic_save_npz(train_path, **train_out)
-        logging.info(f"[save][train] → {train_path}")
+        # *** FIX: read from 'dispersal' module so CLI overrides are recorded ***
+        "DISPERSAL_RATE": _np.float32(float(dispersal.DISPERSAL_RATE)),
+        "LONG_DISTANCE_PROB": _np.float32(float(dispersal.LONG_DISTANCE_PROB)),
 
-        # ----------------------------------------------------------------------
+        "detection_threshold": _np.float32(thr),
+        "window_steps": _np.int64(extra_assembly_outputs.get("window_steps", args.ibm_window_steps if args.engine == 'ibm' else -1)),
+        "seed_size": _np.int64(extra_assembly_outputs.get("seed_size", -1)),
+        "attempts_total": _np.int64(extra_assembly_outputs.get("attempts_total", -1)),
+        "round_last": _np.int64(extra_assembly_outputs.get("round_last", -1)),
+        "seed": _np.int64(1),
+
+        "t_dynamics": t_dynamics,
+        "B_dynamics": dynamics_B_to_save,
+        "extinction_step_times": extinction_step_times,
+        "runtime_s": _np.float32(runtime_s),
+
+        # extras for AI
+        "C_topk_idx": C_top_idx, "C_topk_w": C_top_w,
+        "GRID_u": G_u, "GRID_v": G_v, "GRID_w": G_w, "GRID_deg": G_deg,
+        "r_base": r_final.astype(_np.float32),
+        "r_mean": r_mean, "r_std": r_std,
+        "RSD": RSD,
+        "RSD_t": RSD_t, "gamma_t": gamma_t,
+        "T_first_occ": T_first_occ, "persist_steps": persist_steps,
+
+        # *** NEW: species event summaries (now saved) ***
+        "SP_T_first_any": SP_events["T_first_any"] if SP_events else None,
+        "SP_T_last_any":  SP_events["T_last_any"] if SP_events else None,
+        "SP_T_first_ext_after_any": SP_events["T_first_ext_after_any"] if SP_events else None,
+        "SP_n_recolonizations": SP_events["n_recolonizations"] if SP_events else None,
+        "SP_frac_time_occupied": SP_events["frac_time_occupied"] if SP_events else None,
+
+        # *** NEW: any-time presence & prevalence/weights ***
+        "P_any": P_any,
+        "prevalence_final": prev_final,
+        "prevalence_any": prev_any,
+        "w_invprev_final": w_invprev_final,
+        "w_invprev_any": w_invprev_any,
+    }
+    # ----------------New---------------------------
+    # attach alpha summaries here  # *** FIX ***
+    train_out["alpha_abs_mean"]   = alpha_mu
+    train_out["alpha_abs_median"] = alpha_med
+    train_out["alpha_abs_p95"]    = alpha_p95
+
+    # *** NEW: any-time co-occurrence ***
+    if CO_J_any is not None:
+        train_out["COOCC_Jaccard_anytime"] = CO_J_any
+    
+    # Add model-specific outputs (e.g., PSD2 wait times, IBM final N)
+    train_out.update(model_specific_outputs)
 
 
-        if not args.no_movie:
-            animate_spatial(B_ibm, f'IBM {tag}', str(d_mov/f'IBM_{tag}.mp4'), args.fps)
+    # NEW: optionally include environment in training file (unchanged idea)
+    if args.save_env_field and ENV_r_field is not None:
+        train_out.update({
+            "ENV_r_field": ENV_r_field.astype(_np.float32),
+            "ENV_length_scale": _np.float32(args.env_length_scale if args.env_length_scale is not None else -1.0),
+            "ENV_var_r": _np.float32(args.env_var_r if args.env_var_r is not None else 0.0),
+            "ENV_seed_field": _np.int64(args.env_seed_field if args.env_seed_field is not None else -1),
+            "ENV_type": _np.array(["sqrt-exp GRF"], dtype=object),
+        })
+    
+    # attach assembly history (single loop)
+    for key in ("ASM_round", "ASM_attempts", "ASM_established",
+                "ASM_gamma", "ASM_alpha_bar", "ASM_alpha_patches"):
+        
+        if key in extra_assembly_outputs:
+            train_out[key] = _to_host(extra_assembly_outputs[key])
 
-    # # =====================================================================
-    # #  ODE (benchmark only)
-    # # =====================================================================
-    # if not use_assembly:
-    #     m_ode = ODEModel(r0, C0,
-    #                      tmax=args.tmax, record_step=args.record,
-    #                      dispersal_type='propagule', seed=7)
-    #     t_ode, B_ode = m_ode.run()
-    #     meta['ODE'] = dict(S=3,
-    #                        period=dominant_period(t_ode, B_ode.mean((2,3))[:,0]))
-    #     data.update({'ODE_t': t_ode, 'ODE_B': B_ode})
+    if obs_masks:
+        train_out.update(obs_masks)
 
-    # # =====================================================================
-    #  SAVE final dataset
+    train_path = d_data / f"{world_tag.lower()}_training.npz"
+    _atomic_save_npz(train_path, **train_out)
+    logging.info(f"[save][train] → {train_path}")
+
+    # ----------------------------------------------------------------------
+
+
+    if not args.no_movie:
+        # Check for full dynamics run before animating
+        if B_dynamics is not None and B_dynamics.ndim == 4:
+            animate_spatial(B_dynamics, f'{args.engine.upper()} {tag}', str(d_mov/f'{args.engine.upper()}_{tag}.mp4'), args.fps)
+        elif args.engine == 'ibm' and args.ibm_record_mode != 'full':
+            logging.warning(f"Cannot generate movie for IBM with record_mode='{args.ibm_record_mode}'. Use 'full'.")
+        else:
+            logging.warning("Cannot generate movie. Full dynamics trajectory (T,S,Y,X) not available.")
+
+
+    # =====================================================================
+    #  SAVE final dataset (meta)
     # =====================================================================
     # right before saving fout:
     total_runtime_s = time.time() - t0
     meta.update(dict(
         scenario   = tag,
+        engine     = args.engine, # <-- NEW: record engine
         timestamp  = _dt.datetime.now(_dt.UTC).isoformat(timespec='seconds').replace('+00:00','Z'),
         grid       = f"{NUM_PATCHES_Y}×{NUM_PATCHES_X}",
         dispersal = dict(
@@ -936,33 +1038,47 @@ def main(argv=None):
         body_mass  = BODY_MASS,
         runtime_s  = float(total_runtime_s),   # NEW
     ))
-    fout = d_data / f'{world_tag.lower()}_dataset.npz'
-    np.savez_compressed(fout, meta=json.dumps(meta, indent=2), **data)
-    print('[save] →', fout)
+    # Save meta to a separate JSON, and the main data to NPZ (which is already done)
+    # fout = d_data / f'{world_tag.lower()}_dataset.npz'
+    # np.savez_compressed(fout, meta=json.dumps(meta, indent=2), **data)
+    
+    # Save meta as JSON
+    meta_path = d_data / f"{world_tag.lower()}_meta.json"
+    with open(meta_path, 'w') as f:
+        json.dump(meta, f, indent=2)
+
+    print('[save] →', train_path)
+    print('[save] →', meta_path)
     print(f'[done] finished successfully in {total_runtime_s:.1f}s.')
 
 
     # =====================================================================
-    # #  QUICK-LOOK PLOT
-    # # =====================================================================
-    # if not args.no_movie and not args.dry_run:
-    #     plt.figure(figsize=(8,6))
-    #     if not args.skip_psd:
-    #         plt.plot(t_psd,  B_psd.mean((1,2,3)), 'b', label='PSD2')
-    #     if not args.skip_ibm:
-    #         plt.plot(t_ibm,  B_ibm.mean((1,2,3)), 'g', label='IBM')
-    #     if 'ODE_t' in data:
-    #         plt.plot(data['ODE_t'],
-    #                  data['ODE_B'].mean((2,3))[:,0], 'r', label='ODE')
-    #     txt = '   '.join(f"{k}:{v['period']:.1f}"
-    #                      for k,v in meta.items()
-    #                      if isinstance(v, dict) and 'period' in v)
-    #     plt.title(f'{tag} – dominant periods   {txt}')
-    #     plt.xlabel('time'); plt.ylabel('mean biomass'); plt.legend()
-    #     plt.tight_layout()
-    #     plt.savefig(d_plot/f'{tag}_means.png', dpi=150); plt.close()
+    #  QUICK-LOOK PLOT
+    # =====================================================================
+    if not args.no_movie and not args.dry_run:
+        plt.figure(figsize=(8,6))
+        
+        # Plot mean biomass from the dynamics run
+        if B_dynamics is not None:
+            mean_biomass = None
+            if B_dynamics.ndim == 4: # (T,S,Y,X)
+                mean_biomass = B_dynamics.mean(axis=(1,2,3))
+            elif B_dynamics.ndim == 2: # (T,S) - e.g., from ibm-record-mode=mean
+                mean_biomass = B_dynamics.mean(axis=1)
+            
+            if mean_biomass is not None:
+                 plt.plot(t_dynamics, mean_biomass, label=f'{args.engine.upper()} Mean Biomass')
 
-    # print('[done] finished successfully.')
+        # The old logic for periods doesn't fit well with generic vars
+        # txt = '   '.join(f"{k}:{v['period']:.1f}"
+        #                  for k,v in meta.items()
+        #                  if isinstance(v, dict) and 'period' in v)
+        plt.title(f'{tag} – {args.engine.upper()} Engine')
+        plt.xlabel('time'); plt.ylabel('mean biomass'); plt.legend()
+        plt.tight_layout()
+        plt.savefig(d_plot/f'{tag}_{args.engine}_means.png', dpi=150); plt.close()
+
+    print(f'[done] finished successfully. Engine: {args.engine}')
 
 # ─────────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
