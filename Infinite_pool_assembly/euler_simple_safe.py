@@ -1,3 +1,6 @@
+############################################
+# euler_simple_safe.py
+############################################
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
@@ -53,32 +56,40 @@ class EulerSimpleSafe(Explicit_ODE):
     def simulate(self, tfinal, ncp_list):
         h        = float(self.options["inith"])
         maxsteps = int(self.options["maxsteps"])
-        t, y     = self.t0, self.y0.copy()
+        
+        # Initialize solver attributes
+        self.t = self.t0
+        self.y = self.y0.copy() 
 
         cps      = np.sort(np.unique(np.append(ncp_list, tfinal)))
-        T        = np.empty(len(cps));          T[0] = t
-        Y        = np.empty((len(cps), len(y))); Y[0] = y
+        T        = np.empty(len(cps));          T[0] = self.t
+        Y        = np.empty((len(cps), len(self.y))); Y[0] = self.y
         nxt      = 1                                         # next cp slot
 
         for _ in range(maxsteps):
-            if t >= tfinal:
+            if self.t >= tfinal:
                 break
 
-            ydot  = self._f(t, y)
-            t_new = t + h
-            y_new = y + h * ydot
+            # 1. Keep reference to start of step (needed for interpolation)
+            y_start = self.y
+            t_start = self.t
 
+            # 2. Calculate next step directly into self.y
+            ydot   = self._f(t_start, y_start)
+            self.t = t_start + h
+            self.y = y_start + h * ydot
+
+            # 3. Check events using the UPDATED self.y
+            #    If the handler runs, it modifies self.y in place.
             if self.problem_info["state_events"]:
-                self.sw = self.sw or []          # ensure sw exists
-                self._check_events(t_new, y_new) # may update solver.y etc.
+                self.sw = self.sw or []          
+                self._check_events(self.t, self.y) 
 
-            # --- linear output interpolation ---------------------------
-            while nxt < len(cps) and t_new >= cps[nxt]:
-                θ      = (cps[nxt] - t) / h
+            # 4. Interpolate output using y_start (old) and self.y (new)
+            while nxt < len(cps) and self.t >= cps[nxt]:
+                θ      = (cps[nxt] - t_start) / h
                 T[nxt] = cps[nxt]
-                Y[nxt] = y + θ * (y_new - y)
+                Y[nxt] = y_start + θ * (self.y - y_start)
                 nxt   += 1
-
-            t, y = t_new, y_new                # advance step
 
         return T[:nxt], Y[:nxt]
