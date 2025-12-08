@@ -55,7 +55,8 @@ class PSD2Model:
                  *,
                  initial_B: Optional[np.ndarray] = None,
                  initial_wait:  Optional[np.ndarray] = None,
-                 initial_clock: Optional[np.ndarray] = None,  
+                 initial_clock: Optional[np.ndarray] = None,
+                 n_new: Optional[int] = 0,
                  r_field=None,      # ◀◀◀ CHANGED: expect spatial field of shape (S, Y, X)
                  length_scale=None, # ◀◀◀ CHANGED: for on‐the‐fly generation
                  var_r=None,        # ◀◀◀ CHANGED: for on‐the‐fly generation
@@ -69,6 +70,7 @@ class PSD2Model:
         """
         :param r: 1D array of intrinsic growth rates (length S).
         :param C: 2D competition matrix (SxS).
+        :param n_new: number of new species to be checked for establishment
         :param tmax: maximum simulation time.
         :param record_step: time interval for recording outputs.
         :param dispersal_type: 'adult' or 'propagule' to indicate how dispersal is handled.
@@ -148,18 +150,6 @@ class PSD2Model:
             # default: all populations start in D-state
             self.waiting = np.zeros((self.S, NUM_PATCHES_Y, NUM_PATCHES_X), bool)
 
-        # ---------- fix potentially inconsistent waiting flags ---------
-        initial_B = np.exp(self.logB)
-        competitive_loss = (self.C @ initial_B.reshape(self.S, -1)).\
-            reshape(self.logB.shape)
-        # print(competitive_loss.shape)
-        local_growth = self.r_field - competitive_loss
-        # diagB = np.diag(self.C).reshape(-1, 1, 1) * initial_B
-        # NEW
-        diagB = self.C_diag.reshape(-1, 1, 1) * initial_B
-        non_self_growth = local_growth + diagB
-        self.waiting[non_self_growth < 0] = 0
-            
         # ---------- Poisson clocks -------------------------------------
         if initial_clock is not None:
             assert initial_clock.shape == (self.S, NUM_PATCHES_Y, NUM_PATCHES_X)
@@ -176,8 +166,49 @@ class PSD2Model:
             self.dispersal_away_rate = \
                 np.asarray(LOCAL_DISPERSAL_MATRIX.sum(axis=0)).flatten(). \
                 reshape((NUM_PATCHES_Y, NUM_PATCHES_X))
-            
-            
+                        
+        # ---------- fix potentially inconsistent waiting flags ---------
+        # ----------       assuming waiting is the default      ---------
+        initial_B = np.exp(self.logB)
+        competitive_loss = (self.C @ initial_B.reshape(self.S, -1)).\
+            reshape(self.logB.shape)
+        # print(competitive_loss.shape)
+        local_growth = self.r_field - competitive_loss
+        # diagB = np.diag(self.C).reshape(-1, 1, 1) * initial_B
+        # NEW
+        diagB = self.C_diag.reshape(-1, 1, 1) * initial_B
+        if self.dispersal_type == 'adult':
+            local_growth = local_growth - \
+                np.broadcast_to(self.dispersal_away_rate,local_growth.shape)
+        non_self_growth = local_growth + diagB
+        self.waiting[non_self_growth < 0] = 0
+        self.poisson_clock[non_self_growth < 0] = 1
+
+        # ---------- test n_new species for establishment at each patch -----
+        for j in range(self.S-n_new, self.S):
+            # For patches where local growth is positive:
+            pos_mask = local_growth[j] > 0
+            denom = local_growth[j] + MORTALITY_RATE
+            if self.dispersal_type == 'adult':
+                denom = denom + self.dispersal_away_rate
+                
+            # establishment probability only where growth>0
+            est = np.ones_like(local_growth[j])
+            est[pos_mask] = local_growth[j][pos_mask] / denom[pos_mask]
+
+            # consider that more than one individual may be present
+            est = 1 - (1 - est)**(initial_B[j]/BODY_MASS)
+
+            # decide at random whether to extablish
+            # (assuming establishment is default):
+            est_failures = np.random.rand(*est.shape) > est
+            self.waiting[j][est_failures] = True
+            self.poisson_clock[j][est_failures] = \
+                np.log(np.random.rand(np.count_nonzero(est_failures)))
+            self.logB[j][~est_failures] -= np.log(est[~est_failures])
+        initial_B=None
+           
+        
         # For storing results (trajectory arrays now have an extra spatial dimension)
         self.nrecords = int(max(1, self.tmax // self.record_step))
         self.trajectory = np.zeros((self.nrecords + 1, self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
@@ -194,11 +225,11 @@ class PSD2Model:
         self.last_sw = None
 
         logger.info(f"PSD2Model init: S={self.S}, tmax={self.tmax}, record_step={self.record_step}")
-        logger.debug(f"Initial logB (shape {self.logB.shape}): {self.logB}")
-        logger.debug(f"Initial waiting (shape {self.waiting.shape}): {self.waiting}")
-        logger.debug(f"Initial PoissonClock (shape {self.poisson_clock.shape}): {self.poisson_clock}")
-        logger.debug(f"Growth rates r: {self.r_flat}")
-        logger.debug(f"Competition Matrix C shape: {self.C.shape}")
+        logger.debug(f"Initial logB (shape {self.logB.shape}):\n{self.logB}")
+        logger.debug(f"Initial waiting (shape {self.waiting.shape}):\n{self.waiting}")
+        logger.debug(f"Initial PoissonClock (shape {self.poisson_clock.shape}):\n{self.poisson_clock}")
+        logger.debug(f"Growth rates r:\n{self.r_flat}")
+        logger.debug(f"Competition Matrix C shape: {self.C.shape}\n{self.C}")
 
     def _ensure_flat_y(self, y):
         """
@@ -348,6 +379,8 @@ class PSD2Model:
         # local_growth = local_growth + np.diag(self.C).reshape(-1, 1, 1) * B
         # new
         local_growth += self.C_diag.reshape(-1,1,1) * B
+        print(f"Waiting populations: {np.sum(sw*1)}")
+        print(f"pclock range: {np.min(pclock.flatten())} - {np.max(pclock.flatten())}")
         return np.concatenate([local_growth.flatten(), pclock.flatten()])
 
 
@@ -489,6 +522,7 @@ class PSD2Model:
 
             # ----- P → S  (successful sweep) -------------------------------
             mask_P_to_S   = trans_to_S & mask_P_sweep
+            print(f"P → S events: {np.sum(mask_P_to_S)}")
             if np.any(mask_P_to_S):
                 # idx = np.vstack(np.nonzero(mask_P_to_S)).T
                 # for s, i, j in idx:
@@ -496,6 +530,7 @@ class PSD2Model:
                     # print(f"Species {s} at patch ({i},{j}): P ({lg:.8f}) -> S at time {solver.t:.8f}")
                 sw[mask_P_to_S]      = True
                 pclock[mask_P_to_S]  = np.log(np.random.rand(np.count_nonzero(mask_P_to_S)))
+                print(f"new plocks: {pclock[mask_P_to_S]}")
 
         # 1.d  D → P (not_waiting & lg_evt_flag == −1) ------------------------
         mask_D_to_P = not_waiting & (lg_evt_flag == -1)
@@ -572,6 +607,8 @@ class PSD2Model:
 
         solver.y[:total]            = logB.ravel()
         solver.y[total:2*total]     = pclock.ravel()
+        print(f"Clocks range: {np.min(solver.y[total:2*total])} - {np.max(solver.y[total:2*total])}")
+        print(f"Clocks: {solver.y[total:2*total]}")
         solver.sw                   = sw.ravel().tolist()
 
 
@@ -775,7 +812,9 @@ class PSD2Model:
         except Exception:
             solver = EulerSimpleSafe(problem)
             solver.options['inith'] = 1.0  # initial step size
-            
+
+        print(f"Solve is: {solver}")
+
         # ==> single call; only 51 rows come back
         t, y = solver.simulate(self.tmax,
                                ncp_list=record_times)
