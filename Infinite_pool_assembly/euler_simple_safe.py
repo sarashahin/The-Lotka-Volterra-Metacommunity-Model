@@ -61,6 +61,11 @@ class EulerSimpleSafe(Explicit_ODE):
         self.t = self.t0
         self.y = self.y0.copy() 
 
+        # 0. Initialise event checking
+        if self.problem_info["state_events"]:
+            self.sw = self.sw or []          
+            self._check_events(self.t, self.y) 
+
         cps      = np.sort(np.unique(np.append(ncp_list, tfinal)))
         T        = np.empty(len(cps));          T[0] = self.t
         Y        = np.empty((len(cps), len(self.y))); Y[0] = self.y

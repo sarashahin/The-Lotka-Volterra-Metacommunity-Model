@@ -47,6 +47,8 @@ from dispersal import compute_dispersal, LOCAL_DISPERSAL_MATRIX
 
 logger = logging.getLogger(__name__)
 
+breach = 1000000000
+
 class PSD2Model:
     def __init__(self,
                  r,                 # either 1D array (length S) or ignored if r_field supplied
@@ -193,19 +195,22 @@ class PSD2Model:
                 denom = denom + self.dispersal_away_rate
                 
             # establishment probability only where growth>0
-            est = np.ones_like(local_growth[j])
+            est = np.zeros_like(local_growth[j])
             est[pos_mask] = local_growth[j][pos_mask] / denom[pos_mask]
 
             # consider that more than one individual may be present
             est = 1 - (1 - est)**(initial_B[j]/BODY_MASS)
 
-            # decide at random whether to extablish
+            # decide at random whether to establish
             # (assuming establishment is default):
-            est_failures = np.random.rand(*est.shape) > est
+            est_failures = (np.random.rand(*est.shape) > est) & pos_mask
+            est_successes = (~est_failures) & pos_mask
             self.waiting[j][est_failures] = True
             self.poisson_clock[j][est_failures] = \
                 np.log(np.random.rand(np.count_nonzero(est_failures)))
-            self.logB[j][~est_failures] -= np.log(est[~est_failures])
+            self.logB[j][est_successes] = \
+                np.clip(self.logB[j][est_successes] - np.log(est[est_successes]),
+                        None, LOG_B_CAP)
         initial_B=None
            
         
@@ -223,6 +228,33 @@ class PSD2Model:
 
         self.record_idx = 0
         self.last_sw = None
+
+        ### TEST CONSISTENCY ####
+        initial_B = np.exp(self.logB)
+        competitive_loss = (self.C @ initial_B.reshape(self.S, -1)).\
+            reshape(self.logB.shape)
+        # print(competitive_loss.shape)
+        local_growth = self.r_field - competitive_loss
+        # diagB = np.diag(self.C).reshape(-1, 1, 1) * initial_B
+        # NEW
+        diagB = self.C_diag.reshape(-1, 1, 1) * initial_B
+        if self.dispersal_type == 'adult':
+            local_growth = local_growth - \
+                np.broadcast_to(self.dispersal_away_rate,local_growth.shape)
+        non_self_growth = local_growth + diagB
+        sw_reshaped = (np.array(self.waiting).reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X)) == 1)
+        if any(sw_reshaped.flatten() & (non_self_growth.flatten() < 0) ):
+            print(f"CONSISTENCY CHECK FAILED")
+            print(f"I condition breach at: {np.asarray(sw_reshaped.flatten() & (non_self_growth.flatten() < 0) ).nonzero()}")
+            breachl = sw_reshaped.flatten() & (non_self_growth.flatten() < 0)
+            print(f"I-Large loG: {local_growth.flatten()[breachl]}")
+            print(f"I-Large nSG: {non_self_growth.flatten()[breachl]}")
+            print(f"I-Large sw : {sw_reshaped.flatten()[breachl]}")
+            print("#######################################################################")
+            print("#######################################################################")
+            print("#######################################################################")
+            print("#######################################################################")
+        ### END TEST CONSISTENCY ####
 
         logger.info(f"PSD2Model init: S={self.S}, tmax={self.tmax}, record_step={self.record_step}")
         logger.debug(f"Initial logB (shape {self.logB.shape}):\n{self.logB}")
@@ -257,14 +289,51 @@ class PSD2Model:
         
         total = self.S * NUM_PATCHES_Y * NUM_PATCHES_X
         logB = y[:total].reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
-        logB = np.clip(logB, None, LOG_B_CAP) # NEW
+        if any(logB.flatten() > np.log(2)):
+            print(f"D-Large logB: {logB.flatten()[logB.flatten() > np.log(2)]}")
+#        logB = np.clip(logB, None, LOG_B_CAP) # NEW
         pclock = y[total:2*total].reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
 
         B = np.exp(logB)
+        if any(B.flatten() > 2):
+            print(f"Large B: {B.flatten()[B.flatten() > 2]}")
         # Compute the biomass for each species in each patch.
         epsilon = 1e-300
         safeB = np.maximum(B, epsilon)
         
+        ### TEST CONSISTENCY ####
+        initial_B = B
+        competitive_loss = (self.C @ initial_B.reshape(self.S, -1)).\
+            reshape(self.logB.shape)
+        # print(competitive_loss.shape)
+        local_growth = self.r_field - competitive_loss
+        # diagB = np.diag(self.C).reshape(-1, 1, 1) * initial_B
+        # NEW
+        diagB = self.C_diag.reshape(-1, 1, 1) * initial_B
+        if self.dispersal_type == 'adult':
+            local_growth = local_growth - \
+                np.broadcast_to(self.dispersal_away_rate,local_growth.shape)
+        non_self_growth = local_growth + diagB
+        sw_reshaped = (np.array(sw).reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X)) == 1)
+        global breach
+        if local_growth.flatten().shape[0] > breach:
+            print(f"D-Large loG: {local_growth.flatten()[breach]}")
+            print(f"D-Large nSG: {non_self_growth.flatten()[breach]}")
+            print(f"D-Large sw : {sw_reshaped.flatten()[breach]}")
+        if any(sw_reshaped.flatten() & (non_self_growth.flatten() < 0) ):
+            print(f"CONSISTENCY CHECK FAILED IN DERIVATIVE COMPUTATION")
+            print(f"S condition breach at: {np.asarray(sw_reshaped.flatten() & (non_self_growth.flatten() < 0) ).nonzero()}")
+            breachl = sw_reshaped.flatten() & (non_self_growth.flatten() < 0)
+            print(f"D-Large loG: {local_growth.flatten()[breachl]}")
+            print(f"D-Large nSG: {non_self_growth.flatten()[breachl]}")
+            print(f"D-Large sw : {sw_reshaped.flatten()[breachl]}")
+            print(f"t = {t}")
+            print("#######################################################################")
+            print("#######################################################################")
+            print("#######################################################################")
+            print("#######################################################################")
+        ### END TEST CONSISTENCY ####
+
         # Calculate growth rates for all patches at once
         # C @ B_reshaped will have shape (S, NUM_PATCHES_Y * NUM_PATCHES_X)
         B_reshaped = B.reshape(self.S, -1)
@@ -328,7 +397,24 @@ class PSD2Model:
         ## impact here.
         dlogB = np.clip(dlogB, a_min=None, a_max=10)
 
+        if any(sw_reshaped.flatten() & (non_self_growth.flatten() < 0) ):
+            print(f"S condition breach at: {np.asarray(sw_reshaped.flatten() & (non_self_growth.flatten() < 0) ).nonzero()}")
+            breachl = sw_reshaped.flatten() & (non_self_growth.flatten() < 0)
+            print(f"DF-Large loG: {local_growth.flatten()[breachl]}")
+            print(f"DF-Large nSG: {non_self_growth.flatten()[breachl]}")
+            print(f"DF-Large inP: {invasion_pressure.flatten()[breachl]}")
+            print(f"DF-Large sw : {sw_reshaped.flatten()[breachl]}")
+            print(f"At t = {t}")
+            print("#######################################################################")
+            print("#######################################################################")
+            print("#######################################################################")
+            print("#######################################################################")
         
+        if any(logB.flatten() > np.log(2)):
+            print(f"DF-Large loG: {local_growth.flatten()[logB.flatten() > np.log(2)]}")
+            print(f"DF-Large nSG: {non_self_growth.flatten()[logB.flatten() > np.log(2)]}")
+            print(f"DF-Large inP: {invasion_pressure.flatten()[logB.flatten() > np.log(2)]}")
+            print(f"DF-Large sw : {sw_reshaped.flatten()[logB.flatten() > np.log(2)]}")
 
         
         # For establishment probability: include dispersal-away in effective mortality for adult dispersal.
@@ -347,6 +433,9 @@ class PSD2Model:
         est_prob = non_self_growth / denom
         dpclock = est_prob * (invasion / BODY_MASS)
 
+        if any(logB.flatten() > np.log(2)):
+            print(f"D-Large dlogB: {dlogB.flatten()[logB.flatten() > np.log(2)]}")
+        
         return np.concatenate([dlogB.flatten(), dpclock.flatten()])
 
     def _event_fn(self, t, y, sw):
@@ -360,6 +449,8 @@ class PSD2Model:
         total_elements = self.S * NUM_PATCHES_Y * NUM_PATCHES_X
         logB = y[:total_elements].reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
         pclock = y[total_elements:2*total_elements].reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X))
+        if any(logB.flatten() > np.log(2)):
+            print(f"E-Large logB: {logB.flatten()[logB.flatten() > np.log(2)]}")
         B = np.exp(logB)
         # Calculate growth rates for all patches at once
         # C @ B_reshaped will have shape (S, NUM_PATCHES_Y * NUM_PATCHES_X)
@@ -379,8 +470,28 @@ class PSD2Model:
         # local_growth = local_growth + np.diag(self.C).reshape(-1, 1, 1) * B
         # new
         local_growth += self.C_diag.reshape(-1,1,1) * B
-        print(f"Waiting populations: {np.sum(sw*1)}")
-        print(f"pclock range: {np.min(pclock.flatten())} - {np.max(pclock.flatten())}")
+
+        ### TEST CONSISTENCY ####
+        initial_B = B
+        competitive_loss = (self.C @ initial_B.reshape(self.S, -1)).\
+            reshape(self.logB.shape)
+        # print(competitive_loss.shape)
+        local_growth = self.r_field - competitive_loss
+        # diagB = np.diag(self.C).reshape(-1, 1, 1) * initial_B
+        # NEW
+        diagB = self.C_diag.reshape(-1, 1, 1) * initial_B
+        if self.dispersal_type == 'adult':
+            local_growth = local_growth - \
+                np.broadcast_to(self.dispersal_away_rate,local_growth.shape)
+        non_self_growth = local_growth + diagB
+        sw_reshaped = (np.array(self.waiting).reshape((self.S, NUM_PATCHES_Y, NUM_PATCHES_X)) == 1)
+        if local_growth.flatten().shape[0] > breach:
+            print(f"E-Large loG: {local_growth.flatten()[breach]}")
+            print(f"E-Large nSG: {non_self_growth.flatten()[breach]}")
+            print(f"E-Large sw : {sw_reshaped.flatten()[breach]}")
+        ### END TEST CONSISTENCY ####
+
+        
         return np.concatenate([local_growth.flatten(), pclock.flatten()])
 
 
@@ -424,6 +535,9 @@ class PSD2Model:
         # Boolean "waiting" grid ----------------------------------------------------
         sw = np.asarray(solver.sw, dtype=bool).reshape(self.S, NUM_PATCHES_Y, NUM_PATCHES_X)
 
+        if any(logB.flatten() > np.log(2)):
+            print(f"H-Large logB: {logB.flatten()[logB.flatten() > np.log(2)]}")
+    
         # ------------------------------------------------------------------
         # Local growth field g = r – C B  (+ intrapecific term) --------------
         # ------------------------------------------------------------------
@@ -469,9 +583,11 @@ class PSD2Model:
             # idx = np.vstack(np.nonzero(mask_S_to_P)).T
             # for s, i, j in idx:
             #     lg = local_growth[s, i, j]
-                # print(f"Species {s} at patch ({i},{j}): S ({lg:.12f}) -> P at time {solver.t:.12f}")
+            #     print(f"Species {s} at patch ({i},{j}): S ({lg:.12f}) -> P at time {solver.t:.12f}")
+            # print(f"That's population: {mask_S_to_P.flatten().nonzero()}")
             sw[mask_S_to_P]      = False
             pclock[mask_S_to_P]  = 1.0
+            #print(f"sw is now: {sw[mask_S_to_P]}")
 
         # 1.c  P‑state sweep test (not_waiting & lg_evt_flag == +1) -------------
         mask_P_sweep = not_waiting & (lg_evt_flag == +1)
@@ -522,7 +638,6 @@ class PSD2Model:
 
             # ----- P → S  (successful sweep) -------------------------------
             mask_P_to_S   = trans_to_S & mask_P_sweep
-            print(f"P → S events: {np.sum(mask_P_to_S)}")
             if np.any(mask_P_to_S):
                 # idx = np.vstack(np.nonzero(mask_P_to_S)).T
                 # for s, i, j in idx:
@@ -530,7 +645,6 @@ class PSD2Model:
                     # print(f"Species {s} at patch ({i},{j}): P ({lg:.8f}) -> S at time {solver.t:.8f}")
                 sw[mask_P_to_S]      = True
                 pclock[mask_P_to_S]  = np.log(np.random.rand(np.count_nonzero(mask_P_to_S)))
-                print(f"new plocks: {pclock[mask_P_to_S]}")
 
         # 1.d  D → P (not_waiting & lg_evt_flag == −1) ------------------------
         mask_D_to_P = not_waiting & (lg_evt_flag == -1)
@@ -607,9 +721,10 @@ class PSD2Model:
 
         solver.y[:total]            = logB.ravel()
         solver.y[total:2*total]     = pclock.ravel()
-        print(f"Clocks range: {np.min(solver.y[total:2*total])} - {np.max(solver.y[total:2*total])}")
-        print(f"Clocks: {solver.y[total:2*total]}")
+        # print(f"sw is in the end: {sw[mask_S_to_P]}")
         solver.sw                   = sw.ravel().tolist()
+        if np.asarray(solver.sw).shape[0] > breach:
+            print(f"sw is in the very end: {np.asarray(solver.sw)[breach]}")
 
 
     # def _handle_event_fn(self, solver, event_info):
@@ -812,8 +927,6 @@ class PSD2Model:
         except Exception:
             solver = EulerSimpleSafe(problem)
             solver.options['inith'] = 1.0  # initial step size
-
-        print(f"Solve is: {solver}")
 
         # ==> single call; only 51 rows come back
         t, y = solver.simulate(self.tmax,
