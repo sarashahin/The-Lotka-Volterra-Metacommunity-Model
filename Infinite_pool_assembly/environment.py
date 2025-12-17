@@ -4,7 +4,7 @@
 ############################################
 
 #power‑spectrum‑correct GRF
-import numpy as np
+from accelerator import np
 from numpy.fft import rfft2, irfft2, rfftfreq, fftfreq    # ← **ADD**
 
 def _sqrt_exp_spectrum(Ny, Nx, L, var):

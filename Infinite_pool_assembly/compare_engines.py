@@ -18,7 +18,7 @@ Usage:
 """
 import argparse
 import logging
-import numpy as np
+from accelerator import np
 
 # Project Module Imports
 from config import BODY_MASS, STEP_SIZE, THRESHOLD

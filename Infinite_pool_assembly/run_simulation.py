@@ -15,7 +15,10 @@ Examples:
   # Run a 3-species RPS benchmark with the PSD2 engine
   python run_simulation.py --engine psd2
 """
+import os
 import sys
+import logging
+from logging.handlers import RotatingFileHandler
 import argparse
 from simulation_runner import IBMSimulation, PSD2Simulation, ODESimulation
 
@@ -41,5 +44,37 @@ def main():
         print(f"Error: Unknown engine '{args.engine}'.", file=sys.stderr)
         sys.exit(1)
 
+############################################################
+# Logging Setup
+############################################################
+def setup_logging_custom():
+    logger = logging.getLogger()
+    if logger.hasHandlers():
+        logger.handlers.clear()
+    logger.setLevel(logging.DEBUG)
+    formatter = logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    log_folder = "logs"
+    os.makedirs(log_folder, exist_ok=True)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    file_handler = RotatingFileHandler(
+        os.path.join(log_folder, "debug.log"),
+        maxBytes=100000,
+        backupCount=3
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+
 if __name__ == '__main__':
+    setup_logging_custom()
+    logger = logging.getLogger(__name__)
+    logger.info("Logging is set up. Debug logs will be stored in the 'logs' folder.")
+    logger.debug(f"################ NEW RUN ################")
     main()

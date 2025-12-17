@@ -11,9 +11,9 @@ across all patches, representing rare long-distance dispersal events.
 This implementation precomputes a dispersal matrix for local dispersal.
 """
 
-import numpy as _np
-from gpu_patch import np, sparse        # backend-aware np/sparse (CuPy or NumPy)
-import scipy.sparse as sps              # build on CPU first; convert if needed
+from accelerator import np, sparse
+#from gpu_patch import np, sparse        # backend-aware np/sparse (CuPy or NumPy)
+#import scipy.sparse as sps              # build on CPU first; convert if needed
 import logging
 
 from config import DISPERSAL_RATE, NUM_PATCHES_X, NUM_PATCHES_Y, LONG_DISTANCE_PROB
@@ -148,5 +148,5 @@ def compute_dispersal(B):
         # incoming_flux += _EXTRA_INVASION.reshape(S, -1)
         incoming_flux += np.asarray(_EXTRA_INVASION).reshape(S, -1)
     # --------------------------------------------------------------------
-    
+
     return incoming_flux.reshape(B.shape)

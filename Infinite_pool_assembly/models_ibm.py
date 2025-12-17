@@ -7,7 +7,7 @@ using binomial & Poisson draws each step.
 Now includes multi-patch dynamics with dispersal.
 """
 # import numpy as np
-from gpu_patch import np    # <-- add
+from accelerator import np
 import logging
 import sys
 from typing import Optional, Literal
@@ -167,7 +167,7 @@ class IBMModel:
             # if s%1==0:
             #     print(f"step {s}, {s/self.nsteps}, {np.sum(self.N)}")
             
-            if s % 100 == 0:
+            if False & (s % 100 == 0):
                 print(f"step {s}, {s/self.nsteps:.1%}, total N = {self.N.sum()}")
                 
             # Compute dispersal flux between patches
@@ -212,7 +212,7 @@ class IBMModel:
             incoming = np.random.poisson(incoming_flux * STEP_SIZE / BODY_MASS)
             # Update population by adding surviving individuals, new births, and incoming dispersers.
             self.N = new_N + birth_values + incoming 
-            
+
             # Ensure no negative counts
             if (self.N < 0).any().item():
                 sys.exit("Negative abundances!!")

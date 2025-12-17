@@ -13,7 +13,8 @@ from __future__ import annotations
 import abc
 import time
 import logging
-import numpy as np
+from accelerator import np
+import os # for biomass dumping
 
 # Project Module Imports
 from config import NUM_PATCHES_X, NUM_PATCHES_Y, THRESHOLD, BODY_MASS
@@ -29,7 +30,7 @@ class StepwiseAssembler(abc.ABC):
     Abstract base class for running an infinite-pool stepwise community assembly.
     """
     def __init__(self, *, base_r=1.0, frac_multi=0.05, F_sat=None, max_rounds=None,
-                 max_attempts=None, richness_cap=None, seed_size=5,
+                 max_attempts=None, richness_cap=None, seed_size=1,
                  detection_threshold=None, seed=0, checkpoint_fn=None,
                  init_state=None, init_r=None, init_C=None,
                  init_attempts=0, init_round=-1, **model_kw):
@@ -100,7 +101,7 @@ class StepwiseAssembler(abc.ABC):
                 r_big, C_big = expand_RC(r_big, C_big, self.base_r, row, col)
             
             state_big = self._prepare_state_for_window(state, n_cand)
-            final_state = self._run_simulation_window(r_big, C_big, state_big)
+            final_state = self._run_simulation_window(r_big, C_big, state_big, n_cand)
             attempts += n_cand
             
             presence_matrix = self._get_presence_matrix(final_state)
@@ -127,7 +128,7 @@ class StepwiseAssembler(abc.ABC):
                 state = state_post_estab
             
             gamma_new = len(r)
-            log.info(f"[{self.engine_name}] Round {rnd}: est={num_established}/{n_cand}, pruned={num_pruned}, γ {gamma_current}→{gamma_new} (thr={self.detection_threshold / BODY_MASS:.1f} inds.)")
+            log.info(f"[{self.engine_name}] Round {rnd}: est={num_established}/{n_cand}, pruned={num_pruned}, γ {gamma_current}→ {gamma_new} (thr={self.detection_threshold / BODY_MASS:.1f} inds.)")
             
             final_presence = self._get_presence_matrix(state)
             rich_map = final_presence.sum(axis=0)
@@ -182,7 +183,8 @@ class StepwiseAssembler(abc.ABC):
     def _prepare_state_for_window(self, current_state: any, n_cand: int) -> any: pass
 
     @abc.abstractmethod
-    def _run_simulation_window(self, r_big: np.ndarray, C_big: np.ndarray, state_big: any) -> any: pass
+    def _run_simulation_window(self, r_big: np.ndarray, C_big: np.ndarray,
+                               state_big: any, n_cand: int) -> any: pass
 
     @abc.abstractmethod
     def _get_presence_matrix(self, state: any) -> np.ndarray: pass
@@ -198,10 +200,14 @@ class IBMAssembler(StepwiseAssembler):
     def engine_name(self): return "IBM"
 
     def _initialize_founder(self):
+        # remove any DUMP biomasses file:
+        if os.path.exists("IBM_biomass_value.txt"):
+            os.remove("IBM_biomass_value.txt")
+        ## end DUMP
         r = np.array([self.base_r])
         C = np.array([[1.0]])
-        N = np.zeros((1, NUM_PATCHES_Y, NUM_PATCHES_X), dtype=int)
-        N[0, self.rng.integers(NUM_PATCHES_Y), self.rng.integers(NUM_PATCHES_X)] = 1
+        N = np.ones((1, NUM_PATCHES_Y, NUM_PATCHES_X), dtype=int) * \
+            np.rint(self.base_r / BODY_MASS).astype(int)
         return r, C, N
 
     def _prepare_state_for_window(self, current_N, n_cand):
@@ -211,7 +217,12 @@ class IBMAssembler(StepwiseAssembler):
             N_big[len(current_N) + i].flat[patches] = 1
         return N_big
 
-    def _run_simulation_window(self, r_big, C_big, N_big):
+    def _run_simulation_window(self, r_big, C_big, N_big, n_cand):
+        # DUMP biomasses for debug
+        B = N_big[:(N_big.shape[1]-n_cand)]*BODY_MASS
+        with open("IBM_biomass_value.txt", "a") as f:
+            np.savetxt(f, B[B > 0.01] , fmt='%f')
+        ## end DUMP
         model = IBMModel(r_big, C_big, initial_N=N_big, **self.model_kw)
         model.run()
         return sim_utils.to_host(model.N)
@@ -232,10 +243,13 @@ class PSD2Assembler(StepwiseAssembler):
     def engine_name(self): return "PSD2"
         
     def _initialize_founder(self):
+        # remove any DUMP biomasses file:
+        if os.path.exists("PSD2_biomass_value.txt"):
+            os.remove("PSD2_biomass_value.txt")
+        ## end DUMP
         r = np.array([self.base_r])
         C = np.array([[1.0]])
-        B = np.zeros((1, NUM_PATCHES_Y, NUM_PATCHES_X))
-        B[0, self.rng.integers(NUM_PATCHES_Y), self.rng.integers(NUM_PATCHES_X)] = BODY_MASS
+        B = np.ones((1, NUM_PATCHES_Y, NUM_PATCHES_X))*self.base_r
         W = np.zeros((1, NUM_PATCHES_Y, NUM_PATCHES_X), dtype=bool)
         PC = np.ones((1, NUM_PATCHES_Y, NUM_PATCHES_X))
         return r, C, (B, W, PC)
@@ -247,19 +261,29 @@ class PSD2Assembler(StepwiseAssembler):
         
         B_big = np.zeros((S_big, NUM_PATCHES_Y, NUM_PATCHES_X))
         B_big[:S_current] = B_current
-        W_big = np.zeros((S_big, NUM_PATCHES_Y, NUM_PATCHES_X), dtype=bool)
+        W_big = np.ones((S_big, NUM_PATCHES_Y, NUM_PATCHES_X), dtype=bool)
         W_big[:S_current] = W_current
         PC_big = np.ones((S_big, NUM_PATCHES_Y, NUM_PATCHES_X))
+        PC_big = np.log(np.random.rand(S_big*NUM_PATCHES_X*NUM_PATCHES_Y).
+                        reshape(S_big, NUM_PATCHES_Y, NUM_PATCHES_X))
         PC_big[:S_current] = PC_current
         
         for i in range(n_cand):
             patches = self.rng.choice(NUM_PATCHES_Y * NUM_PATCHES_X, min(self.seed_size, NUM_PATCHES_Y * NUM_PATCHES_X), replace=False)
             B_big[S_current + i].flat[patches] = BODY_MASS
+            W_big[S_current + i].flat[patches] = 0
+            PC_big[S_current + i].flat[patches] = 1
+
         return (B_big, W_big, PC_big)
 
-    def _run_simulation_window(self, r_big, C_big, state_big):
+    def _run_simulation_window(self, r_big, C_big, state_big, n_cand):        
         B_big, W_big, PC_big = state_big
-        model = PSD2Model(r_big, C_big, initial_B=B_big, initial_wait=W_big, initial_clock=PC_big, **self.model_kw)
+        # DUMP biomasses for debug
+        B = B_big[:(B_big.shape[1]-n_cand)]
+        with open("PSD2_biomass_value.txt", "a") as f:
+            np.savetxt(f, B[B > 0.01] , fmt='%f')
+        ## end DUMP
+        model = PSD2Model(r_big, C_big, initial_B=B_big, initial_wait=W_big, initial_clock=PC_big, n_new=n_cand, **self.model_kw)
         _, B_traj, W_traj, PC_traj, *_ = model.run()
         return (sim_utils.to_host(B_traj[-1]), sim_utils.to_host(W_traj[-1]), sim_utils.to_host(PC_traj[-1]))
 

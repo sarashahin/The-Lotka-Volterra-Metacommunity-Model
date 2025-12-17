@@ -12,7 +12,7 @@ and fully working state-events for PSD2 / IBM models.
     • compatible with Assimulo ≥ 3.2
 """
 
-import numpy as np
+from accelerator import np
 from assimulo.explicit_ode import Explicit_ODE
 
 class EulerSimpleSafe(Explicit_ODE):

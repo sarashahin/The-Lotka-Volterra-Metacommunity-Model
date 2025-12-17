@@ -2,7 +2,7 @@
 # assembly_utils.py
 ############################################
 
-import numpy as np
+from accelerator import np
 from config import CONNECTANCE, INTERACTION_STRENGTH
 from typing import Tuple  # Add this import
 

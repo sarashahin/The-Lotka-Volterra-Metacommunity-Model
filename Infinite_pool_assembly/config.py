@@ -4,10 +4,9 @@
 """
 Holds global constants and parameters used across the simulation.
 """
-import numpy as np
-import gpu_patch
+from accelerator import np
 import math
-import gpu_patch as gpu
+
 
 # -----------------------------
 # Simulation Constants
@@ -62,21 +61,21 @@ THRESHOLD = 10 * BODY_MASS
 # -----------------------------
 
 # Define a 2D grid of patches.
-NUM_PATCHES_X = 20 # Number of patches horizontally
-NUM_PATCHES_Y = 20
-  # Number of patches vertically
+NUM_PATCHES_X = 5 # Number of patches horizontally
+NUM_PATCHES_Y = 5 # Number of patches vertically
 
 # Dispersal rate (diffusion coefficient): fraction of biomass exchanged per time step.
-DISPERSAL_RATE = BODY_MASS * 0.0002 # 0.00002 for 25 patches, 0.002 for 5 patches
+DISPERSAL_RATE = BODY_MASS * 1e-3 # 0.00002 for 25 patches, 0.002 for 5 patches
 # DISPERSAL_RATE = 0.02
 # LONG_DISTANCE_PROB = 1  # Probability of long-distance dispersal
 # DISPERSAL_RATE = BODY_MASS * 0.005
 LONG_DISTANCE_PROB = 0  # Probability of long-distance dispersal
 
+INV = 0 # BODY_MASS/100
 
 
 # ecological upper bound: one adult body mass
-ECOLOGICAL_MAX_B = 1 # one adult biomass
+ECOLOGICAL_MAX_B = 2 # Carrying capacity is typically 1, so we go a bit larger
 LOG_B_CAP        = math.log(ECOLOGICAL_MAX_B)
 
 

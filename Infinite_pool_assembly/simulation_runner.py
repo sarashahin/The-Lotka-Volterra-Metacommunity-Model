@@ -15,16 +15,17 @@ import time
 import logging
 from pathlib import Path
 import datetime as dt
-import numpy as np
+from accelerator import np
 
 # Import project modules
 import dispersal
-from config import BODY_MASS, NUM_PATCHES_X, NUM_PATCHES_Y, STEP_SIZE, THRESHOLD
+from config import BODY_MASS, NUM_PATCHES_X, NUM_PATCHES_Y, STEP_SIZE, THRESHOLD, INV
 from models_ibm import IBMModel
 from models_psd2 import PSD2Model
 from models_ode import ODEModel
 from community_assembler import IBMAssembler, PSD2Assembler
 from run_rps_dynamics import animate_spatial
+from assembly_utils import draw_interactions, expand_RC
 import simulation_utils as sim_utils
 
 class SimulationRunner(abc.ABC):
@@ -57,6 +58,7 @@ class SimulationRunner(abc.ABC):
         parser.add_argument('--no-movie', action='store_true')
         parser.add_argument('--disp-rate', type=float, default=None)
         parser.add_argument('--ldd-prob', type=float, default=None)
+        parser.add_argument('--random-seed', type=int, default=0)        
         # Assembly generic
         parser.add_argument('--window-duration', type=float, default=500, help="Duration of one assembly window (steps for IBM, time for PSD2).")
         parser.add_argument('--F-sat', type=str, default='None')
@@ -75,6 +77,7 @@ class SimulationRunner(abc.ABC):
         # Output options
         parser.add_argument('--fp16-time-series', action='store_true')
         parser.add_argument('--world-tag-extra', type=str, default='')
+        parser.add_argument('--n-species', type=int, default=3)
 
         args = parser.parse_args(argv)
         args.use_assembly = args.pool is not None
@@ -125,12 +128,23 @@ class SimulationRunner(abc.ABC):
         if self.args.use_assembly:
             r_final, C_final, final_state, extra_assembly = self.run_assembly()
         else:
-            logging.info("Running 3-species RPS scenario (no assembly).")
-            r_final = np.ones(3)
-            C_final = np.array([[1, 1.7, 0.4], [0.4, 1, 1.7], [1.7, 0.4, 1]], dtype=float)
-            rng = np.random.default_rng(123)
-            B_seed = (rng.random((3, NUM_PATCHES_Y, NUM_PATCHES_X)) < 0.5).astype(float) * BODY_MASS
-            
+            rng = np.random.default_rng(self.args.random_seed)
+            if self.args.n_species == 3:
+                logging.info("Running 3-species RPS scenario (no assembly).")
+                r_final = np.ones(3)
+                C_final = np.array([[1, 1.7, 0.4], [0.4, 1, 1.7], [1.7, 0.4, 1]], dtype=float)
+            else: # set up a community with n_species species
+                  # permanently invading at rate INV
+                logging.info(f"Running {self.args.n_species}-species scenario (no assembly).")
+                r_final = np.array([], dtype=float)
+                C_final = np.array([[]], dtype=float)
+                for _ in range(self.args.n_species):
+                    row, col = draw_interactions(len(r_final))
+                    r_final, C_final = expand_RC(r_final, C_final, 1, row, col)
+            B_seed = ( rng.random((self.args.n_species, NUM_PATCHES_Y, NUM_PATCHES_X)) <
+                       1.5/self.args.n_species ).astype(float) * BODY_MASS
+            dispersal.set_invasion_pressure( INV * np.ones_like(B_seed) )
+
             if self.args.engine == 'ibm':
                 final_state = (B_seed / BODY_MASS).astype(int)
             elif self.args.engine == 'psd2':
@@ -190,7 +204,22 @@ class SimulationRunner(abc.ABC):
 
         if not self.args.no_movie and B_dynamics is not None and B_dynamics.ndim == 4:
             movie_path = self.paths['movies'] / f'{self.world_tag}.mp4'
-            animate_spatial(sim_utils.to_host(B_dynamics), f'{self.args.engine.upper()} {self.args.tag}', str(movie_path))
+            
+            # 1. Bring to CPU
+            B_host = sim_utils.to_host(B_dynamics)
+
+            # 2. FIX: Force Float64 and Add Dithering
+            #    We add tiny random noise (1e-10) to ensure Max > Min.
+            #    This prevents Matplotlib from dividing by zero on uniform frames.
+            B_host = B_host.astype(np.float64)
+            B_host += np.random.normal(0, 1e-10, B_host.shape)
+
+            # 3. Sanitize and Clip
+            B_host = np.nan_to_num(B_host, nan=0.0, posinf=0.0, neginf=0.0)
+            B_host = np.clip(B_host, 0.0, 1.0)
+
+            # 4. Generate Movie
+            animate_spatial(B_host, f'{self.args.engine.upper()} {self.args.tag}', str(movie_path))
             logging.info(f"[save] -> {movie_path}")
 
     @abc.abstractmethod
@@ -215,7 +244,7 @@ class IBMSimulation(SimulationRunner):
         assembler = IBMAssembler(
             max_attempts=self.args.max_attempts, max_rounds=self.args.max_rounds,
             F_sat=self.args.F_sat, detection_threshold=self.args.detection_threshold,
-            checkpoint_fn=self._checkpoint_callback,
+            checkpoint_fn=self._checkpoint_callback, seed=self.args.random_seed,
             init_r=init_r, init_C=init_C, init_state=init_state,
             init_attempts=init_attempts, init_round=init_round,
             nsteps=int(self.args.window_duration), record_step=int(self.args.window_duration)
@@ -244,7 +273,7 @@ class PSD2Simulation(SimulationRunner):
         assembler = PSD2Assembler(
             max_attempts=self.args.max_attempts, max_rounds=self.args.max_rounds,
             F_sat=self.args.F_sat, detection_threshold=self.args.detection_threshold,
-            checkpoint_fn=self._checkpoint_callback,
+            checkpoint_fn=self._checkpoint_callback, seed=self.args.random_seed,
             tmax=self.args.window_duration, record_step=self.args.window_duration
         )
         return assembler.run()

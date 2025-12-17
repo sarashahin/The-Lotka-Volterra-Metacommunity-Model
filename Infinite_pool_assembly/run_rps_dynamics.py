@@ -2,7 +2,7 @@
 # run_rps_dynamics.py  —  fixed version
 ############################################
 
-import numpy as np
+from accelerator import np, to_cpu # use to_cpu for matlibplot access!
 import matplotlib.pyplot as plt
 from matplotlib import animation
 import matplotlib
@@ -69,6 +69,9 @@ def animate_spatial(traj, title='', filename=None, fps=50):
     """Animate spatial biomass maps stored as traj[t, sp, y, x]."""
     n_t, S, ny, nx = traj.shape
 
+    if S > 72:
+        S = 7*8 # larger videos break the height limit!
+    
     # ---- layout: ≤8 panels per row ---------------------------------
     cols = min(8, S)
     rows = int(np.ceil(S / cols))
@@ -81,11 +84,17 @@ def animate_spatial(traj, title='', filename=None, fps=50):
     # hide unused panes
     for i in range(S, len(axes)):
         axes[i].set_visible(False)
+        
+
+    # 1. Sanitize the data to prevent 'NaN' from breaking the plot
+    traj = np.nan_to_num(traj, nan=0.0, posinf=0.0, neginf=0.0)
 
     vmax = [max(traj[:, i].max(), 1e-12) for i in range(S)]
+    vmax = max(vmax)
     ims  = []
     for i in range(S):
-        im = axes[i].imshow(traj[0, i], vmin=0, vmax=vmax[i], animated=True)
+        #im = axes[i].imshow(traj[0, i], vmin=0, vmax=vmax[i], animated=True)
+        im = axes[i].imshow(traj[0, i], vmin=0, vmax=1.0, animated=True)
         axes[i].set_title(f'Species {i}')
         axes[i].axis('off')
         ims.append(im)

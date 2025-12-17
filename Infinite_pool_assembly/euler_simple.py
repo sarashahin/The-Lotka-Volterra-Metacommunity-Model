@@ -15,7 +15,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-import numpy as np
+from accelerator import np
 
 from assimulo.ode import ID_PY_EVENT, ID_PY_COMPLETE, NORMAL, ID_PY_OK
 from assimulo.explicit_ode import Explicit_ODE
