@@ -3,18 +3,15 @@
 ############################################
 """
 Object-oriented framework for stepwise community assembly.
-
-A base class `StepwiseAssembler` implements the core assembly loop, modeled
-after the behavior of the original IBM assembly process. Subclasses `IBMAssembler`
-and `PSD2Assembler` provide engine-specific implementations for state management
-and simulation execution.
+Runs on GPU via accelerator shim.
+Robust to 2D vs 3D spatial arrays and Time dimension leakage.
 """
 from __future__ import annotations
 import abc
 import time
 import logging
-from accelerator import np
-import os # for biomass dumping
+from accelerator import np # Shim import
+import os 
 
 # Project Module Imports
 from config import NUM_PATCHES_X, NUM_PATCHES_Y, THRESHOLD, BODY_MASS
@@ -46,22 +43,17 @@ class StepwiseAssembler(abc.ABC):
         self.checkpoint_fn = checkpoint_fn
         self.model_kw = model_kw
 
-        # --- FIX: Ensure self.detection_threshold is ALWAYS a biomass value. ---
         if detection_threshold is not None:
-            # Assume a value from the CLI is an individual count; convert to biomass.
             self.detection_threshold = float(detection_threshold) * BODY_MASS
         else:
-            # Use the default THRESHOLD from config.py, which is already a biomass.
-            self.detection_threshold = THRESHOLD #
+            self.detection_threshold = THRESHOLD 
         
-        # Resume state
         self.init_state = init_state
         self.init_r = init_r
         self.init_C = init_C
         self.init_attempts = init_attempts
         self.init_round = init_round
         
-        # History buffers
         self.hist_round = []
         self.hist_attempts = []
         self.hist_gamma = []
@@ -69,9 +61,22 @@ class StepwiseAssembler(abc.ABC):
         self.hist_alpha_pats = []
         self.hist_established_cum = []
 
+    def _check_presence(self, presence_matrix):
+        if presence_matrix.ndim == 3:
+            return presence_matrix.any(axis=(1, 2))
+        elif presence_matrix.ndim == 2:
+            return presence_matrix.any(axis=1)
+        else:
+            raise ValueError(f"Unexpected presence matrix shape: {presence_matrix.shape}")
+
+    def _sum_presence(self, presence_matrix):
+        if presence_matrix.ndim == 3:
+            return presence_matrix.sum(axis=(1, 2))
+        elif presence_matrix.ndim == 2:
+            return presence_matrix.sum(axis=1)
+        return presence_matrix.sum()
+
     def run(self):
-        """Executes the main assembly loop."""
-        
         if self.init_r is not None and self.init_C is not None and self.init_state is not None:
             r, C, state = self.init_r, self.init_C, self.init_state
             attempts = self.init_attempts
@@ -105,7 +110,7 @@ class StepwiseAssembler(abc.ABC):
             attempts += n_cand
             
             presence_matrix = self._get_presence_matrix(final_state)
-            estab_mask = presence_matrix[-n_cand:].any(axis=(1, 2))
+            estab_mask = self._check_presence(presence_matrix[-n_cand:])
             
             if estab_mask.any():
                 keep_new = np.where(estab_mask)[0] + gamma_current
@@ -117,7 +122,7 @@ class StepwiseAssembler(abc.ABC):
                 state_post_estab = self._prune_state(final_state, np.arange(gamma_current))
 
             presence_residents = self._get_presence_matrix(state_post_estab)
-            alive_mask = presence_residents.any(axis=(1, 2))
+            alive_mask = self._check_presence(presence_residents)
             
             num_established = int(estab_mask.sum())
             num_pruned = int((~alive_mask).sum())
@@ -139,10 +144,14 @@ class StepwiseAssembler(abc.ABC):
             self.hist_gamma.append(gamma_new)
             self.hist_established_cum.append(est_cum)
             self.hist_alpha_bar.append(float(rich_map.mean()))
-            self.hist_alpha_pats.append([int(rich_map[y, x]) for (y, x) in _patches_hist])
+            
+            if rich_map.ndim == 2:
+                self.hist_alpha_pats.append([int(rich_map[y, x]) for (y, x) in _patches_hist])
+            else:
+                self.hist_alpha_pats.append([int(rich_map[0])]*3) 
 
             if self.checkpoint_fn:
-                occ = final_presence.sum(axis=(1, 2))
+                occ = self._sum_presence(final_presence)
                 self.checkpoint_fn(dict(r=r, C=C, state=state, occ=occ, attempts=attempts, gamma=gamma_new, round=rnd, thr=self.detection_threshold))
             
             if self.F_sat is not None and attempts >= self.F_sat * gamma_new:
@@ -158,7 +167,7 @@ class StepwiseAssembler(abc.ABC):
     def _package_results(self, r, C, final_state):
         presence = self._get_presence_matrix(final_state)
         extra = dict(
-            occ_counts=presence.sum(axis=(1, 2)),
+            occ_counts=self._sum_presence(presence),
             detection_threshold=self.detection_threshold,
             attempts_total=self.hist_attempts[-1] if self.hist_attempts else 0,
             round_last=self.hist_round[-1] if self.hist_round else -1,
@@ -200,10 +209,8 @@ class IBMAssembler(StepwiseAssembler):
     def engine_name(self): return "IBM"
 
     def _initialize_founder(self):
-        # remove any DUMP biomasses file:
         if os.path.exists("IBM_biomass_value.txt"):
             os.remove("IBM_biomass_value.txt")
-        ## end DUMP
         r = np.array([self.base_r])
         C = np.array([[1.0]])
         N = np.ones((1, NUM_PATCHES_Y, NUM_PATCHES_X), dtype=int) * \
@@ -211,24 +218,33 @@ class IBMAssembler(StepwiseAssembler):
         return r, C, N
 
     def _prepare_state_for_window(self, current_N, n_cand):
-        N_big = np.pad(current_N, [(0, n_cand), (0, 0), (0, 0)], constant_values=0)
+        current_N = sim_utils.to_host(current_N)
+        
+        # --- FIX: Ensure 3D shape ---
+        if current_N.ndim == 2:
+            import numpy as _real_np
+            current_N = current_N[_real_np.newaxis, :, :]
+            
+        S_curr, Y, X = current_N.shape
+        import numpy as _real_np 
+        N_big = _real_np.zeros((S_curr + n_cand, Y, X), dtype=int)
+        N_big[:S_curr] = current_N
         for i in range(n_cand):
             patches = self.rng.choice(NUM_PATCHES_Y * NUM_PATCHES_X, min(self.seed_size, NUM_PATCHES_Y * NUM_PATCHES_X), replace=False)
-            N_big[len(current_N) + i].flat[patches] = 1
+            if hasattr(patches, 'cpu'): patches = patches.cpu().numpy()
+            N_big[S_curr + i].reshape(-1)[patches] = 1
         return N_big
 
     def _run_simulation_window(self, r_big, C_big, N_big, n_cand):
-        # DUMP biomasses for debug
-        B = N_big[:(N_big.shape[1]-n_cand)]*BODY_MASS
+        B = N_big[:(N_big.shape[0]-n_cand)]*BODY_MASS
         with open("IBM_biomass_value.txt", "a") as f:
-            np.savetxt(f, B[B > 0.01] , fmt='%f')
-        ## end DUMP
+            valid_B = B[B > 0.01]
+            if len(valid_B) > 0: np.savetxt(f, valid_B, fmt='%f')
         model = IBMModel(r_big, C_big, initial_N=N_big, **self.model_kw)
         model.run()
         return sim_utils.to_host(model.N)
 
     def _get_presence_matrix(self, N):
-        """--- FIX: Compare biomass to biomass threshold. ---"""
         return (N * BODY_MASS) >= self.detection_threshold
 
     def _prune_state(self, N, keep_mask):
@@ -243,10 +259,8 @@ class PSD2Assembler(StepwiseAssembler):
     def engine_name(self): return "PSD2"
         
     def _initialize_founder(self):
-        # remove any DUMP biomasses file:
         if os.path.exists("PSD2_biomass_value.txt"):
             os.remove("PSD2_biomass_value.txt")
-        ## end DUMP
         r = np.array([self.base_r])
         C = np.array([[1.0]])
         B = np.ones((1, NUM_PATCHES_Y, NUM_PATCHES_X))*self.base_r
@@ -255,42 +269,71 @@ class PSD2Assembler(StepwiseAssembler):
         return r, C, (B, W, PC)
 
     def _prepare_state_for_window(self, current_state, n_cand):
-        B_current, W_current, PC_current = current_state
-        S_current = len(B_current)
-        S_big = S_current + n_cand
+        import numpy as _real_np
+        B_curr, W_curr, PC_curr = [sim_utils.to_host(x) for x in current_state]
         
-        B_big = np.zeros((S_big, NUM_PATCHES_Y, NUM_PATCHES_X))
-        B_big[:S_current] = B_current
-        W_big = np.ones((S_big, NUM_PATCHES_Y, NUM_PATCHES_X), dtype=bool)
-        W_big[:S_current] = W_current
-        PC_big = np.ones((S_big, NUM_PATCHES_Y, NUM_PATCHES_X))
-        PC_big = np.log(np.random.rand(S_big*NUM_PATCHES_X*NUM_PATCHES_Y).
-                        reshape(S_big, NUM_PATCHES_Y, NUM_PATCHES_X))
-        PC_big[:S_current] = PC_current
+        # Strip potential Time dimension
+        if B_curr.ndim == 4: B_curr = B_curr[-1]
+        if W_curr.ndim == 4: W_curr = W_curr[-1]
+        if PC_curr.ndim == 4: PC_curr = PC_curr[-1]
+        
+        # --- FIX: Ensure 3D (Species, Y, X) if squeezed ---
+        if B_curr.ndim == 2: B_curr = B_curr[_real_np.newaxis, :, :]
+        if W_curr.ndim == 2: W_curr = W_curr[_real_np.newaxis, :, :]
+        if PC_curr.ndim == 2: PC_curr = PC_curr[_real_np.newaxis, :, :]
+        
+        S_curr = len(B_curr)
+        S_big = S_curr + n_cand
+        
+        B_big = _real_np.zeros((S_big, NUM_PATCHES_Y, NUM_PATCHES_X))
+        B_big[:S_curr] = B_curr
+        W_big = _real_np.ones((S_big, NUM_PATCHES_Y, NUM_PATCHES_X), dtype=bool)
+        W_big[:S_curr] = W_curr
+        rand_vals = _real_np.random.random((S_big, NUM_PATCHES_Y, NUM_PATCHES_X))
+        PC_big = _real_np.log(rand_vals)
+        PC_big[:S_curr] = PC_curr
         
         for i in range(n_cand):
             patches = self.rng.choice(NUM_PATCHES_Y * NUM_PATCHES_X, min(self.seed_size, NUM_PATCHES_Y * NUM_PATCHES_X), replace=False)
-            B_big[S_current + i].flat[patches] = BODY_MASS
-            W_big[S_current + i].flat[patches] = 0
-            PC_big[S_current + i].flat[patches] = 1
-
+            if hasattr(patches, 'cpu'): patches = patches.cpu().numpy()
+            B_big[S_curr + i].reshape(-1)[patches] = BODY_MASS
+            W_big[S_curr + i].reshape(-1)[patches] = 0 
+            PC_big[S_curr + i].reshape(-1)[patches] = 1 
         return (B_big, W_big, PC_big)
 
     def _run_simulation_window(self, r_big, C_big, state_big, n_cand):        
         B_big, W_big, PC_big = state_big
-        # DUMP biomasses for debug
-        B = B_big[:(B_big.shape[1]-n_cand)]
+        B = B_big[:(B_big.shape[0]-n_cand)]
         with open("PSD2_biomass_value.txt", "a") as f:
-            np.savetxt(f, B[B > 0.01] , fmt='%f')
-        ## end DUMP
+            valid_B = B[B > 0.01]
+            if len(valid_B) > 0: np.savetxt(f, valid_B, fmt='%f')
+            
         model = PSD2Model(r_big, C_big, initial_B=B_big, initial_wait=W_big, initial_clock=PC_big, n_new=n_cand, **self.model_kw)
         _, B_traj, W_traj, PC_traj, *_ = model.run()
-        return (sim_utils.to_host(B_traj[-1]), sim_utils.to_host(W_traj[-1]), sim_utils.to_host(PC_traj[-1]))
+        
+        b_final = sim_utils.to_host(B_traj[-1])
+        w_final = sim_utils.to_host(W_traj[-1])
+        pc_final = sim_utils.to_host(PC_traj[-1])
+        
+        # Robust Dimension check
+        S_target = len(r_big)
+        
+        def force_shape(arr):
+            if arr.ndim == 4: arr = arr[-1]
+            if arr.shape != (S_target, NUM_PATCHES_Y, NUM_PATCHES_X):
+                try:
+                    return arr.reshape(S_target, NUM_PATCHES_Y, NUM_PATCHES_X)
+                except ValueError: pass
+            return arr
+                
+        b_final = force_shape(b_final)
+        w_final = force_shape(w_final)
+        pc_final = force_shape(pc_final)
+        
+        return (b_final, w_final, pc_final)
 
     def _get_presence_matrix(self, state):
-        """--- FIX: Compare biomass to biomass threshold. ---"""
         B, _, _ = state
-        # self.detection_threshold is already a biomass value.
         return B >= self.detection_threshold
 
     def _prune_state(self, state, keep_mask):
@@ -301,4 +344,3 @@ class PSD2Assembler(StepwiseAssembler):
         B, W, PC = state_tuple
         r_p, C_p, B_p, W_p, PC_p, _ = prune_extinct(alive_mask, r, C, B, W, PC)
         return r_p, C_p, (B_p, W_p, PC_p)
-

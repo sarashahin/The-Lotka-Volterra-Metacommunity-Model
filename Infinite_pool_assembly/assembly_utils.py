@@ -4,7 +4,7 @@
 
 from accelerator import np
 from config import CONNECTANCE, INTERACTION_STRENGTH
-from typing import Tuple  # Add this import
+from typing import Tuple 
 
 def draw_interactions(k: int, *, rng=np.random):
     """
@@ -12,7 +12,7 @@ def draw_interactions(k: int, *, rng=np.random):
     and the current γ=k residents.
 
        row[j] = effect of resident j  → new
-       col[j] = effect of new        → resident j
+       col[j] = effect of new         → resident j
     Non–zero entries occur with probability CONNECTANCE and have the
     *constant* magnitude INTERACTION_STRENGTH (Axel’s default).
     """

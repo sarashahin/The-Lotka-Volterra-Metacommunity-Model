@@ -30,7 +30,7 @@ def stepwise_assembly_psd2(
         max_rounds    : int   = 50,
         seed          : int   = 0,
         **model_kw
-) -> Tuple[np.ndarray, np.ndarray, dict]:
+) -> Tuple[np.array, np.array, dict]:
     rng = np.random.default_rng(seed)
 
     # ── founder ─────────────────────────────────────────────────────────

@@ -150,7 +150,7 @@ def rsd_from_presence(P_last):
     return P.mean(axis=1).astype(_np.float32)        # (S,)
 # ========================================================================
 
-def take_last_snapshots(B: np.ndarray, t: np.ndarray, k: int = 4):
+def take_last_snapshots(B: np.array, t: np.array, k: int = 4):
     """
     Return last k snapshots (time-major), safely if T<k, without NumPy/CuPy
     implicit conversions.
@@ -226,7 +226,7 @@ def sample_obs_masks(P_last, budgets=(5, 10, 25), rng=None):
 
 
 # ─── helpers ─────────────────────────────────────────────────────────────
-def dominant_period(t: np.ndarray, x: np.ndarray) -> float:
+def dominant_period(t: np.array, x: np.array) -> float:
     if len(t) < 4:
         return float('nan')
     freqs = rfftfreq(len(t), np.mean(np.diff(t)))[1:]
@@ -254,7 +254,7 @@ def _extinction_times_thresholded(B, t, thr_mass):
 # ─────────────────────────────────────────────────────────────────────────
 
 # ─── NEW: robust species-level event times ───────────────────────────────
-def species_event_times(P_t: np.ndarray, t: np.ndarray):
+def species_event_times(P_t: np.array, t: np.array):
     """
     Compute per-species colonization/extinction summary times on the host.
     Returns dict with:

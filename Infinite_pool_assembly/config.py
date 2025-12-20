@@ -46,7 +46,7 @@ RECORDING_STEP_SIZE = 1000  # e.g., 1000
 N_RECORDS = TMAX // RECORDING_STEP_SIZE
 
 #: Random seed for reproducibility
-RANDOM_SEED = 123
+RANDOM_SEED = 125
 
 # For ODE/PSD2 solvers
 RTOL = 1e-5

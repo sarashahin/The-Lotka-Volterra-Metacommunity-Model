@@ -25,75 +25,47 @@ def to_host(arr):
     """Ensure an array is a NumPy array on the host CPU."""
     if _GPU_ENABLED and isinstance(arr, cp.ndarray):
         return cp.asnumpy(arr)
+    
+    # FIX: Add support for PyTorch tensors
+    if hasattr(arr, "detach"): # Checks for Torch Tensor
+        return arr.detach().cpu().numpy()
+        
     return arr
 
 # --- State Translation Functions ---
 
-def translate_psd_state_to_ibm(psd_state: tuple, rng: _np.random.Generator = None) -> _np.ndarray:
-    """
-    Translates a PSD2 state (biomass) to an IBM state (individual counts).
-
-    For each species in each patch, the number of individuals is sampled from a
-    Poisson distribution whose mean is given by (Biomass / BODY_MASS).
-
-    Args:
-        psd_state: A tuple (B, W, PC) representing the PSD2 state.
-        rng: A NumPy random number generator for reproducibility. If None, a new
-             one is created.
-
-    Returns:
-        A NumPy array of integer counts `N` representing the corresponding IBM state.
-    """
+def translate_psd_state_to_ibm(psd_state: tuple, rng: _np.random.Generator = None) -> _np.array:
     if rng is None:
         rng = _np.random.default_rng()
 
     biomass, _, _ = psd_state
     biomass_host = to_host(biomass)
-    mean_individuals = biomass_host / BODY_MASS #
+    mean_individuals = biomass_host / BODY_MASS 
     mean_individuals[mean_individuals < 0] = 0
     N = rng.poisson(mean_individuals).astype(int)
     return N
 
-def translate_ibm_state_to_psd(ibm_state_N: _np.ndarray) -> tuple:
-    """
-    Performs a PROVISIONAL translation of an IBM state to a PSD2 state.
-
-    - logB is set based on N * BODY_MASS.
-    - Patches with N=0 are provisionally set to the 'S' (waiting) state.
-    - This state must be refined later using `local_growth` information.
-
-    Args:
-        ibm_state_N: A NumPy array of integer counts `N`.
-
-    Returns:
-        A provisional PSD2 state tuple (B, W, PC).
-    """
+def translate_ibm_state_to_psd(ibm_state_N: _np.array) -> tuple:
     N = to_host(ibm_state_N)
     S, Ny, Nx = N.shape
 
-    # Calculate logB based on N
-    # Use a very small biomass for extinct patches
     B = _np.where(N > 0,
-                  N * BODY_MASS, #
-                  BODY_MASS / 10000) #
+                  N * BODY_MASS, 
+                  BODY_MASS / 10000) 
     
-    # Provisionally set waiting flags and clocks
-    # N > 0 -> Active 'D' state (waiting=False, pclock=1.0)
-    # N == 0 -> Waiting 'S' state (waiting=True, pclock=random)
     W = (N == 0)
     PC = _np.where(W,
-                   _np.log(_np.random.rand(S, Ny, Nx)), # New random clock
-                   1.0)                                # Active state clock
+                   _np.log(_np.random.rand(S, Ny, Nx)),
+                   1.0)                                
                    
     return (B, W, PC)
 
 # --- Data Analysis & Feature Extraction ---
-# ... (the rest of the file remains unchanged) ...
 def dominant_period(t, x):
     t, x = to_host(t), to_host(x)
     if len(t) < 4: return float('nan')
-    from scipy.fft import rfft, rfftreq
-    dt = _np.mean(_np.diff(t)); freqs = rfftreq(len(t), dt)[1:]
+    from scipy.fft import rfft, rfftfreq
+    dt = _np.mean(_np.diff(t)); freqs = rfftfreq(len(t), dt)[1:]
     if not len(freqs): return float('nan')
     spec = _np.abs(rfft(x))[1:]; return 1.0 / freqs[_np.argmax(spec)]
 
@@ -139,3 +111,4 @@ def atomic_save_npz(path: Path, **arrays):
     payload = {k: to_host(v) for k, v in arrays.items() if v is not None}
     with open(tmp_path, "wb") as fh: _np.savez_compressed(fh, **payload)
     os.replace(tmp_path, path)
+    

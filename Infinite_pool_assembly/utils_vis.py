@@ -12,10 +12,10 @@ matplotlib.use('Agg')
 
 
 
-def slice_to_rgb(state: np.ndarray,
-                 colour_table: np.ndarray, top_k=None,
+def slice_to_rgb(state: np.array,
+                 colour_table: np.array, top_k=None,
                  empty_colour: tuple[float, float, float] = (0, 0, 0)
-                 ) -> np.ndarray:
+                 ) -> np.array:
     """
     Convert one model slice to an RGB image.
 
@@ -42,9 +42,9 @@ def slice_to_rgb(state: np.ndarray,
     return rgb
 
 
-def make_mosaic(frames: list[np.ndarray],
+def make_mosaic(frames: list[np.array],
                 times: list[float],
-                colour_table: np.ndarray,
+                colour_table: np.array,
                 save_to: str,
                 ncols: int = 4,
                 dpi: int = 200) -> None:
