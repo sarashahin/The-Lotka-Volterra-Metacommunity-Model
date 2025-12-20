@@ -11,6 +11,7 @@ import abc
 import time
 import logging
 from accelerator import np # Shim import
+import numpy as _real_numpy # <--- ADD THIS: Standard NumPy for independent RNG
 import os 
 
 # Project Module Imports
@@ -32,7 +33,11 @@ class StepwiseAssembler(abc.ABC):
                  init_state=None, init_r=None, init_C=None,
                  init_attempts=0, init_round=-1, **model_kw):
 
-        self.rng = np.random.default_rng(seed)
+        # <--- CHANGE START: Use CPU Generator to decouple from Global/Torch RNG
+        # self.rng = np.random.default_rng(seed) 
+        self.rng = _real_numpy.random.default_rng(seed)
+        # <--- CHANGE END
+
         self.base_r = base_r
         self.frac_multi = frac_multi
         self.F_sat = F_sat
@@ -102,6 +107,8 @@ class StepwiseAssembler(abc.ABC):
 
             r_big, C_big = r, C
             for _ in range(n_cand):
+                # self.rng is now a CPU generator. 
+                # assembly_utils.draw_interactions handles CPU/GPU mix correctly.
                 row, col = draw_interactions(len(r_big), rng=self.rng)
                 r_big, C_big = expand_RC(r_big, C_big, self.base_r, row, col)
             

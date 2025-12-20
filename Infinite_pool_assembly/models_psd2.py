@@ -8,6 +8,7 @@ from accelerator import np # PyTorch Shim
 import numpy as _cpu_numpy # Standard Numpy for CPU-side control flow
 from typing import Optional
 
+# Replaced Assimulo with local solver compatible with Accelerator
 from euler_simple_safe import Explicit_Problem, EulerSimpleSafe
 from environment import generate_spatial_r
 import math
@@ -29,13 +30,12 @@ class PSD2Model:
     def __init__(self, r, C=None, *,
                  initial_B=None, initial_wait=None, initial_clock=None,
                  n_new: int = 0, r_field=None, length_scale=None, var_r=None,
-                 seed_field=None, tmax=None, record_step=None, seed=None, # <--- Restored argument
+                 seed_field=None, tmax=None, record_step=None, 
+                 seed=123, # Reverted default to match orig
                  dispersal_type='propagule', dispersal_away_rate=None):
 
-        # FIX: We accept 'seed' to prevent TypeError from legacy callers,
-        # but we DO NOT call np.random.seed(seed) here.
-        # This ensures the global random state evolves naturally across rounds.
-        # np.random.seed(seed) 
+        # Restored seed reset
+        np.random.seed(seed) 
 
         self.S = len(r)
         self.N_patches = NUM_PATCHES_X * NUM_PATCHES_Y
@@ -69,7 +69,7 @@ class PSD2Model:
             flat_B = initial_B.reshape(self.S, -1)
             flat_B = np.asarray(flat_B, dtype=float)
             self.logB = np.log(np.maximum(flat_B, SAFE_MIN_B, dtype=np.float64))
-            self.logB = np.minimum(self.logB, LOG_B_CAP)
+            # self.logB = np.minimum(self.logB, LOG_B_CAP)
         else:
             init_biomass = BODY_MASS / 10.0
             self.logB = np.full(self.shape_flat, np.log(init_biomass))
@@ -90,8 +90,8 @@ class PSD2Model:
         else:
             self.dispersal_away_rate = np.asarray(LOCAL_DISPERSAL_MATRIX.sum(axis=0)).flatten()
 
+        # --- Initial Consistency Check ---
         current_B = np.exp(self.logB)
-        
         local_growth, non_self_growth = self._compute_local_growth(current_B)
         
         inconsistent_waiting = self.waiting & (non_self_growth < 0)
@@ -219,19 +219,35 @@ class PSD2Model:
         logB_clamped = np.minimum(logB, LOG_B_CAP)
         B = np.exp(logB_clamped)
         
-        rootsfound = event_info[0]
-        trigger_mask = (rootsfound != 0) 
-        growth_trigger = trigger_mask[:total].reshape(self.S, -1)
-        clock_trigger = trigger_mask[total:].reshape(self.S, -1)
+        # --- FIX START: Restore explicit event direction parsing ---
+        # The AI version collapsed rootsfound into a boolean, losing the sign.
+        # We need the sign (+1 or -1) to distinguish "Growth becoming Positive" 
+        # from "Growth becoming Negative".
+        
+        # 1. Retrieve the raw event flags (ints)
+        rootsfound = np.asarray(event_info[0], dtype=int)
+        
+        # 2. Split into Growth events and Clock events
+        growth_evts = rootsfound[:total].reshape(self.S, -1)
+        clock_evts = rootsfound[total:].reshape(self.S, -1)
         
         local_growth, non_self_growth = self._compute_local_growth(B)
         
-        mask_S_to_P = growth_trigger & (non_self_growth < 0) & sw
+        # Case A: Growth becomes NEGATIVE (pos -> neg)
+        # Event flag should be -1 (if defined as crossing 0 downwards) or we check logic
+        # Original code used (growth_evts == -1). 
+        # We strictly check for the specific transition flag + current state.
+        mask_S_to_P = (growth_evts == -1) & sw
+        
         if np.any(mask_S_to_P):
             sw[mask_S_to_P] = False
             pclock[mask_S_to_P] = 1.0 
 
-        mask_sweep = growth_trigger & (non_self_growth > 0) & (~sw)
+        # Case B: Growth becomes POSITIVE (neg -> pos) -> SWEEP
+        # Event flag should be +1.
+        # CRITICAL FIX: Do not rely on 'non_self_growth > 0' alone, 
+        # which can be noisy at the zero boundary. Rely on the solver's detected crossing.
+        mask_sweep = (growth_evts == 1) & (~sw)
         
         if np.any(mask_sweep):
             yd = self._derivatives(solver.t, solver.y, solver.sw)
@@ -263,7 +279,10 @@ class PSD2Model:
                  n_fail = np.count_nonzero(failed_sweep)
                  pclock[failed_sweep] = np.log(np.random.rand(n_fail))
 
-        mask_clock = clock_trigger & sw
+        # Case C: Clock Events (S -> D)
+        # Event flag should be +1 (crossing 0 upwards) or similar. 
+        # Original code used (clock_evts == 1).
+        mask_clock = (clock_evts == 1) & sw
         
         if np.any(mask_clock):
             est_prob = self._get_est_prob(non_self_growth)
@@ -281,11 +300,12 @@ class PSD2Model:
                 pclock[invalid_est] = 1.0 
                 sw[invalid_est] = False   
 
+        # Write back to solver
         solver.y[:total] = logB.ravel()
         solver.y[total:] = pclock.ravel()
         solver.sw = sw.ravel().tolist()
         return solver.y
-
+    
     def run(self):
         logger.info("Starting PSD2 simulation (Plug-in)...")
         
