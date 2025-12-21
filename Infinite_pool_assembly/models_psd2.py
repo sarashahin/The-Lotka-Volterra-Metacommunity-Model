@@ -4,7 +4,7 @@
 
 import sys
 import logging
-from accelerator import np # PyTorch Shim
+from accelerator import np, to_cpu # <--- ADDED to_cpu for transfer
 import numpy as _cpu_numpy 
 from typing import Optional
 from euler_simple_safe import Explicit_Problem, EulerSimpleSafe
@@ -27,10 +27,8 @@ class PSD2Model:
                  initial_B=None, initial_wait=None, initial_clock=None,
                  n_new: int = 0, r_field=None, length_scale=None, var_r=None,
                  seed_field=None, tmax=None, record_step=None, 
-                 seed=123, 
+                 seed=None, # <--- Default None ensures we use global RNG stream
                  dispersal_type='propagule', dispersal_away_rate=None):
-
-        np.random.seed(seed) 
 
         self.S = len(r)
         self.N_patches = NUM_PATCHES_X * NUM_PATCHES_Y
@@ -42,9 +40,11 @@ class PSD2Model:
         self._cache = {}
 
         if C is None:
+            # Use local RNG if seed provided, else global
+            rng = np.random.default_rng(seed) if seed is not None else np.random
             C = np.eye(self.S, dtype=float)
-            mask = np.random.rand(self.S, self.S) < CONNECTANCE
-            C[mask] = INTERACTION_STRENGTH * np.random.rand(np.count_nonzero(mask))
+            mask = rng.random((self.S, self.S)) < CONNECTANCE
+            C[mask] = INTERACTION_STRENGTH * rng.random(np.count_nonzero(mask))
             np.fill_diagonal(C, 1.0) 
 
         self.C = np.asarray(C, dtype=float)
@@ -98,14 +98,15 @@ class PSD2Model:
         self.nrecords = int(max(1, self.tmax // self.record_step))
         out_shape = (self.nrecords + 1, *self.shape_2d)
         
-        self.trajectory = np.zeros(out_shape, dtype=np.float32)
-        self.wait_trajectory = np.zeros(out_shape, dtype=bool)
-        self.time_points = np.zeros(self.nrecords + 1)
+        # <--- FIX: Allocate storage on CPU (Host RAM)
+        self.trajectory = _cpu_numpy.zeros(out_shape, dtype=_cpu_numpy.float32)
+        self.wait_trajectory = _cpu_numpy.zeros(out_shape, dtype=bool)
+        self.time_points = _cpu_numpy.zeros(self.nrecords + 1)
 
-        self.poisson_clock_traj = np.zeros(out_shape, dtype=np.float32)
-        self.growth_rate_traj = np.zeros(out_shape, dtype=np.float32)
-        self.invasion_rate_traj = np.zeros(out_shape, dtype=np.float32)
-        self.establishment_prob_traj = np.zeros(out_shape, dtype=np.float32)
+        self.poisson_clock_traj = _cpu_numpy.zeros(out_shape, dtype=_cpu_numpy.float32)
+        self.growth_rate_traj = _cpu_numpy.zeros(out_shape, dtype=_cpu_numpy.float32)
+        self.invasion_rate_traj = _cpu_numpy.zeros(out_shape, dtype=_cpu_numpy.float32)
+        self.establishment_prob_traj = _cpu_numpy.zeros(out_shape, dtype=_cpu_numpy.float32)
 
         logger.info(f"PSD2Model initialized: S={self.S}, Patches={self.N_patches} (Cached + Dense Recompute)")
 
@@ -205,9 +206,6 @@ class PSD2Model:
         return np.concatenate([c['non_self_growth'].flatten(), c['pclock'].flatten()])
 
     def _handle_event_fn(self, solver, event_info):
-        """
-        Discrete event logic using cached values and optimized updates.
-        """
         total = self.S * self.N_patches
         
         self._ensure_cache(solver.t, solver.y)
@@ -232,44 +230,31 @@ class PSD2Model:
         # B. Growth -> Pos (Sweep)
         mask_sweep = (growth_evts == 1) & (~sw)
         
-        # Reuse cached derivative logic
         yd = self._derivatives(solver.t, solver.y, solver.sw)
         dlogB_deriv = yd[:total].reshape(self.S, -1)
         
-        # Dense multiply (fast on GPU)
         prod = B * np.where(mask_sweep, 0.0, dlogB_deriv)
         c_vals = -(self.C @ prod)
         
         # --- BRANCHLESS ALGEBRAIC FIX ---
-        # 1. Calculate validity mask
         valid_sweep = (c_vals > 0) & mask_sweep
-
-        # 2. Calculate terms EVERYWHERE (Dense)
-        # Use np.where to ensure we only take sqrt of positive numbers
-        # (Where valid_sweep is False, we use 0.0, which is safe)
+        
         c_safe = np.where(valid_sweep, c_vals, 0.0)
         sqrt_c = np.sqrt(c_safe)
         
         const_term = MORTALITY_RATE * np.sqrt(np.pi / 2.0)
         
-        # 3. Compute Probability Density
-        # Note: denominator is > 0 because const_term > 0 and BODY_MASS > 0
         numerator = B * sqrt_c
         denominator = BODY_MASS * (sqrt_c + const_term)
         term = numerator / denominator
         
-        # 4. Final Probability Masking
-        # If valid_sweep is True -> exp(-term)
-        # If valid_sweep is False -> 0.0
         prob_remain_S = np.where(valid_sweep, np.exp(-term), 0.0)
         
-        # 5. Random Draws (Dense)
         rnd = np.random.rand(*B.shape)
         
         failed_sweep = valid_sweep & (rnd <= prob_remain_S)
         successful_sweep = valid_sweep & (rnd > prob_remain_S)
         
-        # Apply Updates
         offset = -np.log1p(-prob_remain_S)
         new_logB = np.minimum(0.0, logB + offset)
         
@@ -325,7 +310,7 @@ class PSD2Model:
         return solver.y
     
     def run(self):
-        logger.info("Starting PSD2 simulation (Fully Optimized)...")
+        logger.info("Starting PSD2 simulation (Fully Optimized & Reproducible)...")
         
         y0 = np.concatenate([self.logB.flatten(), self.poisson_clock.flatten()])
         sw0 = self.waiting.flatten() 
@@ -357,12 +342,15 @@ class PSD2Model:
             est_prob = self._get_est_prob(non_self_g)
             inv_rate = inv_flux * est_prob / BODY_MASS
             
-            self.trajectory[i] = B.reshape(self.shape_2d)
-            self.poisson_clock_traj[i] = pclock.reshape(self.shape_2d)
-            self.growth_rate_traj[i] = non_self_g.reshape(self.shape_2d)
-            self.invasion_rate_traj[i] = inv_rate.reshape(self.shape_2d)
-            self.establishment_prob_traj[i] = est_prob.reshape(self.shape_2d)
-            self.wait_trajectory[i] = (pclock < 0).reshape(self.shape_2d)
+            # <--- FIX: Move to CPU before storing to avoid MPS Index Overflow
+            self.trajectory[i] = to_cpu(B).reshape(self.shape_2d)
+            self.poisson_clock_traj[i] = to_cpu(pclock).reshape(self.shape_2d)
+            self.growth_rate_traj[i] = to_cpu(non_self_g).reshape(self.shape_2d)
+            self.invasion_rate_traj[i] = to_cpu(inv_rate).reshape(self.shape_2d)
+            self.establishment_prob_traj[i] = to_cpu(est_prob).reshape(self.shape_2d)
+            
+            # Calculate bool on GPU then transfer
+            self.wait_trajectory[i] = to_cpu(pclock < 0).reshape(self.shape_2d)
 
         logger.info("PSD2 simulation completed.")
         return (self.time_points, self.trajectory, self.wait_trajectory, self.poisson_clock_traj, self.growth_rate_traj, self.invasion_rate_traj, self.establishment_prob_traj)

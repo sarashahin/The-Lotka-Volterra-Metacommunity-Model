@@ -3,10 +3,8 @@
 ############################################
 """
 Object-oriented framework for running ecological simulations.
-
-Defines a base `SimulationRunner` class to handle command-line parsing,
-directory setup, data post-processing, and saving. Engine-specific logic
-for assembly and dynamics is implemented in subclasses.
+Handles CLI arguments, checkpoint loading/saving, and dispatching
+to IBM or PSD2 engines.
 """
 import abc
 import argparse
@@ -14,14 +12,15 @@ import json
 import time
 import logging
 import random
+import os
 from pathlib import Path
 import datetime as dt
 from accelerator import np
-import numpy as _real_numpy
+import numpy as _real_numpy # Standard NumPy
 
 # Import project modules
 import dispersal
-import config # Import config to access RANDOM_SEED
+import config 
 from config import BODY_MASS, NUM_PATCHES_X, NUM_PATCHES_Y, STEP_SIZE, THRESHOLD, INV
 from models_ibm import IBMModel
 from models_psd2 import PSD2Model
@@ -40,8 +39,9 @@ class SimulationRunner(abc.ABC):
         self._setup_logging()
         self._setup_paths()
         self._configure_dispersal()
-        self._set_global_seeds() # <--- NEW: Centralized Seeding
+        self._set_global_seeds()
 
+        # Build World Tag
         self.world_tag = sim_utils.build_world_tag(
             base=f"{self.args.tag}_{self.args.engine}" + (f"_{self.args.world_tag_extra}" if self.args.world_tag_extra else ""),
             ls=self.args.env_length_scale, vr=self.args.env_var_r, thr=self.args.detection_threshold,
@@ -63,24 +63,30 @@ class SimulationRunner(abc.ABC):
         parser.add_argument('--disp-rate', type=float, default=None)
         parser.add_argument('--ldd-prob', type=float, default=None)
         
-        # <--- UPDATED: Default to config.RANDOM_SEED
+        # Random seed
         parser.add_argument('--random-seed', type=int, default=config.RANDOM_SEED)        
         
+        # Checkpointing
+        parser.add_argument('--resume', type=str, default=None, help="Path to specific .npz checkpoint to resume.")
+        parser.add_argument('--resume-latest', action='store_true', help="Automatically resume from the latest checkpoint for this config.")
+
         # Assembly generic
         parser.add_argument('--window-duration', type=float, default=500, help="Duration of one assembly window (steps for IBM, time for PSD2).")
         parser.add_argument('--F-sat', type=str, default='None')
         parser.add_argument('--max-rounds', type=str, default='None')
         parser.add_argument('--max-attempts', type=str, default='10000')
         parser.add_argument('--detection-threshold', type=str, default=None)
-        parser.add_argument('--resume', type=str, default=None)
         parser.add_argument('--save-every-rounds', type=int, default=5)
         parser.add_argument('--save-every-seconds', type=float, default=180.0)
+        
         # Dynamics generic
         parser.add_argument('--record-mode', choices=['full', 'mean', 'none'], default='full')
+        
         # Environment specific
         parser.add_argument('--env-length-scale', type=float, default=None)
         parser.add_argument('--env-var-r', type=float, default=None)
         parser.add_argument('--env-seed-field', type=int, default=None)
+        
         # Output options
         parser.add_argument('--fp16-time-series', action='store_true')
         parser.add_argument('--world-tag-extra', type=str, default='')
@@ -104,17 +110,10 @@ class SimulationRunner(abc.ABC):
         return args
 
     def _set_global_seeds(self):
-        """Sets seeds for all RNG backends to ensure reproducibility."""
         seed = self.args.random_seed
         logging.info(f"Setting GLOBAL RANDOM SEED to: {seed}")
-        
-        # 1. Python random
         random.seed(seed)
-        
-        # 2. Standard NumPy
         _real_numpy.random.seed(seed)
-        
-        # 3. Accelerator (PyTorch/MPS/CUDA)
         np.random.seed(seed)
 
     def _setup_logging(self):
@@ -145,15 +144,31 @@ class SimulationRunner(abc.ABC):
             self.last_checkpoint_time = time.time()
             logging.info(f"[checkpoint] -> {self.checkpoint_path.name}")
 
+    def _load_checkpoint(self):
+        path = None
+        if self.args.resume:
+            path = Path(self.args.resume)
+        elif self.args.resume_latest:
+            path = self.checkpoint_path
+        
+        if path and path.exists():
+            try:
+                logging.info(f"Loading checkpoint: {path}")
+                ck = np.load(path, allow_pickle=True)
+                return ck
+            except Exception as e:
+                logging.error(f"Failed to load checkpoint {path}: {e}")
+                return None
+        elif path:
+            logging.warning(f"Checkpoint file not found: {path}")
+            return None
+        return None
+
     def execute(self):
         if self.args.use_assembly:
             r_final, C_final, final_state, extra_assembly = self.run_assembly()
         else:
-            # Note: We use the global RNG now, but drawing specific interactions 
-            # might still benefit from a local generator for clarity, or we can use the global one.
-            # Using local generator initialized with master seed is safer for modularity.
             rng = _real_numpy.random.default_rng(self.args.random_seed)
-            
             if self.args.n_species == 3:
                 logging.info("Running 3-species RPS scenario (no assembly).")
                 r_final = np.ones(3)
@@ -166,7 +181,6 @@ class SimulationRunner(abc.ABC):
                     row, col = draw_interactions(len(r_final), rng=rng)
                     r_final, C_final = expand_RC(r_final, C_final, 1, row, col)
             
-            # Initial seeding logic
             B_seed = ( rng.random((self.args.n_species, NUM_PATCHES_Y, NUM_PATCHES_X)) <
                        1.5/self.args.n_species ).astype(float) * BODY_MASS
             dispersal.set_invasion_pressure( INV * np.ones_like(B_seed) )
@@ -196,27 +210,35 @@ class SimulationRunner(abc.ABC):
     def post_process_and_save(self, results):
         logging.info("Post-processing and saving results...")
 
-        r_final, C_final = results['r_final'], results['C_final']
-        B_dynamics, t_dynamics = results.get('B_dynamics'), results.get('t_dynamics')
+        # Move metadata to Host
+        r_final = sim_utils.to_host(results['r_final'])
+        C_final = sim_utils.to_host(results['C_final'])
+        
+        # B_dynamics needed for movie?
+        B_dynamics = results.get('B_dynamics')
+        if B_dynamics is not None:
+             B_dynamics = sim_utils.to_host(B_dynamics)
+        t_dynamics = results.get('t_dynamics')
 
         detection_thr_count = self.args.detection_threshold if self.args.detection_threshold is not None else (THRESHOLD / BODY_MASS)
-        thr_mass = detection_thr_count * BODY_MASS
+        
+        # Capture last state
+        B_last = B_dynamics[-1].astype(_real_numpy.float16) if B_dynamics is not None and B_dynamics.ndim == 4 else None
 
-        P_t = (B_dynamics >= thr_mass).astype(np.uint8) if B_dynamics is not None and B_dynamics.ndim == 4 else None
-        B_last = B_dynamics[-1].astype(np.float16) if B_dynamics is not None and B_dynamics.ndim == 4 else None
-
-        sp_events = sim_utils.species_event_times(P_t, t_dynamics) if P_t is not None else {}
         deg_in, deg_out = sim_utils.summarize_interactions(C_final)
         C_top_idx, C_top_w = sim_utils.topk_interactions(C_final, k=16)
 
         output_payload = {
-            "gamma": int(len(r_final)), "r_base": r_final.astype(np.float32),
+            "gamma": int(len(r_final)), 
+            "r_base": r_final.astype(_real_numpy.float32), 
             "deg_in": deg_in, "deg_out": deg_out, "C_topk_idx": C_top_idx, "C_topk_w": C_top_w,
-            "t_dynamics": t_dynamics,
-            "B_dynamics": B_dynamics.astype(np.float16) if self.args.fp16_time_series and B_dynamics is not None else B_dynamics,
-            "P_t": P_t, "B_last": B_last, "runtime_s": float(results['runtime_s']),
+            "t_dynamics": None, 
+            "B_dynamics": None, 
+            "P_t": None,
+            "B_last": B_last,
+            "runtime_s": float(results['runtime_s']),
             "detection_threshold": float(detection_thr_count),
-            **results.get('model_specific_outputs', {}), **results.get('extra_assembly', {}), **sp_events
+            **results.get('model_specific_outputs', {}), **results.get('extra_assembly', {}),
         }
 
         train_path = self.paths['data'] / f"{self.world_tag.lower()}_training.npz"
@@ -228,15 +250,13 @@ class SimulationRunner(abc.ABC):
         with open(meta_path, 'w') as f: json.dump(meta, f, indent=2)
         logging.info(f"[save] -> {meta_path}")
 
+        # Movie Generation
         if not self.args.no_movie and B_dynamics is not None and B_dynamics.ndim == 4:
             movie_path = self.paths['movies'] / f'{self.world_tag}.mp4'
-            
-            B_host = sim_utils.to_host(B_dynamics)
-            B_host = B_host.astype(np.float64)
-            B_host += np.random.normal(0, 1e-10, B_host.shape)
-            B_host = np.nan_to_num(B_host, nan=0.0, posinf=0.0, neginf=0.0)
-            B_host = np.clip(B_host, 0.0, 1.0)
-
+            B_host = B_dynamics.astype(_real_numpy.float64)
+            B_host += _real_numpy.random.normal(0, 1e-10, B_host.shape)
+            B_host = _real_numpy.nan_to_num(B_host, nan=0.0, posinf=0.0, neginf=0.0)
+            B_host = _real_numpy.clip(B_host, 0.0, 1.0)
             animate_spatial(B_host, f'{self.args.engine.upper()} {self.args.tag}', str(movie_path))
             logging.info(f"[save] -> {movie_path}")
 
@@ -249,15 +269,14 @@ class SimulationRunner(abc.ABC):
 class IBMSimulation(SimulationRunner):
     def run_assembly(self):
         init_r, init_C, init_state, init_attempts, init_round = None, None, None, 0, -1
-        if self.args.resume:
-            try:
-                ck = np.load(self.args.resume, allow_pickle=True)
-                init_r, init_C = ck['r'], ck['C']
-                init_state = ck.get('state') or ck.get('N')
-                init_attempts, init_round = int(ck.get('attempts', 0)), int(ck.get('round', -1))
-                logging.info(f"Resuming IBM from checkpoint: {self.args.resume}")
-            except Exception as e:
-                logging.error(f"Failed to load IBM checkpoint: {e}", exc_info=True)
+        
+        ck = self._load_checkpoint()
+        if ck is not None:
+            init_r = np.asarray(ck['r'])
+            init_C = np.asarray(ck['C'])
+            init_state = ck.get('state') or ck.get('N')
+            init_attempts, init_round = int(ck.get('attempts', 0)), int(ck.get('round', -1))
+            logging.info(f"Resuming IBM from round {init_round}, attempts {init_attempts}")
 
         assembler = IBMAssembler(
             max_attempts=self.args.max_attempts, max_rounds=self.args.max_rounds,
@@ -275,7 +294,7 @@ class IBMSimulation(SimulationRunner):
                          nsteps=int(self.args.tmax / STEP_SIZE),
                          record_step=int(self.args.record / STEP_SIZE),
                          record_mode=self.args.record_mode, 
-                         seed=self.args.random_seed, # Use global seed config
+                         seed=self.args.random_seed,
                          length_scale=self.args.env_length_scale, var_r=self.args.env_var_r,
                          seed_field=self.args.env_seed_field)
         
@@ -289,10 +308,28 @@ class IBMSimulation(SimulationRunner):
 
 class PSD2Simulation(SimulationRunner):
     def run_assembly(self):
+        init_r, init_C, init_state, init_attempts, init_round = None, None, None, 0, -1
+        
+        ck = self._load_checkpoint()
+        if ck is not None:
+            init_r = np.asarray(ck['r'])
+            init_C = np.asarray(ck['C'])
+            loaded_state = ck.get('state')
+            if loaded_state is not None:
+                if loaded_state.ndim == 0:
+                    init_state = loaded_state.item()
+                else:
+                    init_state = loaded_state
+            
+            init_attempts, init_round = int(ck.get('attempts', 0)), int(ck.get('round', -1))
+            logging.info(f"Resuming PSD2 from round {init_round}, attempts {init_attempts}")
+
         assembler = PSD2Assembler(
             max_attempts=self.args.max_attempts, max_rounds=self.args.max_rounds,
             F_sat=self.args.F_sat, detection_threshold=self.args.detection_threshold,
             checkpoint_fn=self._checkpoint_callback, seed=self.args.random_seed,
+            init_r=init_r, init_C=init_C, init_state=init_state,
+            init_attempts=init_attempts, init_round=init_round,
             tmax=self.args.window_duration, record_step=self.args.window_duration
         )
         return assembler.run()
@@ -302,18 +339,27 @@ class PSD2Simulation(SimulationRunner):
         logging.info("Running dynamics with PSD2 engine...")
         model = PSD2Model(r, C, initial_B=B0, initial_wait=W0, initial_clock=PC0,
                           tmax=self.args.tmax, record_step=self.args.record, 
-                          seed=self.args.random_seed, # Use global seed config
+                          seed=self.args.random_seed,
                           length_scale=self.args.env_length_scale, var_r=self.args.env_var_r,
                           seed_field=self.args.env_seed_field)
         
         t, B, W, PC, G, INV, EST = model.run()
         
         B_final_assembly, _, _ = initial_state
+        
+        # <--- FIX: Ensure we do NOT pass full trajectories for aux variables.
+        # Only pass the final frame [-1] to avoid multi-GB saves.
+        # We handle None checks in case the simulation length was 0.
+        def safe_last(arr): return arr[-1] if arr is not None and len(arr) > 0 else None
+
         return {
             "t_dynamics": t, "B_dynamics": B,
             "model_specific_outputs": {
-                'PSD2_wait': W, 'PSD2_pclock': PC, 'PSD2_growth': G,
-                'PSD2_invasion': INV, 'PSD2_est_prob': EST,
+                'PSD2_wait': safe_last(W), 
+                'PSD2_pclock': safe_last(PC), 
+                'PSD2_growth': safe_last(G),
+                'PSD2_invasion': safe_last(INV), 
+                'PSD2_est_prob': safe_last(EST),
                 'final_assembly_B': B_final_assembly
             }
         }

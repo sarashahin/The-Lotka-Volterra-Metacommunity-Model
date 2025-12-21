@@ -5,7 +5,7 @@ import os
 import sys
 
 # <FIX> Define locally to avoid circular import with config.py
-ENABLE_GPU = False
+ENABLE_GPU = True
 # </FIX>
 
 has_cuda = False
