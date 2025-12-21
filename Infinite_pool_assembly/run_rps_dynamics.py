@@ -1,140 +1,192 @@
 ############################################
-# run_rps_dynamics.py  —  fixed version
+# run_rps_dynamics.py
 ############################################
+"""
+Visualization module for ecological simulations.
+Optimized for high-performance direct-to-ffmpeg video encoding.
+Features:
+- Direct RGB piping (Viridis colormap)
+- Hardware acceleration (VideoToolbox/NVENC)
+- FFmpeg-side upscaling
+- Centered White Padding
+- Smart TV Layout (Adapts rows to field geometry Nx/Ny)
+"""
 
-from accelerator import np, to_cpu # use to_cpu for matlibplot access!
-import matplotlib.pyplot as plt
-from matplotlib import animation
-import matplotlib
+import sys
+import shutil
+import subprocess
+import platform
+import logging
+import numpy as std_np  # Standard numpy for CPU image ops
+from accelerator import to_cpu
 
-# from models_psd2 import PSD2Model
-from models_ibm import IBMModel
+import matplotlib.cm
 
-# --- global “well‑mixed’’ dispersal ---------------------------------
-import config
-from config import NUM_PATCHES_X, NUM_PATCHES_Y, BODY_MASS, DISPERSAL_RATE        # link all 25 patches
-# -------------------------------------------------------------------
+try:
+    from config import NUM_PATCHES_X, NUM_PATCHES_Y, BODY_MASS
+except ImportError:
+    NUM_PATCHES_X, NUM_PATCHES_Y = 50, 50
+    BODY_MASS = 1.0
 
-# ----------------‑‑ utility ----------------------------------------
-def dominant_period(t, x):
-    """Return the period of the dominant FFT peak of 1‑D signal x(t)."""
-    from scipy.fft import rfftfreq, rfft
-    dt = np.mean(np.diff(t))
-    freqs = rfftfreq(len(t), dt)[1:]          # skip the zero mode
-    spec  = np.abs(rfft(x))[1:]
-    return 1.0 / freqs[np.argmax(spec)]
+logger = logging.getLogger(__name__)
 
-# ----------------‑‑ LV parameters ----------------------------------
-r = np.ones(3)
-C = np.eye(3)
-C[C == 0] = 0.4          # off‑diagonal interaction strength
+# --- LAYOUT CONFIGURATION ---
+MAX_COLS = 10
+TARGET_ASPECT = 16 / 9  # Standard TV Aspect Ratio
 
-# ----------------‑‑ simulation control -----------------------------
-tmax        = 20_000
-record_step = 100
-# -------------------------------------------------------------------
-
-def run_psd2():
-    np.random.seed(0)
-    model = PSD2Model(r, C, tmax=tmax, record_step=record_step,
-                      seed=42, dispersal_type='propagule')
-    model.logB += 0.01 * (np.random.rand(*model.logB.shape) - 0.5)
-    t, traj, *_ = model.run()
-
-    mean_ts = traj.sum(axis=1).mean(axis=(1, 2))     # community mean biomass
-    plt.figure()
-    plt.plot(t, mean_ts, label='PSD2')
-    plt.xlabel('time'); plt.ylabel('mean biomass'); plt.legend(); plt.title('PSD2')
-    plt.show()
-    print("PSD2 dominant period:", dominant_period(t, mean_ts))
-    return t, traj
-
-def run_ibm():
-    np.random.seed(1)
-    model = IBMModel(r, C, nsteps=tmax, record_step=record_step,
-                     seed=1, dispersal_type='propagule')
-    traj = model.run()
-    times = np.arange(record_step, tmax + 1, record_step)
-
-    mean_ts = traj.sum(axis=1).mean(axis=(1, 2))
-    plt.figure()
-    plt.plot(times, mean_ts, label='IBM', color='g')
-    plt.xlabel('time'); plt.ylabel('mean biomass'); plt.legend(); plt.title('IBM')
-    plt.show()
-    print("IBM dominant period:", dominant_period(times, mean_ts))
-    return times, traj
-
-# ----------------‑‑ animation helper --------------------------------
-def animate_spatial(traj, title='', filename=None, fps=50):
-    """Animate spatial biomass maps stored as traj[t, sp, y, x]."""
-    n_t, S, ny, nx = traj.shape
-
-    if S > 72:
-        S = 7*8 # larger videos break the height limit!
+def get_ffmpeg_encoder_args():
+    """Detects the best available hardware encoder."""
+    system = platform.system()
     
-    # ---- layout: ≤8 panels per row ---------------------------------
-    cols = min(8, S)
-    rows = int(np.ceil(S / cols))
-
-    fig, axes = plt.subplots(rows, cols,
-                             figsize=(4 * cols, 3 * rows),
-                             squeeze=False)
-    axes = axes.flatten()
-
-    # hide unused panes
-    for i in range(S, len(axes)):
-        axes[i].set_visible(False)
-        
-
-    # 1. Sanitize the data to prevent 'NaN' from breaking the plot
-    traj = np.nan_to_num(traj, nan=0.0, posinf=0.0, neginf=0.0)
-
-    vmax = [max(traj[:, i].max(), 1e-12) for i in range(S)]
-    vmax = max(vmax)
-    ims  = []
-    for i in range(S):
-        #im = axes[i].imshow(traj[0, i], vmin=0, vmax=vmax[i], animated=True)
-        im = axes[i].imshow(traj[0, i], vmin=0, vmax=1.0, animated=True)
-        axes[i].set_title(f'Species {i}')
-        axes[i].axis('off')
-        ims.append(im)
-
-    plt.suptitle(title, y=1.02)
-    plt.tight_layout()
-
-    def update(frame):
-        for i, im in enumerate(ims):
-            im.set_array(traj[frame, i])
-        return ims
-
-    ani = animation.FuncAnimation(fig, update, frames=n_t,
-                                  blit=True, interval=200)
-
-    if filename:
+    if system == 'Darwin':
         try:
-            if filename.endswith('.mp4'):
-                Writer = animation.writers['ffmpeg']
-                ani.save(filename, writer=Writer(fps=fps))
-            elif filename.endswith('.gif'):
-                ani.save(filename, writer='pillow', fps=fps)
-            else:                       # HTML for notebooks
-                with open(filename, 'w') as f:
-                    f.write(ani.to_jshtml())
-            print(f"Saved animation to {filename}")
-        except (KeyError, RuntimeError):   # FFmpeg unavailable
-            print("⚠️  FFmpeg not found – falling back to GIF via Pillow")
-            ani.save(filename.replace('.mp4', '.gif'), writer='pillow', fps=fps)
-    else:
-        plt.show()
+            res = subprocess.run(['ffmpeg', '-encoders'], capture_output=True, text=True)
+            if 'h264_videotoolbox' in res.stdout:
+                return ['-c:v', 'h264_videotoolbox', '-b:v', '40M', '-allow_sw', '1']
+        except Exception:
+            pass
+            
+    # return ['-c:v', 'h264_nvenc', '-preset', 'fast', '-b:v', '20M']
+    return ['-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p']
 
-    plt.close(fig)
-    return ani
+def tile_images(data_t, cols=8, padding=2, pad_value=std_np.nan):
+    """
+    Tiles (S, H, W) -> Single Grid.
+    Centers the fields by splitting 'padding' evenly.
+    """
+    S, H, W = data_t.shape
+    rows = int(std_np.ceil(S / cols))
+    
+    # Pad species dimension
+    pad_count = (rows * cols) - S
+    if pad_count > 0:
+        extra = std_np.full((pad_count, H, W), pad_value, dtype=data_t.dtype)
+        data_t = std_np.concatenate([data_t, extra], axis=0)
+        
+    # Spatial Padding (Centered)
+    if padding > 0:
+        p_half = padding // 2
+        p_rest = padding - p_half
+        data_t = std_np.pad(data_t, 
+                            ((0,0), (p_half, p_rest), (p_half, p_rest)), 
+                            mode='constant', constant_values=pad_value)
+        H += padding
+        W += padding
 
-# ----------------‑‑ main --------------------------------------------
+    # Reshape to grid
+    grid = data_t.reshape(rows, cols, H, W)
+    grid = grid.transpose(0, 2, 1, 3) 
+    grid = grid.reshape(rows * H, cols * W)
+    
+    return grid
+
+def animate_spatial(traj, title='', filename=None, fps=30, padding=2):
+    """
+    Generates a 4K colored movie.
+    Dynamically calculates layout rows to fit 16:9 TV aspect ratio
+    based on the shape (Nx, Ny) of the species fields.
+    """
+    if filename is None: return
+    if shutil.which("ffmpeg") is None:
+        logger.error("FFmpeg not found.")
+        return
+
+    traj = to_cpu(traj)
+    if hasattr(traj, "numpy"): traj = traj.numpy()
+        
+    T, S, H, W = traj.shape
+    
+    # --- DYNAMIC TV LAYOUT ---
+    # We want (Cols * Width) / (Rows * Height) ~= 1.77
+    # Solve for Rows: Rows = (Cols * Width) / (Height * 1.77)
+    
+    eff_w = W + padding
+    eff_h = H + padding
+    
+    calc_rows = int(std_np.round((MAX_COLS * eff_w) / (eff_h * TARGET_ASPECT)))
+    calc_rows = max(1, calc_rows) # Ensure at least 1 row
+    
+    max_display = MAX_COLS * calc_rows
+    
+    if S > max_display:
+        logger.warning(f"Too many species ({S}). Truncating to {max_display} to fit TV layout (based on {W}x{H} fields).")
+        traj = traj[:, :max_display]
+        S = max_display
+        
+    cols = min(MAX_COLS, S)
+    rows = int(std_np.ceil(S / cols))
+    
+    # Input dimensions
+    in_w = cols * eff_w
+    in_h = rows * eff_h
+    
+    # Sanitize & Normalize
+    traj = std_np.nan_to_num(traj, nan=0.0, posinf=0.0, neginf=0.0)
+    v_max = std_np.percentile(traj, 99.9) if traj.max() > 0 else 1.0
+    if v_max == 0: v_max = 1.0
+    
+    cmap = matplotlib.colormaps['viridis']
+    
+    logger.info(f"Rendering {filename}")
+    logger.info(f"Geometry: {W}x{H} fields. Layout: {rows}x{cols}. Upscaling to 4K.")
+
+    encoder_args = get_ffmpeg_encoder_args()
+    
+    cmd = [
+        'ffmpeg',
+        '-y',
+        '-f', 'rawvideo',
+        '-vcodec', 'rawvideo',
+        '-s', f'{in_w}x{in_h}',
+        '-pix_fmt', 'rgb24',
+        '-r', str(fps),
+        '-i', '-',
+        '-an',
+        '-vf', 'scale=3840:-2:flags=neighbor,format=yuv420p',
+        *encoder_args,
+        filename
+    ]
+    
+    process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    
+    try:
+        for t in range(T):
+            grid = tile_images(traj[t], cols=cols, padding=padding, pad_value=std_np.nan)
+            
+            is_pad = std_np.isnan(grid)
+            
+            grid_safe = std_np.nan_to_num(grid, nan=0.0)
+            grid_norm = std_np.clip(grid_safe / v_max, 0.0, 1.0)
+            
+            rgba = cmap(grid_norm) 
+            frame_rgb = (rgba[..., :3] * 255).astype(std_np.uint8)
+            frame_rgb[is_pad] = [255, 255, 255]
+            
+            process.stdin.write(frame_rgb.tobytes())
+            
+            if t % 100 == 0:
+                logger.debug(f"Frame {t}/{T}")
+
+        process.stdin.close()
+        process.wait()
+        
+        if process.returncode != 0:
+            logger.error(f"FFmpeg Error: {process.stderr.read().decode('utf-8')}")
+        else:
+            logger.info(f"Saved {filename}")
+            
+    except Exception as e:
+        logger.error(f"Movie gen failed: {e}")
+        try: process.kill()
+        except: pass
+
 if __name__ == '__main__':
-    t_psd, traj_psd = run_psd2()
-    animate_spatial(traj_psd, 'PSD2 spatial dynamics', filename='psd2_rps.mp4')
-
-    t_ibm, traj_ibm = run_ibm()
-    animate_spatial(traj_ibm, 'IBM spatial dynamics', filename='ibm_rps.mp4')
-    # animate_spatial(traj_ibm, 'IBM spatial dynamics', filename='ibm_rps.gif')
+    # Test 1: Wide strips (should allow many rows)
+    print("Test 1: Wide fields (100x10)")
+    data_wide = std_np.random.rand(30, 80, 10, 100).astype(std_np.float32)
+    animate_spatial(data_wide, filename="test_wide.mp4", fps=30)
+    
+    # Test 2: Tall strips (should limit rows)
+    print("Test 2: Tall fields (10x100)")
+    data_tall = std_np.random.rand(30, 20, 100, 10).astype(std_np.float32)
+    animate_spatial(data_tall, filename="test_tall.mp4", fps=30)
