@@ -5,25 +5,20 @@
 import sys
 import logging
 from accelerator import np # PyTorch Shim
-import numpy as _cpu_numpy # Standard Numpy for CPU-side control flow
+import numpy as _cpu_numpy 
 from typing import Optional
-
-# Replaced Assimulo with local solver compatible with Accelerator
 from euler_simple_safe import Explicit_Problem, EulerSimpleSafe
 from environment import generate_spatial_r
 import math
-
 from config import (
     BODY_MASS, MORTALITY_RATE, TMAX, RECORDING_STEP_SIZE,
     NUM_PATCHES_X, NUM_PATCHES_Y, DISPERSAL_RATE, LONG_DISTANCE_PROB,
     CONNECTANCE, INTERACTION_STRENGTH, LOG_B_CAP, RTOL, ATOL, STEP_SIZE
 )
-
 from dispersal import compute_dispersal, LOCAL_DISPERSAL_MATRIX
 
 logger = logging.getLogger(__name__)
 
-# FLOAT32 SAFETY CONSTANT
 SAFE_MIN_B = 1e-30 
 
 class PSD2Model:
@@ -31,10 +26,9 @@ class PSD2Model:
                  initial_B=None, initial_wait=None, initial_clock=None,
                  n_new: int = 0, r_field=None, length_scale=None, var_r=None,
                  seed_field=None, tmax=None, record_step=None, 
-                 seed=123, # Reverted default to match orig
+                 seed=123, 
                  dispersal_type='propagule', dispersal_away_rate=None):
 
-        # Restored seed reset
         np.random.seed(seed) 
 
         self.S = len(r)
@@ -43,7 +37,6 @@ class PSD2Model:
         self.shape_flat = (self.S, self.N_patches)
         
         if C is None:
-            # Use global rng for structure generation
             C = np.eye(self.S, dtype=float)
             mask = np.random.rand(self.S, self.S) < CONNECTANCE
             C[mask] = INTERACTION_STRENGTH * np.random.rand(np.count_nonzero(mask))
@@ -64,12 +57,10 @@ class PSD2Model:
         self.tmax = tmax if tmax is not None else TMAX
         self.record_step = record_step if record_step is not None else RECORDING_STEP_SIZE
 
-        # --- 3. Initial State ---
         if initial_B is not None:
             flat_B = initial_B.reshape(self.S, -1)
             flat_B = np.asarray(flat_B, dtype=float)
             self.logB = np.log(np.maximum(flat_B, SAFE_MIN_B, dtype=np.float64))
-            # self.logB = np.minimum(self.logB, LOG_B_CAP)
         else:
             init_biomass = BODY_MASS / 10.0
             self.logB = np.full(self.shape_flat, np.log(init_biomass))
@@ -90,14 +81,11 @@ class PSD2Model:
         else:
             self.dispersal_away_rate = np.asarray(LOCAL_DISPERSAL_MATRIX.sum(axis=0)).flatten()
 
-        # --- Initial Consistency Check ---
         current_B = np.exp(self.logB)
         local_growth, non_self_growth = self._compute_local_growth(current_B)
-        
         inconsistent_waiting = self.waiting & (non_self_growth < 0)
-        if np.any(inconsistent_waiting):
-            self.waiting[inconsistent_waiting] = False
-            self.poisson_clock[inconsistent_waiting] = 1.0
+        self.waiting = np.where(inconsistent_waiting, False, self.waiting)
+        self.poisson_clock = np.where(inconsistent_waiting, 1.0, self.poisson_clock)
 
         if n_new > 0:
             self._attempt_initial_establishment(n_new, current_B, local_growth)
@@ -114,7 +102,7 @@ class PSD2Model:
         self.invasion_rate_traj = np.zeros(out_shape, dtype=np.float32)
         self.establishment_prob_traj = np.zeros(out_shape, dtype=np.float32)
 
-        logger.info(f"PSD2Model initialized: S={self.S}, Patches={self.N_patches}")
+        logger.info(f"PSD2Model initialized: S={self.S}, Patches={self.N_patches} (Fully Asynchronous)")
 
     def _compute_local_growth(self, B):
         competitive_loss = self.C @ B 
@@ -126,54 +114,40 @@ class PSD2Model:
         return local_growth, non_self_growth
 
     def _compute_dispersal_input(self, B):
-        # FIX: Do not move to CPU. Keep B on device.
-        # B is (S, N). Reshape to (S, Y, X) for dispersal.py logic
-        B_3d = B.reshape(self.shape_2d)
-        
-        # Compute on GPU (since B is GPU tensor and LOCAL_DISPERSAL_MATRIX is GPU tensor)
-        incoming_3d = compute_dispersal(B_3d)
-        
-        return incoming_3d.reshape(self.S, -1)
+        return compute_dispersal(B.reshape(self.shape_2d)).reshape(self.S, -1)
 
     def _get_est_prob(self, growth_rate):
         denom = growth_rate + MORTALITY_RATE
         if self.dispersal_type == 'adult':
             denom += self.dispersal_away_rate[None, :]
-        prob = np.where(growth_rate > 0, growth_rate / denom, 0.0)
-        return prob
+        return np.where(growth_rate > 0, growth_rate / denom, 0.0)
 
     def _attempt_initial_establishment(self, n_new, current_B, local_growth):
         for j in range(self.S - n_new, self.S):
             g = local_growth[j]
             pos_mask = g > 0
+            denom = g + MORTALITY_RATE
+            if self.dispersal_type == 'adult': denom += self.dispersal_away_rate
             
-            est = np.zeros_like(g)
-            denom = g[pos_mask] + MORTALITY_RATE
-            if self.dispersal_type == 'adult':
-                denom += self.dispersal_away_rate[pos_mask]
-            
-            est[pos_mask] = g[pos_mask] / denom
-            est = 1.0 - (1.0 - est)**(current_B[j] / BODY_MASS)
-            
+            valid_est = np.divide(g, denom)
+            est = np.where(pos_mask, 1.0 - (1.0 - valid_est)**(current_B[j] / BODY_MASS), 0.0)
+
             rnd = np.random.rand(*est.shape)
             est_failures = (rnd > est) & pos_mask
             est_successes = (~est_failures) & pos_mask
             
-            self.waiting[j][est_failures] = True
-            n_fail = np.count_nonzero(est_failures)
-            self.poisson_clock[j][est_failures] = np.log(np.random.rand(n_fail))
-            
-            self.logB[j][est_successes] = np.clip(
-                self.logB[j][est_successes] - np.log(np.maximum(est[est_successes], 1e-10)),
-                None, LOG_B_CAP
-            )
+            self.waiting[j] = np.where(est_failures, True, self.waiting[j])
+            new_clocks = np.log(np.random.rand(*self.poisson_clock[j].shape))
+            self.poisson_clock[j] = np.where(est_failures, new_clocks, self.poisson_clock[j])
+
+            new_logB = self.logB[j] - np.log(np.maximum(est, 1e-10))
+            self.logB[j] = np.where(est_successes, np.clip(new_logB, None, LOG_B_CAP), self.logB[j])
 
     def _derivatives(self, t, y, sw):
         total = self.S * self.N_patches
         logB = y[:total].reshape(self.S, -1)
         pclock = y[total:].reshape(self.S, -1)
         
-        # Float32 Safety Clamp
         logB_clamped = np.minimum(logB, LOG_B_CAP)
         B = np.exp(logB_clamped)
         safeB = np.maximum(B, SAFE_MIN_B)
@@ -185,12 +159,11 @@ class PSD2Model:
         invasion_pressure = np.clip(invasion_pressure, 0.0, 10.0)
 
         dlogB = local_growth + invasion_pressure
-
-        sw_mask = np.array(sw, dtype=bool).reshape(self.S, -1)
+        sw_mask = sw.reshape(self.S, -1)
         
-        dlogB[sw_mask] = -np.maximum(0, non_self_growth[sw_mask]) + \
-            invasion_pressure[sw_mask]
-        
+        # Branchless sw logic
+        dlogB_sw = -np.maximum(0, non_self_growth) + invasion_pressure
+        dlogB = np.where(sw_mask, dlogB_sw, dlogB)
         dlogB = np.clip(dlogB, None, 10.0)
 
         est_prob = self._get_est_prob(non_self_growth)
@@ -206,111 +179,90 @@ class PSD2Model:
         logB_clamped = np.minimum(logB, LOG_B_CAP)
         B = np.exp(logB_clamped)
 
-        local_growth, non_self_growth = self._compute_local_growth(B)
+        _, non_self_growth = self._compute_local_growth(B)
         return np.concatenate([non_self_growth.flatten(), pclock.flatten()])
 
     def _handle_event_fn(self, solver, event_info):
+        """
+        FULLY OPTIMIZED: No 'np.any()' checks. 
+        Always calculates the sweep logic. 
+        """
         total = self.S * self.N_patches
         y_vec = solver.y
         logB = y_vec[:total].reshape(self.S, -1)
         pclock = y_vec[total:].reshape(self.S, -1)
-        sw = np.array(solver.sw, dtype=bool).reshape(self.S, -1)
+        sw = solver.sw.reshape(self.S, -1)
         
         logB_clamped = np.minimum(logB, LOG_B_CAP)
         B = np.exp(logB_clamped)
         
-        # --- FIX START: Restore explicit event direction parsing ---
-        # The AI version collapsed rootsfound into a boolean, losing the sign.
-        # We need the sign (+1 or -1) to distinguish "Growth becoming Positive" 
-        # from "Growth becoming Negative".
-        
-        # 1. Retrieve the raw event flags (ints)
         rootsfound = np.asarray(event_info[0], dtype=int)
-        
-        # 2. Split into Growth events and Clock events
         growth_evts = rootsfound[:total].reshape(self.S, -1)
         clock_evts = rootsfound[total:].reshape(self.S, -1)
         
-        local_growth, non_self_growth = self._compute_local_growth(B)
+        _, non_self_growth = self._compute_local_growth(B)
         
-        # Case A: Growth becomes NEGATIVE (pos -> neg)
-        # Event flag should be -1 (if defined as crossing 0 downwards) or we check logic
-        # Original code used (growth_evts == -1). 
-        # We strictly check for the specific transition flag + current state.
+        # A. Growth -> Neg
         mask_S_to_P = (growth_evts == -1) & sw
-        
-        if np.any(mask_S_to_P):
-            sw[mask_S_to_P] = False
-            pclock[mask_S_to_P] = 1.0 
+        sw = np.where(mask_S_to_P, False, sw)
+        pclock = np.where(mask_S_to_P, 1.0, pclock)
 
-        # Case B: Growth becomes POSITIVE (neg -> pos) -> SWEEP
-        # Event flag should be +1.
-        # CRITICAL FIX: Do not rely on 'non_self_growth > 0' alone, 
-        # which can be noisy at the zero boundary. Rely on the solver's detected crossing.
+        # B. Growth -> Pos (Sweep)
         mask_sweep = (growth_evts == 1) & (~sw)
         
-        if np.any(mask_sweep):
-            yd = self._derivatives(solver.t, solver.y, solver.sw)
-            dlogB = yd[:total].reshape(self.S, -1)
-            dlogB[mask_sweep] = 0.0
-            
-            prod = B * dlogB
-            c_vals = -(self.C @ prod)
-            
-            eps = SAFE_MIN_B
-            denom = BODY_MASS * (1.0 + np.sqrt(np.pi / (2.0 * np.maximum(c_vals, eps))) * MORTALITY_RATE)
-            
-            prob_remain_S = np.zeros_like(c_vals)
-            valid_sweep = (c_vals > 0) & mask_sweep
-            
-            if np.any(valid_sweep):
-                prob_remain_S[valid_sweep] = np.exp(-B[valid_sweep] / denom[valid_sweep])
-                
-            rnd = np.random.rand(*B.shape)
-            failed_sweep = valid_sweep & (rnd <= prob_remain_S)
-            successful_sweep = valid_sweep & (rnd > prob_remain_S)
-            
-            if np.any(successful_sweep):
-                offset = -np.log1p(-prob_remain_S[successful_sweep])
-                logB[successful_sweep] = np.minimum(0.0, logB[successful_sweep] + offset)
-            
-            if np.any(failed_sweep):
-                 sw[failed_sweep] = True 
-                 n_fail = np.count_nonzero(failed_sweep)
-                 pclock[failed_sweep] = np.log(np.random.rand(n_fail))
-
-        # Case C: Clock Events (S -> D)
-        # Event flag should be +1 (crossing 0 upwards) or similar. 
-        # Original code used (clock_evts == 1).
-        mask_clock = (clock_evts == 1) & sw
+        # --- REMOVED 'if np.any(mask_sweep)' ---
+        # Unconditional calculation keeps GPU pipeline full.
+        yd = self._derivatives(solver.t, solver.y, solver.sw)
+        dlogB_deriv = yd[:total].reshape(self.S, -1)
         
-        if np.any(mask_clock):
-            est_prob = self._get_est_prob(non_self_growth)
-            valid_est = mask_clock & (est_prob > 0)
-            
-            if np.any(valid_est):
-                val = np.divide(BODY_MASS, est_prob[valid_est])
-                val = np.minimum(val, BODY_MASS) 
-                logB[valid_est] = np.log(val)
-                pclock[valid_est] = 1.0 
-                sw[valid_est] = False 
-            
-            invalid_est = mask_clock & (est_prob <= 0)
-            if np.any(invalid_est):
-                pclock[invalid_est] = 1.0 
-                sw[invalid_est] = False   
+        prod = B * np.where(mask_sweep, 0.0, dlogB_deriv)
+        c_vals = -(self.C @ prod)
+        
+        eps = SAFE_MIN_B
+        denom = BODY_MASS * (1.0 + np.sqrt(np.pi / (2.0 * np.maximum(c_vals, eps))) * MORTALITY_RATE)
+        prob_remain_S = np.exp(-B / denom)
+        
+        rnd = np.random.rand(*B.shape)
+        valid_sweep_mask = (c_vals > 0) & mask_sweep
+        
+        failed_sweep = valid_sweep_mask & (rnd <= prob_remain_S)
+        successful_sweep = valid_sweep_mask & (rnd > prob_remain_S)
+        
+        offset = -np.log1p(-prob_remain_S)
+        new_logB = np.minimum(0.0, logB + offset)
+        logB = np.where(successful_sweep, new_logB, logB)
+        
+        sw = np.where(failed_sweep, True, sw)
+        new_clocks = np.log(np.random.rand(*B.shape))
+        pclock = np.where(failed_sweep, new_clocks, pclock)
+        # ---------------------------------------
 
-        # Write back to solver
+        # C. Clock
+        mask_clock = (clock_evts == 1) & sw
+        est_prob = self._get_est_prob(non_self_growth)
+        
+        valid_est = mask_clock & (est_prob > 0)
+        val = np.divide(BODY_MASS, est_prob + 1e-20)
+        val = np.minimum(val, BODY_MASS)
+        
+        logB = np.where(valid_est, np.log(val), logB)
+        pclock = np.where(valid_est, 1.0, pclock)
+        sw = np.where(valid_est, False, sw)
+        
+        invalid_est = mask_clock & (est_prob <= 0)
+        pclock = np.where(invalid_est, 1.0, pclock)
+        sw = np.where(invalid_est, False, sw)
+
         solver.y[:total] = logB.ravel()
         solver.y[total:] = pclock.ravel()
-        solver.sw = sw.ravel().tolist()
+        solver.sw = sw.ravel()
         return solver.y
     
     def run(self):
-        logger.info("Starting PSD2 simulation (Plug-in)...")
+        logger.info("Starting PSD2 simulation (No Sync / Streamlined)...")
         
         y0 = np.concatenate([self.logB.flatten(), self.poisson_clock.flatten()])
-        sw0 = self.waiting.flatten().tolist()
+        sw0 = self.waiting.flatten() 
         
         problem = Explicit_Problem(self._derivatives, y0, t0=0.0, sw0=sw0)
         problem.state_events = self._event_fn
@@ -319,19 +271,11 @@ class PSD2Model:
         solver = EulerSimpleSafe(problem)
         solver.options['inith'] = STEP_SIZE
 
-        # 1. Device tensor for storing results
-        t_eval = np.arange(0, self.tmax + self.record_step, self.record_step)
-        self.time_points = t_eval
-        
-        # 2. Host array for controlling the loop (CRITICAL FIX)
         t_eval_host = _cpu_numpy.arange(0, self.tmax + self.record_step, self.record_step)
         
-        # Simulate using CPU time points
         t_out, y_out = solver.simulate(self.tmax, ncp_list=t_eval_host)
         
         total = self.S * self.N_patches
-        
-        # Post-processing loop using CPU control flow
         for i, t in enumerate(t_eval_host):
             idx = _cpu_numpy.abs(t_out - t).argmin()
             y_curr = y_out[idx]
@@ -343,10 +287,8 @@ class PSD2Model:
             B = np.exp(logB_clamped)
             local_g, non_self_g = self._compute_local_growth(B)
             
-            # Recalculate full dispersal for recording
             inv_flux = self._compute_dispersal_input(B)
             est_prob = self._get_est_prob(non_self_g)
-            
             inv_rate = inv_flux * est_prob / BODY_MASS
             
             self.trajectory[i] = B.reshape(self.shape_2d)
@@ -354,17 +296,7 @@ class PSD2Model:
             self.growth_rate_traj[i] = non_self_g.reshape(self.shape_2d)
             self.invasion_rate_traj[i] = inv_rate.reshape(self.shape_2d)
             self.establishment_prob_traj[i] = est_prob.reshape(self.shape_2d)
-            
             self.wait_trajectory[i] = (pclock < 0).reshape(self.shape_2d)
 
         logger.info("PSD2 simulation completed.")
-        
-        return (
-            self.time_points,
-            self.trajectory,
-            self.wait_trajectory,
-            self.poisson_clock_traj,
-            self.growth_rate_traj,
-            self.invasion_rate_traj,
-            self.establishment_prob_traj
-        )
+        return (self.time_points, self.trajectory, self.wait_trajectory, self.poisson_clock_traj, self.growth_rate_traj, self.invasion_rate_traj, self.establishment_prob_traj)

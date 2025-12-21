@@ -1,9 +1,10 @@
-# accelerator.py -----------------------------------------------------------
+############################################
+# accelerator.py
+############################################
 import os
 import sys
 
-# CONFIGURATION
-ENABLE_GPU = True
+from config import ENABLE_GPU
 
 has_cuda = False
 has_mps = False
@@ -90,57 +91,48 @@ if ENABLE_GPU and (has_cuda or has_mps):
 
         def poisson(self, lam, size=None):
             """
-            Robust Poisson Generation (Vectorized).
-            Returns LongTensor (Integers), matching numpy behavior.
+            Branchless Poisson for MPS/M4.
+            Computes BOTH Normal Approx and Exact Inverse Transform for ALL elements,
+            then selects the valid one on GPU. Wastes FLOPs to save Latency.
             """
-            # Ensure calculations happen in Float
             lam_t = _as_tensor(lam).float()
             if size is not None: lam_t = lam_t.expand(size)
             
-            # Output buffer: Long (Integer) to match numpy.random.poisson
-            result = torch.zeros(lam_t.shape, device=lam_t.device, dtype=torch.long)
-            
-            # --- 1. Identify Regimes ---
-            THRESHOLD = 30.0
-            mask_approx = (lam_t > THRESHOLD)
-            mask_exact = (~mask_approx) & (lam_t > 0)
-            
-            # --- 2. Large Lambda: Normal Approximation ---
-            if mask_approx.any():
-                lam_large = lam_t[mask_approx]
-                sigma = torch.sqrt(lam_large)
-                sample = torch.normal(lam_large, sigma).round()
-                # Cast to Long for assignment
-                result[mask_approx] = torch.clamp(sample, min=0.0).long()
+            # 1. Normal Approximation (Always Valid, but inaccurate for small lam)
+            # We use abs() to prevent NaN if lam < 0 during transient states
+            sigma = torch.sqrt(torch.abs(lam_t)) 
+            res_normal = torch.normal(lam_t, sigma).round().long()
+            res_normal = torch.clamp(res_normal, min=0)
 
-            # --- 3. Small Lambda: Vectorized Inverse Transform Sampling ---
-            if mask_exact.any():
-                lam_small = lam_t[mask_exact]
-                num_small = lam_small.shape[0]
-                
-                K_MAX = 64
-                k = torch.arange(K_MAX, device=lam_t.device).unsqueeze(0) # (1, 64)
-                lam_exp = lam_small.unsqueeze(1) # (N, 1)
-                
-                # PMF in Log Space
-                log_pmf = (k * torch.log(lam_exp + 1e-30)) - lam_exp - torch.lgamma(k + 1.0)
-                cdf = torch.cumsum(torch.exp(log_pmf), dim=1)
-                
-                # Inverse Transform
-                u = torch.rand((num_small, 1), device=lam_t.device)
-                counts = (cdf < u).sum(dim=1) # Boolean sum returns Long/Int
-                
-                result[mask_exact] = counts.long()
-
-            return result
+            # 2. Exact Inverse Transform Sampling (Vectorized)
+            # We use a fixed expansion of K=128. This covers Lambda up to ~80 safely.
+            # Our threshold is 30, so this is plenty.
+            K_MAX = 128
+            
+            # (N, 1)
+            lam_flat = lam_t.unsqueeze(-1) 
+            # (1, 128)
+            k = torch.arange(K_MAX, device=lam_t.device, dtype=torch.float32).unsqueeze(0)
+            
+            # Log PMF: k*ln(lam) - lam - ln(k!)
+            # Add epsilon to lam to avoid log(0)
+            log_pmf = (k * torch.log(lam_flat + 1e-30)) - lam_flat - torch.lgamma(k + 1.0)
+            cdf = torch.cumsum(torch.exp(log_pmf), dim=-1)
+            
+            # Draw uniforms: (N, 1)
+            u = torch.rand(lam_flat.shape, device=lam_t.device)
+            # Count how many steps in CDF we passed
+            res_exact = (cdf < u).sum(dim=-1).long()
+            
+            # 3. Branchless Selection
+            # If Lambda > 30, use Normal. Else use Exact.
+            # No CPU Sync.
+            return torch.where(lam_t > 30.0, res_normal, res_exact)
 
         def binomial(self, n, p, size=None):
             """
-            Robust Binomial Generation (Vectorized).
-            Handles three regimes for maximum accuracy and speed:
-            1. Small N: Exact Bernoulli trials (Exact).
-            2. Large N, Small p (Rare events): Poisson Approximation.
-            3. Large N, Large p: Normal Approximation.
+            Branchless Binomial for MPS/M4.
+            Computes Normal, Poisson, and Exact branches for ALL elements.
             """
             n_in = _as_tensor(n)
             p_in = _as_tensor(p)
@@ -149,77 +141,64 @@ if ENABLE_GPU and (has_cuda or has_mps):
                 n_in = n_in.expand(size)
                 p_in = p_in.expand(size)
 
-            # Cast to Float for Probability Calculations
             n_float = n_in.float()
             p_float = p_in.float()
             
-            # Output buffer: Long (Integer) to match numpy behavior
-            result = torch.zeros(n_float.shape, device=n_float.device, dtype=torch.long)
-            
-            # --- thresholds ---
-            # N_CUTOFF: below this, we simulate every individual coin flip (exact)
-            N_CUTOFF = 30.0 
-            # LAM_CUTOFF: above this (Np > 30), Normal approx is safe. 
-            # Below this (Np < 30 but N is large), we use Poisson limit.
+            # Thresholds
+            N_CUTOFF = 30.0
             LAM_CUTOFF = 30.0
-            
-            # --- 1. Identify Regimes ---
-            # Calculate expected value (lambda)
             lam = n_float * p_float
             
-            mask_exact = (n_float <= N_CUTOFF) & (n_float > 0)
-            
-            # Large N, but small expectation -> Poisson Limit (The missing case)
-            mask_poisson = (n_float > N_CUTOFF) & (lam <= LAM_CUTOFF)
-            
-            # Large N, large expectation -> Normal Limit
-            mask_normal = (n_float > N_CUTOFF) & (lam > LAM_CUTOFF)
-            
-            # --- 2. Large N / Large P: Normal Approximation ---
-            if mask_normal.any():
-                n_large = n_float[mask_normal]
-                p_large = p_float[mask_normal] if p_float.numel() > 1 else p_float
-                
-                mu = n_large * p_large
-                sigma = torch.sqrt(mu * (1.0 - p_large) + 1e-6)
-                
-                sample = torch.normal(mu, sigma).round()
-                sample = torch.clamp(sample, min=0.0)
-                
-                # Clamp to N (you can't have more successes than trials)
-                final_est = torch.min(sample, n_large)
-                result[mask_normal] = final_est.long()
+            # --- Branch 1: Normal Approx (Large N, Large P) ---
+            sigma = torch.sqrt(lam * (1.0 - p_float) + 1e-6)
+            res_normal = torch.normal(lam, sigma).round().long()
+            res_normal = torch.clamp(res_normal, min=0)
+            res_normal = torch.min(res_normal, n_in) # Cap at N
 
-            # --- 3. Large N / Small P: Poisson Approximation ---
-            # This handles the "Rare Event" regime efficiently.
-            if mask_poisson.any():
-                lam_subset = lam[mask_poisson]
-                
-                # Reuse our robust poisson method to ensure small lambda is handled exactly
-                # This handles the "Poisson(0.1)" vs "Poisson(25)" cases correctly
-                val = self.poisson(lam_subset)
-                
-                # Clamp result to N (Poisson theoretically can exceed N, though unlikely if p is small)
-                val = torch.min(val, n_float[mask_poisson].long())
-                result[mask_poisson] = val
+            # --- Branch 2: Poisson Approx (Large N, Small P) ---
+            # Reuse our branchless poisson from above
+            res_poisson = self.poisson(lam)
+            res_poisson = torch.min(res_poisson, n_in)
 
-            # --- 4. Small N: Vectorized Sum of Bernoullis ---
-            if mask_exact.any():
-                n_small = n_float[mask_exact]
-                p_small = p_float[mask_exact] if p_float.numel() > 1 else p_float
-                num_small = n_small.shape[0]
-                
-                max_trials = int(N_CUTOFF)
-                # Create a stack of uniforms: shape (num_small_patches, 30)
-                uniforms = torch.rand((num_small, max_trials), device=n_float.device)
-                
-                indices = torch.arange(max_trials, device=n_float.device).unsqueeze(0)
-                valid_trials = indices < n_small.unsqueeze(1)
-                
-                successes = (uniforms < p_small.unsqueeze(1)) & valid_trials
-                result[mask_exact] = successes.sum(dim=1).long()
+            # --- Branch 3: Exact Bernoulli (Small N) ---
+            # We simulate 30 coin flips for EVERYONE.
+            # If N > 30, this result is garbage (capped at 30), but masked out later.
+            MAX_FLIPS = 30
+            
+            # Expand to (..., 30)
+            # u: Random numbers [0,1]
+            u_flips = torch.rand(n_float.shape + (MAX_FLIPS,), device=n_float.device)
+            
+            # Trial indices: (1, 30)
+            idx = torch.arange(MAX_FLIPS, device=n_float.device).unsqueeze(0)
+            
+            # Active trials mask: only count flips where trial_index < n
+            # (..., 1)
+            n_broad = n_float.unsqueeze(-1)
+            p_broad = p_float.unsqueeze(-1)
+            
+            active_mask = idx < n_broad
+            success_mask = (u_flips < p_broad) & active_mask
+            res_exact = success_mask.sum(dim=-1).long()
 
-            return result
+            # --- Branchless Selection ---
+            # Condition 1: Use Exact if N <= 30
+            # Condition 2: Use Poisson if N > 30 AND Lam <= 30
+            # Condition 3: Otherwise Normal
+            
+            is_small_n = n_float <= N_CUTOFF
+            is_rare    = (n_float > N_CUTOFF) & (lam <= LAM_CUTOFF)
+            
+            # Nested Where: 
+            # If Small N -> Exact
+            # Else If Rare -> Poisson
+            # Else -> Normal
+            final = torch.where(
+                is_small_n, 
+                res_exact, 
+                torch.where(is_rare, res_poisson, res_normal)
+            )
+            return final.long()
         
         def choice(self, a, size=None, replace=True, p=None):
             if isinstance(a, int):
