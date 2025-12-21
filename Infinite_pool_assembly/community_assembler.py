@@ -33,10 +33,8 @@ class StepwiseAssembler(abc.ABC):
                  init_state=None, init_r=None, init_C=None,
                  init_attempts=0, init_round=-1, **model_kw):
 
-        # <--- CHANGE START: Use CPU Generator to decouple from Global/Torch RNG
-        # self.rng = np.random.default_rng(seed) 
+        # Use CPU Generator to decouple from Global/Torch RNG
         self.rng = _real_numpy.random.default_rng(seed)
-        # <--- CHANGE END
 
         self.base_r = base_r
         self.frac_multi = frac_multi
@@ -227,14 +225,11 @@ class IBMAssembler(StepwiseAssembler):
     def _prepare_state_for_window(self, current_N, n_cand):
         current_N = sim_utils.to_host(current_N)
         
-        # --- FIX: Ensure 3D shape ---
         if current_N.ndim == 2:
-            import numpy as _real_np
-            current_N = current_N[_real_np.newaxis, :, :]
+            current_N = current_N[_real_numpy.newaxis, :, :]
             
         S_curr, Y, X = current_N.shape
-        import numpy as _real_np 
-        N_big = _real_np.zeros((S_curr + n_cand, Y, X), dtype=int)
+        N_big = _real_numpy.zeros((S_curr + n_cand, Y, X), dtype=int)
         N_big[:S_curr] = current_N
         for i in range(n_cand):
             patches = self.rng.choice(NUM_PATCHES_Y * NUM_PATCHES_X, min(self.seed_size, NUM_PATCHES_Y * NUM_PATCHES_X), replace=False)
@@ -247,6 +242,8 @@ class IBMAssembler(StepwiseAssembler):
         with open("IBM_biomass_value.txt", "a") as f:
             valid_B = B[B > 0.01]
             if len(valid_B) > 0: np.savetxt(f, valid_B, fmt='%f')
+            
+        # Do not pass a seed that resets the generator. Let global stream flow.
         model = IBMModel(r_big, C_big, initial_N=N_big, **self.model_kw)
         model.run()
         return sim_utils.to_host(model.N)
@@ -276,7 +273,6 @@ class PSD2Assembler(StepwiseAssembler):
         return r, C, (B, W, PC)
 
     def _prepare_state_for_window(self, current_state, n_cand):
-        import numpy as _real_np
         B_curr, W_curr, PC_curr = [sim_utils.to_host(x) for x in current_state]
         
         # Strip potential Time dimension
@@ -284,20 +280,22 @@ class PSD2Assembler(StepwiseAssembler):
         if W_curr.ndim == 4: W_curr = W_curr[-1]
         if PC_curr.ndim == 4: PC_curr = PC_curr[-1]
         
-        # --- FIX: Ensure 3D (Species, Y, X) if squeezed ---
-        if B_curr.ndim == 2: B_curr = B_curr[_real_np.newaxis, :, :]
-        if W_curr.ndim == 2: W_curr = W_curr[_real_np.newaxis, :, :]
-        if PC_curr.ndim == 2: PC_curr = PC_curr[_real_np.newaxis, :, :]
+        # Ensure 3D (Species, Y, X) if squeezed
+        if B_curr.ndim == 2: B_curr = B_curr[_real_numpy.newaxis, :, :]
+        if W_curr.ndim == 2: W_curr = W_curr[_real_numpy.newaxis, :, :]
+        if PC_curr.ndim == 2: PC_curr = PC_curr[_real_numpy.newaxis, :, :]
         
         S_curr = len(B_curr)
         S_big = S_curr + n_cand
         
-        B_big = _real_np.zeros((S_big, NUM_PATCHES_Y, NUM_PATCHES_X))
+        B_big = _real_numpy.zeros((S_big, NUM_PATCHES_Y, NUM_PATCHES_X))
         B_big[:S_curr] = B_curr
-        W_big = _real_np.ones((S_big, NUM_PATCHES_Y, NUM_PATCHES_X), dtype=bool)
+        W_big = _real_numpy.ones((S_big, NUM_PATCHES_Y, NUM_PATCHES_X), dtype=bool)
         W_big[:S_curr] = W_curr
-        rand_vals = _real_np.random.random((S_big, NUM_PATCHES_Y, NUM_PATCHES_X))
-        PC_big = _real_np.log(rand_vals)
+        
+        # <--- FIX: Use self.rng (controlled CPU stream) instead of global numpy
+        rand_vals = self.rng.random((S_big, NUM_PATCHES_Y, NUM_PATCHES_X))
+        PC_big = _real_numpy.log(rand_vals)
         PC_big[:S_curr] = PC_curr
         
         for i in range(n_cand):
@@ -315,6 +313,7 @@ class PSD2Assembler(StepwiseAssembler):
             valid_B = B[B > 0.01]
             if len(valid_B) > 0: np.savetxt(f, valid_B, fmt='%f')
             
+        # Do not pass a seed that resets the generator. Let global stream flow.
         model = PSD2Model(r_big, C_big, initial_B=B_big, initial_wait=W_big, initial_clock=PC_big, n_new=n_cand, **self.model_kw)
         _, B_traj, W_traj, PC_traj, *_ = model.run()
         

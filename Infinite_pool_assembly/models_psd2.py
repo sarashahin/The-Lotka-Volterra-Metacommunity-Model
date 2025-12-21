@@ -13,7 +13,8 @@ import math
 from config import (
     BODY_MASS, MORTALITY_RATE, TMAX, RECORDING_STEP_SIZE,
     NUM_PATCHES_X, NUM_PATCHES_Y, DISPERSAL_RATE, LONG_DISTANCE_PROB,
-    CONNECTANCE, INTERACTION_STRENGTH, LOG_B_CAP, RTOL, ATOL, STEP_SIZE
+    CONNECTANCE, INTERACTION_STRENGTH, LOG_B_CAP, RTOL, ATOL, STEP_SIZE,
+    ECOLOGICAL_MAX_B
 )
 from dispersal import compute_dispersal, LOCAL_DISPERSAL_MATRIX
 
@@ -36,6 +37,10 @@ class PSD2Model:
         self.shape_2d = (self.S, NUM_PATCHES_Y, NUM_PATCHES_X)
         self.shape_flat = (self.S, self.N_patches)
         
+        # --- Caching State ---
+        self._cache_t = -1.0
+        self._cache = {}
+
         if C is None:
             C = np.eye(self.S, dtype=float)
             mask = np.random.rand(self.S, self.S) < CONNECTANCE
@@ -102,7 +107,45 @@ class PSD2Model:
         self.invasion_rate_traj = np.zeros(out_shape, dtype=np.float32)
         self.establishment_prob_traj = np.zeros(out_shape, dtype=np.float32)
 
-        logger.info(f"PSD2Model initialized: S={self.S}, Patches={self.N_patches} (Fully Asynchronous)")
+        logger.info(f"PSD2Model initialized: S={self.S}, Patches={self.N_patches} (Cached + Dense Recompute)")
+
+    def _ensure_cache(self, t, y):
+        if t == self._cache_t:
+            return
+
+        total = self.S * self.N_patches
+        logB = y[:total].reshape(self.S, -1)
+        pclock = y[total:].reshape(self.S, -1)
+        
+        # 1. Biomass reconstruction
+        logB_clamped = np.minimum(logB, LOG_B_CAP)
+        B = np.exp(logB_clamped)
+        safeB = np.maximum(B, SAFE_MIN_B)
+
+        # 2. Expensive Matrix Ops (Run Once)
+        local_growth, non_self_growth = self._compute_local_growth(B)
+        invasion_flux = self._compute_dispersal_input(B)
+        
+        # 3. Derived Ops
+        invasion_pressure = invasion_flux / safeB
+        invasion_pressure = np.clip(invasion_pressure, 0.0, 10.0)
+        est_prob = self._get_est_prob(non_self_growth)
+
+        # 4. Store
+        self._cache = {
+            'B': B,
+            'logB': logB, 
+            'pclock': pclock,
+            'local_growth': local_growth,
+            'non_self_growth': non_self_growth,
+            'invasion_flux': invasion_flux,
+            'invasion_pressure': invasion_pressure,
+            'est_prob': est_prob
+        }
+        self._cache_t = t
+
+    def _invalidate_cache(self):
+        self._cache_t = -1.0
 
     def _compute_local_growth(self, B):
         competitive_loss = self.C @ B 
@@ -144,64 +187,43 @@ class PSD2Model:
             self.logB[j] = np.where(est_successes, np.clip(new_logB, None, LOG_B_CAP), self.logB[j])
 
     def _derivatives(self, t, y, sw):
-        total = self.S * self.N_patches
-        logB = y[:total].reshape(self.S, -1)
-        pclock = y[total:].reshape(self.S, -1)
+        self._ensure_cache(t, y)
+        c = self._cache
         
-        logB_clamped = np.minimum(logB, LOG_B_CAP)
-        B = np.exp(logB_clamped)
-        safeB = np.maximum(B, SAFE_MIN_B)
-
-        invasion_flux = self._compute_dispersal_input(B)
-        local_growth, non_self_growth = self._compute_local_growth(B)
-
-        invasion_pressure = invasion_flux / safeB
-        invasion_pressure = np.clip(invasion_pressure, 0.0, 10.0)
-
-        dlogB = local_growth + invasion_pressure
+        dlogB = c['local_growth'] + c['invasion_pressure']
         sw_mask = sw.reshape(self.S, -1)
-        
-        # Branchless sw logic
-        dlogB_sw = -np.maximum(0, non_self_growth) + invasion_pressure
+        dlogB_sw = -np.maximum(0, c['non_self_growth']) + c['invasion_pressure']
         dlogB = np.where(sw_mask, dlogB_sw, dlogB)
         dlogB = np.clip(dlogB, None, 10.0)
-
-        est_prob = self._get_est_prob(non_self_growth)
-        dpclock = est_prob * (invasion_flux / BODY_MASS)
+        dpclock = c['est_prob'] * (c['invasion_flux'] / BODY_MASS)
         
         return np.concatenate([dlogB.flatten(), dpclock.flatten()])
 
     def _event_fn(self, t, y, sw):
-        total = self.S * self.N_patches
-        logB = y[:total].reshape(self.S, -1)
-        pclock = y[total:].reshape(self.S, -1)
-        
-        logB_clamped = np.minimum(logB, LOG_B_CAP)
-        B = np.exp(logB_clamped)
-
-        _, non_self_growth = self._compute_local_growth(B)
-        return np.concatenate([non_self_growth.flatten(), pclock.flatten()])
+        self._ensure_cache(t, y)
+        c = self._cache
+        return np.concatenate([c['non_self_growth'].flatten(), c['pclock'].flatten()])
 
     def _handle_event_fn(self, solver, event_info):
         """
-        FULLY OPTIMIZED: No 'np.any()' checks. 
-        Always calculates the sweep logic. 
+        Discrete event logic using cached values and optimized updates.
         """
         total = self.S * self.N_patches
-        y_vec = solver.y
-        logB = y_vec[:total].reshape(self.S, -1)
-        pclock = y_vec[total:].reshape(self.S, -1)
+        
+        self._ensure_cache(solver.t, solver.y)
+        c = self._cache
+
+        logB = c['logB'] 
+        pclock = c['pclock']
+        B = c['B']
+        
         sw = solver.sw.reshape(self.S, -1)
-        
-        logB_clamped = np.minimum(logB, LOG_B_CAP)
-        B = np.exp(logB_clamped)
-        
         rootsfound = np.asarray(event_info[0], dtype=int)
         growth_evts = rootsfound[:total].reshape(self.S, -1)
         clock_evts = rootsfound[total:].reshape(self.S, -1)
         
-        _, non_self_growth = self._compute_local_growth(B)
-        
+        state_modified = False
+
         # A. Growth -> Neg
         mask_S_to_P = (growth_evts == -1) & sw
         sw = np.where(mask_S_to_P, False, sw)
@@ -210,42 +232,65 @@ class PSD2Model:
         # B. Growth -> Pos (Sweep)
         mask_sweep = (growth_evts == 1) & (~sw)
         
-        # --- REMOVED 'if np.any(mask_sweep)' ---
-        # Unconditional calculation keeps GPU pipeline full.
+        # Reuse cached derivative logic
         yd = self._derivatives(solver.t, solver.y, solver.sw)
         dlogB_deriv = yd[:total].reshape(self.S, -1)
         
+        # Dense multiply (fast on GPU)
         prod = B * np.where(mask_sweep, 0.0, dlogB_deriv)
         c_vals = -(self.C @ prod)
         
-        eps = SAFE_MIN_B
-        denom = BODY_MASS * (1.0 + np.sqrt(np.pi / (2.0 * np.maximum(c_vals, eps))) * MORTALITY_RATE)
-        prob_remain_S = np.exp(-B / denom)
+        # --- BRANCHLESS ALGEBRAIC FIX ---
+        # 1. Calculate validity mask
+        valid_sweep = (c_vals > 0) & mask_sweep
+
+        # 2. Calculate terms EVERYWHERE (Dense)
+        # Use np.where to ensure we only take sqrt of positive numbers
+        # (Where valid_sweep is False, we use 0.0, which is safe)
+        c_safe = np.where(valid_sweep, c_vals, 0.0)
+        sqrt_c = np.sqrt(c_safe)
         
+        const_term = MORTALITY_RATE * np.sqrt(np.pi / 2.0)
+        
+        # 3. Compute Probability Density
+        # Note: denominator is > 0 because const_term > 0 and BODY_MASS > 0
+        numerator = B * sqrt_c
+        denominator = BODY_MASS * (sqrt_c + const_term)
+        term = numerator / denominator
+        
+        # 4. Final Probability Masking
+        # If valid_sweep is True -> exp(-term)
+        # If valid_sweep is False -> 0.0
+        prob_remain_S = np.where(valid_sweep, np.exp(-term), 0.0)
+        
+        # 5. Random Draws (Dense)
         rnd = np.random.rand(*B.shape)
-        valid_sweep_mask = (c_vals > 0) & mask_sweep
         
-        failed_sweep = valid_sweep_mask & (rnd <= prob_remain_S)
-        successful_sweep = valid_sweep_mask & (rnd > prob_remain_S)
+        failed_sweep = valid_sweep & (rnd <= prob_remain_S)
+        successful_sweep = valid_sweep & (rnd > prob_remain_S)
         
+        # Apply Updates
         offset = -np.log1p(-prob_remain_S)
         new_logB = np.minimum(0.0, logB + offset)
+        
         logB = np.where(successful_sweep, new_logB, logB)
+        if np.any(successful_sweep): state_modified = True
         
         sw = np.where(failed_sweep, True, sw)
         new_clocks = np.log(np.random.rand(*B.shape))
         pclock = np.where(failed_sweep, new_clocks, pclock)
-        # ---------------------------------------
 
         # C. Clock
         mask_clock = (clock_evts == 1) & sw
-        est_prob = self._get_est_prob(non_self_growth)
+        est_prob = c['est_prob'] 
         
         valid_est = mask_clock & (est_prob > 0)
         val = np.divide(BODY_MASS, est_prob + 1e-20)
-        val = np.minimum(val, BODY_MASS)
+        val = np.minimum(val, ECOLOGICAL_MAX_B)
         
         logB = np.where(valid_est, np.log(val), logB)
+        if np.any(valid_est): state_modified = True
+        
         pclock = np.where(valid_est, 1.0, pclock)
         sw = np.where(valid_est, False, sw)
         
@@ -253,13 +298,34 @@ class PSD2Model:
         pclock = np.where(invalid_est, 1.0, pclock)
         sw = np.where(invalid_est, False, sw)
 
+        # Write back
         solver.y[:total] = logB.ravel()
         solver.y[total:] = pclock.ravel()
         solver.sw = sw.ravel()
+        
+        # --- DENSE CACHE UPDATE ---
+        if state_modified:
+             new_logB = logB 
+             logB_clamped = np.minimum(new_logB, LOG_B_CAP)
+             B_new = np.exp(logB_clamped)
+             
+             local_growth, non_self_growth = self._compute_local_growth(B_new)
+             
+             c['B'] = B_new
+             c['logB'] = new_logB.copy()
+             c['local_growth'] = local_growth
+             c['non_self_growth'] = non_self_growth
+             
+             c['invasion_flux'] = self._compute_dispersal_input(B_new)
+             safeB = np.maximum(B_new, SAFE_MIN_B)
+             c['invasion_pressure'] = np.clip(c['invasion_flux'] / safeB, 0.0, 10.0)
+             c['est_prob'] = self._get_est_prob(non_self_growth)
+
+        c['pclock'] = pclock.copy() 
         return solver.y
     
     def run(self):
-        logger.info("Starting PSD2 simulation (No Sync / Streamlined)...")
+        logger.info("Starting PSD2 simulation (Fully Optimized)...")
         
         y0 = np.concatenate([self.logB.flatten(), self.poisson_clock.flatten()])
         sw0 = self.waiting.flatten() 

@@ -13,12 +13,15 @@ import argparse
 import json
 import time
 import logging
+import random
 from pathlib import Path
 import datetime as dt
 from accelerator import np
+import numpy as _real_numpy
 
 # Import project modules
 import dispersal
+import config # Import config to access RANDOM_SEED
 from config import BODY_MASS, NUM_PATCHES_X, NUM_PATCHES_Y, STEP_SIZE, THRESHOLD, INV
 from models_ibm import IBMModel
 from models_psd2 import PSD2Model
@@ -37,6 +40,7 @@ class SimulationRunner(abc.ABC):
         self._setup_logging()
         self._setup_paths()
         self._configure_dispersal()
+        self._set_global_seeds() # <--- NEW: Centralized Seeding
 
         self.world_tag = sim_utils.build_world_tag(
             base=f"{self.args.tag}_{self.args.engine}" + (f"_{self.args.world_tag_extra}" if self.args.world_tag_extra else ""),
@@ -58,7 +62,10 @@ class SimulationRunner(abc.ABC):
         parser.add_argument('--no-movie', action='store_true')
         parser.add_argument('--disp-rate', type=float, default=None)
         parser.add_argument('--ldd-prob', type=float, default=None)
-        parser.add_argument('--random-seed', type=int, default=0)        
+        
+        # <--- UPDATED: Default to config.RANDOM_SEED
+        parser.add_argument('--random-seed', type=int, default=config.RANDOM_SEED)        
+        
         # Assembly generic
         parser.add_argument('--window-duration', type=float, default=500, help="Duration of one assembly window (steps for IBM, time for PSD2).")
         parser.add_argument('--F-sat', type=str, default='None')
@@ -96,6 +103,20 @@ class SimulationRunner(abc.ABC):
 
         return args
 
+    def _set_global_seeds(self):
+        """Sets seeds for all RNG backends to ensure reproducibility."""
+        seed = self.args.random_seed
+        logging.info(f"Setting GLOBAL RANDOM SEED to: {seed}")
+        
+        # 1. Python random
+        random.seed(seed)
+        
+        # 2. Standard NumPy
+        _real_numpy.random.seed(seed)
+        
+        # 3. Accelerator (PyTorch/MPS/CUDA)
+        np.random.seed(seed)
+
     def _setup_logging(self):
         logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s', handlers=[logging.StreamHandler()])
 
@@ -128,19 +149,24 @@ class SimulationRunner(abc.ABC):
         if self.args.use_assembly:
             r_final, C_final, final_state, extra_assembly = self.run_assembly()
         else:
-            rng = np.random.default_rng(self.args.random_seed)
+            # Note: We use the global RNG now, but drawing specific interactions 
+            # might still benefit from a local generator for clarity, or we can use the global one.
+            # Using local generator initialized with master seed is safer for modularity.
+            rng = _real_numpy.random.default_rng(self.args.random_seed)
+            
             if self.args.n_species == 3:
                 logging.info("Running 3-species RPS scenario (no assembly).")
                 r_final = np.ones(3)
                 C_final = np.array([[1, 1.7, 0.4], [0.4, 1, 1.7], [1.7, 0.4, 1]], dtype=float)
-            else: # set up a community with n_species species
-                  # permanently invading at rate INV
+            else: 
                 logging.info(f"Running {self.args.n_species}-species scenario (no assembly).")
                 r_final = np.array([], dtype=float)
                 C_final = np.array([[]], dtype=float)
                 for _ in range(self.args.n_species):
-                    row, col = draw_interactions(len(r_final))
+                    row, col = draw_interactions(len(r_final), rng=rng)
                     r_final, C_final = expand_RC(r_final, C_final, 1, row, col)
+            
+            # Initial seeding logic
             B_seed = ( rng.random((self.args.n_species, NUM_PATCHES_Y, NUM_PATCHES_X)) <
                        1.5/self.args.n_species ).astype(float) * BODY_MASS
             dispersal.set_invasion_pressure( INV * np.ones_like(B_seed) )
@@ -184,7 +210,6 @@ class SimulationRunner(abc.ABC):
         C_top_idx, C_top_w = sim_utils.topk_interactions(C_final, k=16)
 
         output_payload = {
-            # FIX: Use Python int/float constructors; np.int64/float32 are dtypes in the accelerator shim.
             "gamma": int(len(r_final)), "r_base": r_final.astype(np.float32),
             "deg_in": deg_in, "deg_out": deg_out, "C_topk_idx": C_top_idx, "C_topk_w": C_top_w,
             "t_dynamics": t_dynamics,
@@ -206,20 +231,12 @@ class SimulationRunner(abc.ABC):
         if not self.args.no_movie and B_dynamics is not None and B_dynamics.ndim == 4:
             movie_path = self.paths['movies'] / f'{self.world_tag}.mp4'
             
-            # 1. Bring to CPU
             B_host = sim_utils.to_host(B_dynamics)
-
-            # 2. FIX: Force Float64 and Add Dithering
-            #    We add tiny random noise (1e-10) to ensure Max > Min.
-            #    This prevents Matplotlib from dividing by zero on uniform frames.
             B_host = B_host.astype(np.float64)
             B_host += np.random.normal(0, 1e-10, B_host.shape)
-
-            # 3. Sanitize and Clip
             B_host = np.nan_to_num(B_host, nan=0.0, posinf=0.0, neginf=0.0)
             B_host = np.clip(B_host, 0.0, 1.0)
 
-            # 4. Generate Movie
             animate_spatial(B_host, f'{self.args.engine.upper()} {self.args.tag}', str(movie_path))
             logging.info(f"[save] -> {movie_path}")
 
@@ -254,12 +271,11 @@ class IBMSimulation(SimulationRunner):
 
     def run_dynamics(self, r, C, initial_N):
         logging.info("Running dynamics with IBM engine...")
-        ### CHECK: The AI version used `tmax=self.args.tmax` here. 
-        ### I reverted to `nsteps=int(self.args.tmax / STEP_SIZE)` to ensure exact time-stepping behavior.
         model = IBMModel(r, C, initial_N=initial_N,
                          nsteps=int(self.args.tmax / STEP_SIZE),
                          record_step=int(self.args.record / STEP_SIZE),
-                         record_mode=self.args.record_mode, seed=1,
+                         record_mode=self.args.record_mode, 
+                         seed=self.args.random_seed, # Use global seed config
                          length_scale=self.args.env_length_scale, var_r=self.args.env_var_r,
                          seed_field=self.args.env_seed_field)
         
@@ -285,7 +301,8 @@ class PSD2Simulation(SimulationRunner):
         B0, W0, PC0 = initial_state
         logging.info("Running dynamics with PSD2 engine...")
         model = PSD2Model(r, C, initial_B=B0, initial_wait=W0, initial_clock=PC0,
-                          tmax=self.args.tmax, record_step=self.args.record, seed=1,
+                          tmax=self.args.tmax, record_step=self.args.record, 
+                          seed=self.args.random_seed, # Use global seed config
                           length_scale=self.args.env_length_scale, var_r=self.args.env_var_r,
                           seed_field=self.args.env_seed_field)
         
@@ -308,7 +325,8 @@ class ODESimulation(SimulationRunner):
 
     def run_dynamics(self, r, C, initial_state=None):
         logging.info("Running dynamics with ODE engine...")
-        model = ODEModel(r, C, tmax=self.args.tmax, record_step=self.args.record, seed=1,
+        model = ODEModel(r, C, tmax=self.args.tmax, record_step=self.args.record, 
+                         seed=self.args.random_seed,
                          length_scale=self.args.env_length_scale, var_r=self.args.env_var_r,
                          seed_field=self.args.env_seed_field)
         t, B = model.run()

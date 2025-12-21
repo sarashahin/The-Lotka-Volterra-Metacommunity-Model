@@ -40,32 +40,28 @@ class IBMModel:
     - Supports both adult and propagule dispersal
     """
     def __init__(self,
-                 r,                 # either 1D array (length S) or ignored if r_field supplied
+                 r,                 
                  C=None,
                  initial_N: Optional[np.ndarray] = None,   
-                 r_field=None,      # expect spatial field of shape (S, Y, X)
-                 length_scale=None, # for on‐the‐fly generation
-                 var_r=None,        # for on‐the‐fly generation
-                 seed_field=None,   # seed for generate_spatial_r
+                 r_field=None,      
+                 length_scale=None, 
+                 var_r=None,        
+                 seed_field=None,   
                  nsteps=None,
                  record_step=None,
                  record_mode: Literal['full', 'mean', 'none']='full',
-                 seed=0,
+                 seed=None, # <--- CHANGED: Default None, No reset to 123
                  dispersal_type='propagule',
                  dispersal_away_rate=None):
-        """
-        :param r: 1D array of intrinsic growth rates (length S).
-        :param C: 2D competition matrix (SxS).
-        :param nsteps: number of steps in simulation (default TMAX).
-        :param record_step: record every record_step steps.
-        :param seed: random seed for reproducibility.
-        :param dispersal_type: 'adult' or 'propagule' - specifies which life stage disperses
-        """
-        self.S = len(r)  # number of species
         
-        # --- Matrix Generation (Reverted to use local RNG for exact consistency) ---
+        # <--- REMOVED: np.random.seed(seed) to allow continuous global stream
+
+        self.S = len(r) 
+        
+        # --- Matrix Generation ---
         if C is None:
-            rng = np.random.default_rng(seed)
+            # Use local RNG if seed provided, else global
+            rng = np.random.default_rng(seed) if seed is not None else np.random
             C = np.eye(self.S, dtype=float)
             for i in range(self.S):
                 for j in range(self.S):
@@ -76,6 +72,7 @@ class IBMModel:
         # --- Environment Setup ---
         if r_field is None:
             if (length_scale is not None) and (var_r is not None):
+                # generate_spatial_r handles seeding via seed_field
                 self.r_field = generate_spatial_r(
                     self.S, NUM_PATCHES_Y, NUM_PATCHES_X,
                     length_scale, r, var_r, seed=seed_field
@@ -86,7 +83,6 @@ class IBMModel:
                     (self.S, NUM_PATCHES_Y, NUM_PATCHES_X)
                 )
         else:
-            # assert r_field.shape == (self.S, NUM_PATCHES_Y, NUM_PATCHES_X)
             self.r_field = r_field
 
         self.r_field = np.asarray(self.r_field, dtype=float).copy()
@@ -104,12 +100,7 @@ class IBMModel:
                 np.asarray(LOCAL_DISPERSAL_MATRIX.sum(axis=0)).flatten(). \
                 reshape((NUM_PATCHES_Y, NUM_PATCHES_X))
 
-        # ### CHECK: The AI removed this seed reset. I restored it to match original.
-        # This forces the global RNG to the same state every time this class is initialized.
-        np.random.seed(seed)
-
         # Initialize counts (N) for each patch
-        # Shape: (S, NUM_PATCHES_Y, NUM_PATCHES_X)
         if initial_N is not None:
             self.N = np.asarray(initial_N).copy()
         else:
@@ -123,76 +114,53 @@ class IBMModel:
         # --- Storage for trajectory ---
         self.nrecords = self.nsteps // self.record_step
         if self.record_mode == "full":
-            # Reverted dtype to float32 to store Biomass (not Int counts)
             self.trajectory = np.full((self.nrecords, self.S,
                                         NUM_PATCHES_Y, NUM_PATCHES_X),
                                        np.nan, dtype=np.float32)
         elif self.record_mode == "mean":
             self.trajectory = np.full((self.nrecords, self.S),
                                        np.nan, dtype=np.float32)
-        else:                # "none"
+        else:                
             self.trajectory = None
         
     def run(self):
-        """
-        Run the IBM simulation with multi-patch dynamics.
-        """
         logger.info("Starting IBM simulation with multi-patch dynamics...")
         record_idx = 0
         
         for s in range(self.nsteps):
+            B = self.N * BODY_MASS 
             
-            # Convert counts to biomass for all patches
-            B = self.N * BODY_MASS  # Shape: (S, NUM_PATCHES_Y, NUM_PATCHES_X)
+            incoming_flux = np.asarray(compute_dispersal(B))
             
-            if False & (s % 100 == 0):
-                print(f"step {s}, {s/self.nsteps:.1%}, total N = {self.N.sum()}")
-                
-            # Compute dispersal flux between patches
-            incoming_flux = np.asarray(compute_dispersal(B))  # Same shape as B
-            
-            # Reshape B for matrix multiplication with C
-            B_reshaped = B.reshape(self.S, -1)  # Shape: (S, NUM_PATCHES_Y * NUM_PATCHES_X)
-            
-            # Calculate growth rates for all patches at once
+            B_reshaped = B.reshape(self.S, -1) 
             local_growth_flat = self.r_flat - (self.C @ B_reshaped)
             local_growth_rates = local_growth_flat.reshape(B.shape)
             
             if self.dispersal_type == 'adult':
                 local_growth_rates -= np.broadcast_to(self.dispersal_away_rate, local_growth_rates.shape)
             
-            # Handle fast dying: localGrowthRate < - MORTALITY_RATE
             fast_dying = local_growth_rates < (-MORTALITY_RATE)
             full_mortality = np.full_like(local_growth_rates, MORTALITY_RATE)
             full_mortality[fast_dying] = -local_growth_rates[fast_dying]
             local_growth_rates[fast_dying] = -MORTALITY_RATE
             
-            # For adult dispersal, add the dispersal-away rate to mortality here.
             if self.dispersal_type == 'adult':
                 full_mortality = full_mortality + self.dispersal_away_rate
             
-            # Step
-            # Death
             survival_prob = np.exp(-full_mortality * STEP_SIZE)
             new_N = np.random.binomial(self.N, survival_prob)
             
-            # Birth
             birth_lambda = (np.exp((local_growth_rates + MORTALITY_RATE) * STEP_SIZE) - 1) * new_N
             birth_values = np.random.poisson(birth_lambda)
             
-            # Incoming dispersers are computed from the incoming_flux.
             incoming = np.random.poisson(incoming_flux * STEP_SIZE / BODY_MASS)
-            # Update population by adding surviving individuals, new births, and incoming dispersers.
             self.N = new_N + birth_values + incoming 
 
-            # Ensure no negative counts
             if (self.N < 0).any().item():
                 sys.exit("Negative abundances!!")
             
-            # ─── recording ────────────────────────────────────────────
             if (s+1) % self.record_step == 0:
                 if self.record_mode == "full":
-                    # Reverted to storing Biomass
                     self.trajectory[record_idx] = self.N * BODY_MASS
                 elif self.record_mode == "mean":
                     self.trajectory[record_idx] = (self.N * BODY_MASS).mean((1,2))
