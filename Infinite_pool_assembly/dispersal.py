@@ -76,14 +76,15 @@ def _precompute_custom_kernel(shape):
         kernel_spatial = _real_numpy.vectorize(DISPERSAL_KERNEL)(r_grid)
         
     kernel_spatial = kernel_spatial.astype(_real_numpy.float32)
-
-    # 3. Normalize
-    k_sum = kernel_spatial.sum()
-    if k_sum > 0:
-        kernel_spatial /= k_sum
     
-    # 4. Shift Center for FFT
+    # 3. Shift Center for FFT
     kernel_shifted = _real_numpy.fft.ifftshift(kernel_spatial)
+    kernel_shifted[0,0] = 0
+
+    # 4. Normalize
+    k_sum = kernel_shifted.sum()
+    if k_sum > 0:
+        kernel_shifted /= k_sum
     
     # 5. Compute FFTs
     # A. NumPy/SciPy (CPU)
