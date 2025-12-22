@@ -222,15 +222,22 @@ class SimulationRunner(abc.ABC):
 
         detection_thr_count = self.args.detection_threshold if self.args.detection_threshold is not None else (THRESHOLD / BODY_MASS)
         
-        # Capture last state
+        # Capture last state before discarding dynamics
         B_last = B_dynamics[-1].astype(_real_numpy.float16) if B_dynamics is not None and B_dynamics.ndim == 4 else None
 
         deg_in, deg_out = sim_utils.summarize_interactions(C_final)
         C_top_idx, C_top_w = sim_utils.topk_interactions(C_final, k=16)
 
+        # Retrieve traits from extra_assembly
+        extra = results.get('extra_assembly', {})
+        final_traits = extra.get('final_traits', None)
+        if final_traits is not None:
+             final_traits = sim_utils.to_host(final_traits)
+
         output_payload = {
             "gamma": int(len(r_final)), 
             "r_base": r_final.astype(_real_numpy.float32), 
+            "traits": final_traits,
             "deg_in": deg_in, "deg_out": deg_out, "C_topk_idx": C_top_idx, "C_topk_w": C_top_w,
             "t_dynamics": None, 
             "B_dynamics": None, 
@@ -268,13 +275,14 @@ class SimulationRunner(abc.ABC):
 
 class IBMSimulation(SimulationRunner):
     def run_assembly(self):
-        init_r, init_C, init_state, init_attempts, init_round = None, None, None, 0, -1
+        init_r, init_C, init_state, init_traits, init_attempts, init_round = None, None, None, None, 0, -1
         
         ck = self._load_checkpoint()
         if ck is not None:
             init_r = np.asarray(ck['r'])
             init_C = np.asarray(ck['C'])
             init_state = ck.get('state') or ck.get('N')
+            init_traits = np.asarray(ck.get('traits')) if 'traits' in ck else None 
             init_attempts, init_round = int(ck.get('attempts', 0)), int(ck.get('round', -1))
             logging.info(f"Resuming IBM from round {init_round}, attempts {init_attempts}")
 
@@ -282,7 +290,8 @@ class IBMSimulation(SimulationRunner):
             max_attempts=self.args.max_attempts, max_rounds=self.args.max_rounds,
             F_sat=self.args.F_sat, detection_threshold=self.args.detection_threshold,
             checkpoint_fn=self._checkpoint_callback, seed=self.args.random_seed,
-            init_r=init_r, init_C=init_C, init_state=init_state,
+            init_r=init_r, init_C=init_C, init_state=init_state, 
+            init_traits=init_traits, 
             init_attempts=init_attempts, init_round=init_round,
             nsteps=int(self.args.window_duration), record_step=int(self.args.window_duration)
         )
@@ -290,13 +299,23 @@ class IBMSimulation(SimulationRunner):
 
     def run_dynamics(self, r, C, initial_N):
         logging.info("Running dynamics with IBM engine...")
-        model = IBMModel(r, C, initial_N=initial_N,
+        
+        # <--- FIX: Handle spatial r field correctly
+        r_field_arg = None
+        if r.ndim == 2:
+            r_field_arg = r
+            r_input = r[:, 0] # Dummy 1D vector for S
+        else:
+            r_input = r
+
+        model = IBMModel(r_input, C, initial_N=initial_N,
                          nsteps=int(self.args.tmax / STEP_SIZE),
                          record_step=int(self.args.record / STEP_SIZE),
                          record_mode=self.args.record_mode, 
                          seed=self.args.random_seed,
                          length_scale=self.args.env_length_scale, var_r=self.args.env_var_r,
-                         seed_field=self.args.env_seed_field)
+                         seed_field=self.args.env_seed_field,
+                         r_field=r_field_arg) # Pass r_field explicitly
         
         B_dynamics_raw = model.run()
         t_dynamics = np.arange(1, model.nrecords + 1) * self.args.record
@@ -308,18 +327,18 @@ class IBMSimulation(SimulationRunner):
 
 class PSD2Simulation(SimulationRunner):
     def run_assembly(self):
-        init_r, init_C, init_state, init_attempts, init_round = None, None, None, 0, -1
+        init_r, init_C, init_state, init_traits, init_attempts, init_round = None, None, None, None, 0, -1
         
         ck = self._load_checkpoint()
         if ck is not None:
             init_r = np.asarray(ck['r'])
             init_C = np.asarray(ck['C'])
+            init_traits = np.asarray(ck.get('traits')) if 'traits' in ck else None 
+            
             loaded_state = ck.get('state')
             if loaded_state is not None:
-                if loaded_state.ndim == 0:
-                    init_state = loaded_state.item()
-                else:
-                    init_state = loaded_state
+                if loaded_state.ndim == 0: init_state = loaded_state.item()
+                else: init_state = loaded_state
             
             init_attempts, init_round = int(ck.get('attempts', 0)), int(ck.get('round', -1))
             logging.info(f"Resuming PSD2 from round {init_round}, attempts {init_attempts}")
@@ -329,6 +348,7 @@ class PSD2Simulation(SimulationRunner):
             F_sat=self.args.F_sat, detection_threshold=self.args.detection_threshold,
             checkpoint_fn=self._checkpoint_callback, seed=self.args.random_seed,
             init_r=init_r, init_C=init_C, init_state=init_state,
+            init_traits=init_traits, 
             init_attempts=init_attempts, init_round=init_round,
             tmax=self.args.window_duration, record_step=self.args.window_duration
         )
@@ -337,19 +357,26 @@ class PSD2Simulation(SimulationRunner):
     def run_dynamics(self, r, C, initial_state):
         B0, W0, PC0 = initial_state
         logging.info("Running dynamics with PSD2 engine...")
-        model = PSD2Model(r, C, initial_B=B0, initial_wait=W0, initial_clock=PC0,
+        
+        # <--- FIX: Handle spatial r field correctly
+        r_field_arg = None
+        if r.ndim == 2:
+            r_field_arg = r
+            r_input = r[:, 0] # Dummy 1D vector for S
+        else:
+            r_input = r
+
+        model = PSD2Model(r_input, C, initial_B=B0, initial_wait=W0, initial_clock=PC0,
                           tmax=self.args.tmax, record_step=self.args.record, 
                           seed=self.args.random_seed,
                           length_scale=self.args.env_length_scale, var_r=self.args.env_var_r,
-                          seed_field=self.args.env_seed_field)
+                          seed_field=self.args.env_seed_field,
+                          r_field=r_field_arg) # Pass r_field explicitly
         
         t, B, W, PC, G, INV, EST = model.run()
         
         B_final_assembly, _, _ = initial_state
         
-        # <--- FIX: Ensure we do NOT pass full trajectories for aux variables.
-        # Only pass the final frame [-1] to avoid multi-GB saves.
-        # We handle None checks in case the simulation length was 0.
         def safe_last(arr): return arr[-1] if arr is not None and len(arr) > 0 else None
 
         return {
