@@ -10,7 +10,7 @@ import numpy as _real_numpy
 import os 
 
 from config import NUM_PATCHES_X, NUM_PATCHES_Y, THRESHOLD, BODY_MASS
-from assembly_utils import draw_interactions, expand_RC, prune_extinct
+from assembly_utils import expand_RC, prune_extinct # Removed draw_interactions
 from models_ibm import IBMModel
 from models_psd2 import PSD2Model
 import simulation_utils as sim_utils
@@ -85,24 +85,41 @@ class StepwiseAssembler(abc.ABC):
             r_big, C_big, traits_big = r, C, traits
             
             for _ in range(n_cand):
-                # 1. Traits
-                new_trait = self.trait_manager.generate_traits(1)
+                # 1. Generate Trait
+                new_trait = self.trait_manager.generate_traits(1) # Shape (1,)
                 
-                # 2. Spatial Growth Rates (1, P)
+                # 2. Get Spatial Growth Rates
                 new_r_val = self.trait_manager.get_growth_rates(new_trait)
                 
-                # 3. Topology
+                # 3. Calculate Interactions (Delegating Topology to TraitManager)
                 curr_S = len(r_big)
-                row_inds, col_inds = draw_interactions(curr_S, rng=self.rng)
                 
-                # 4. Interactions (Trait-based)
-                traits_existing_for_row = traits_big[col_inds]
-                row_vals = self.trait_manager.get_interaction_strengths(target_traits=new_trait, source_traits=traits_existing_for_row)
+                # We construct full vectors comparing New Species vs All Existing Species
                 
-                traits_existing_for_col = traits_big[row_inds]
-                col_vals = self.trait_manager.get_interaction_strengths(target_traits=traits_existing_for_col, source_traits=new_trait)
+                # --- Row: Effect of Existing (Source) on New (Target) ---
+                # Target is New (repeated S times), Source is Existing (list of S)
+                # Using numpy broadcast logic on CPU for index generation
+                target_traits_row = _real_numpy.broadcast_to(sim_utils.to_host(new_trait), (curr_S,))
+                source_traits_row = sim_utils.to_host(traits_big[:curr_S])
                 
-                # 5. Expand (r_big is now a matrix)
+                row_vector = self.trait_manager.get_interaction_strengths(target_traits_row, source_traits_row)
+                
+                # Filter for non-zeros (Sparsity)
+                row_inds = _real_numpy.nonzero(row_vector)[0]
+                row_vals = row_vector[row_inds]
+                
+                # --- Col: Effect of New (Source) on Existing (Target) ---
+                # Target is Existing, Source is New
+                target_traits_col = sim_utils.to_host(traits_big[:curr_S])
+                source_traits_col = _real_numpy.broadcast_to(sim_utils.to_host(new_trait), (curr_S,))
+                
+                col_vector = self.trait_manager.get_interaction_strengths(target_traits_col, source_traits_col)
+                
+                # Filter for non-zeros
+                col_inds = _real_numpy.nonzero(col_vector)[0]
+                col_vals = col_vector[col_inds]
+                
+                # 4. Expand
                 r_big, C_big = expand_RC(r_big, C_big, new_r_val, row_inds, col_inds, row_vals, col_vals)
                 traits_big = np.concatenate([traits_big, new_trait])
 
@@ -165,7 +182,7 @@ class StepwiseAssembler(abc.ABC):
         )
         return r, C, final_state, extra
 
-    # ... [Abstract methods remain same] ...
+    # ... [Abstract methods unchanged] ...
     def _check_presence(self, presence_matrix):
         if presence_matrix.ndim == 3: return presence_matrix.any(axis=(1, 2))
         elif presence_matrix.ndim == 2: return presence_matrix.any(axis=1)
@@ -203,8 +220,6 @@ class IBMAssembler(StepwiseAssembler):
         # Initial N based on local r
         N = np.zeros((1, NUM_PATCHES_Y, NUM_PATCHES_X), dtype=int)
         
-        # Use simple mean r for initial abundance scale or local?
-        # Let's use local r
         r_reshaped = r_field[0].reshape(NUM_PATCHES_Y, NUM_PATCHES_X)
         N[0] = np.rint(np.maximum(0, r_reshaped) / BODY_MASS).astype(int)
             
@@ -222,8 +237,6 @@ class IBMAssembler(StepwiseAssembler):
         return N_big
 
     def _run_simulation_window(self, r_big, C_big, N_big, n_cand):
-        # r_big is (S, P). Pass it as r_field.
-        # Pass dummy r vector as first arg to satisfy length checks in Model init
         dummy_r = np.ones(len(r_big)) 
         model = IBMModel(dummy_r, C_big, initial_N=N_big, r_field=r_big, **self.model_kw)
         model.run()
@@ -289,8 +302,6 @@ class PSD2Assembler(StepwiseAssembler):
 
     def _run_simulation_window(self, r_big, C_big, state_big, n_cand):        
         B_big, W_big, PC_big = state_big
-        
-        # r_big is (S, P). Pass as r_field.
         dummy_r = np.ones(len(r_big))
         
         model = PSD2Model(dummy_r, C_big, initial_B=B_big, initial_wait=W_big, initial_clock=PC_big, 

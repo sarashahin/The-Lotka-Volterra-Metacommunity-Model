@@ -8,6 +8,8 @@ from config import CONNECTANCE, INTERACTION_STRENGTH
 def draw_interactions(S, rng=None):
     """
     Determines WHICH species interact (Topology).
+    NOTE: This is the legacy topological function. 
+    The new TraitManager logic handles topology implicitly via sparsity.
     """
     if rng is None: rng = _real_numpy.random
     mask_row = rng.random(S) < CONNECTANCE
@@ -24,6 +26,10 @@ def expand_RC(r, C, new_r_vals, row_inds, col_inds, row_vals, col_vals):
         r: Current growth rates. Can be (S,) or (S, P).
         C: Current interactions (S, S).
         new_r_vals: New species growth. (k,) or (k, P).
+        row_inds: Indices of existing species that affect the new species (Incoming).
+        col_inds: Indices of existing species affected by the new species (Outgoing).
+        row_vals: Strength of effects ON new species.
+        col_vals: Strength of effects BY new species.
     """
     k = len(new_r_vals)
     S = len(r)
@@ -51,10 +57,17 @@ def expand_RC(r, C, new_r_vals, row_inds, col_inds, row_vals, col_vals):
         
     # 3. Fill Off-Diagonals
     if k == 1:
-        C_out[S, col_inds] = row_vals
-        C_out[row_inds, S] = col_vals
+        # Row S: Interactions COMING IN to the New Species
+        # C[New, Existing] = row_vals
+        # We use row_inds (indices of Existing species acting on New)
+        C_out[S, row_inds] = row_vals
+        
+        # Column S: Interactions GOING OUT from the New Species
+        # C[Existing, New] = col_vals
+        # We use col_inds (indices of Existing species affected by New)
+        C_out[col_inds, S] = col_vals
     else:
-        # Bulk addition logic would go here
+        # Bulk addition logic (if needed in future)
         pass
 
     return r_out, C_out
