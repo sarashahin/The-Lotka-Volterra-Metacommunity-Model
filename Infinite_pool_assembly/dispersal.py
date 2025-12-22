@@ -2,132 +2,171 @@
 # dispersal.py
 ############################################
 """
-Dispersal module.
-Supports two modes:
-1. Direct 3x3 Convolution (Fastest for Local/Nearest-Neighbor)
-2. FFT Convolution (Accurate for Long-Distance/Custom Kernels)
-Retains legacy LOCAL_DISPERSAL_MATRIX for initialization compatibility.
+Handles spatial dispersal kernels and invasion pressure.
+
+Logic:
+1. If DISPERSAL_KERNEL is provided in config (as a function f(r)):
+   - Generates a 2D kernel grid by evaluating f(r).
+   - Uses FFT convolution (SciPy on CPU, PyTorch on GPU).
+2. Otherwise:
+   - Uses Nearest-Neighbor dispersal mixed with Global Mean-Field dispersal.
+   - Mixing controlled by LONG_DISTANCE_PROB.
 """
-
-from accelerator import np
 import logging
-import config
-from config import DISPERSAL_RATE, NUM_PATCHES_X, NUM_PATCHES_Y, LONG_DISTANCE_PROB
+from accelerator import np, to_cpu, torch # Removed 'device'
+import numpy as _real_numpy
+import scipy.fft 
 
+from config import (
+    NUM_PATCHES_X, NUM_PATCHES_Y, 
+    DISPERSAL_RATE, LONG_DISTANCE_PROB
+)
+
+# Try to import custom kernel function
 try:
-    import torch
-    import torch.nn.functional as F
-    HAS_TORCH = True
+    from config import DISPERSAL_KERNEL
 except ImportError:
-    HAS_TORCH = False
-
-_EXTRA_INVASION = None
-_KERNEL_FFT_CACHE = None
-_LAST_KERNEL_FUNC = None
-_DIRECT_CONV_KERNEL = None
+    DISPERSAL_KERNEL = None
 
 logger = logging.getLogger(__name__)
 
-def set_invasion_pressure(arr):
-    global _EXTRA_INVASION
-    if arr is None:
-        _EXTRA_INVASION = None
-    else:
-        _EXTRA_INVASION = np.asarray(arr, float)
+# --- RESTORED CONSTANT ---
+# Standard Von Neumann (4-neighbor) Laplacian for local diffusion calculations.
+# Used by models to calculate 'away' rates if needed.
+LOCAL_DISPERSAL_MATRIX = _real_numpy.array([
+    [0.0, 1.0, 0.0],
+    [1.0, 0.0, 1.0],
+    [0.0, 1.0, 0.0]
+], dtype=_real_numpy.float32)
+LOCAL_DISPERSAL_MATRIX /= LOCAL_DISPERSAL_MATRIX.sum()
 
-# --- Legacy Support for Initialization Logic (PSD2/IBM) ---
-def create_local_dispersal_matrix():
+# Global state
+_kernel_fft_torch = None
+_kernel_fft_numpy = None
+_invasion_pressure = None
+
+def set_invasion_pressure(inv_field):
+    global _invasion_pressure
+    _invasion_pressure = inv_field
+
+def _precompute_custom_kernel(shape):
     """
-    Re-added for backward compatibility. 
-    Needed by models_psd2.py and models_ibm.py to calculate dispersal_away_rate.
+    Evaluates the function DISPERSAL_KERNEL(r) on a grid to create
+    the 2D convolution kernel, then precomputes its FFT.
     """
-    N = NUM_PATCHES_X * NUM_PATCHES_Y
-    D = np.zeros((N, N))
-    for i in range(NUM_PATCHES_Y):
-        for j in range(NUM_PATCHES_X):
-            idx = i * NUM_PATCHES_X + j
-            # 4-neighbor stencil
-            for di in [-1, 0, 1]:
-                for dj in [-1, 0, 1]:
-                    if di == 0 and dj == 0: continue
-                    if di*dj != 0: continue 
-                    ni = (i + di) % NUM_PATCHES_Y
-                    nj = (j + dj) % NUM_PATCHES_X
-                    n_idx = ni * NUM_PATCHES_X + nj
-                    D[idx, n_idx] = 1.0/4.0
-    return DISPERSAL_RATE * D
+    global _kernel_fft_torch, _kernel_fft_numpy
+    
+    if DISPERSAL_KERNEL is None:
+        return
 
-# Defined at module level so other files can import it
-LOCAL_DISPERSAL_MATRIX = create_local_dispersal_matrix()
+    H, W = shape
+    
+    # 1. Generate Distance Grid (r)
+    y = _real_numpy.arange(H) - H // 2
+    x = _real_numpy.arange(W) - W // 2
+    xx, yy = _real_numpy.meshgrid(x, y)
+    
+    # Radial distance r
+    r_grid = _real_numpy.sqrt(xx**2 + yy**2)
+    
+    # 2. Evaluate User Function f(r)
+    try:
+        kernel_spatial = DISPERSAL_KERNEL(r_grid)
+    except Exception:
+        kernel_spatial = _real_numpy.vectorize(DISPERSAL_KERNEL)(r_grid)
+        
+    kernel_spatial = kernel_spatial.astype(_real_numpy.float32)
 
+    # 3. Normalize
+    k_sum = kernel_spatial.sum()
+    if k_sum > 0:
+        kernel_spatial /= k_sum
+    
+    # 4. Shift Center for FFT
+    kernel_shifted = _real_numpy.fft.ifftshift(kernel_spatial)
+    
+    # 5. Compute FFTs
+    # A. NumPy/SciPy (CPU)
+    _kernel_fft_numpy = scipy.fft.rfft2(kernel_shifted)
+    
+    # B. PyTorch (GPU)
+    if torch is not None:
+        # Detect device dynamically
+        current_dev = torch.ones(1).device
+        k_tensor = torch.from_numpy(kernel_shifted).float().to(current_dev)
+        _kernel_fft_torch = torch.fft.rfftn(k_tensor, dim=(-2, -1))
+        
+    logger.info(f"Custom DISPERSAL_KERNEL(r) evaluated and precomputed. Shape: {shape}")
 
-def _get_direct_conv_kernel(device, dtype):
-    global _DIRECT_CONV_KERNEL
-    if _DIRECT_CONV_KERNEL is None or _DIRECT_CONV_KERNEL.device != device:
-        k_dat = torch.tensor([
-            [0.0, 0.25, 0.0],
-            [0.25, 0.0, 0.25],
-            [0.0, 0.25, 0.0]
-        ], device=device, dtype=dtype) * DISPERSAL_RATE
-        _DIRECT_CONV_KERNEL = k_dat.view(1, 1, 3, 3)
-    return _DIRECT_CONV_KERNEL
+def _apply_fft_convolution(biomass):
+    """
+    Applies FFT convolution using the precomputed custom kernel.
+    """
+    if _kernel_fft_numpy is None:
+        _precompute_custom_kernel(biomass.shape[-2:])
 
-def _get_spectral_kernel(Ny, Nx, kernel_func, device):
-    global _KERNEL_FFT_CACHE, _LAST_KERNEL_FUNC
-    if _KERNEL_FFT_CACHE is not None and kernel_func is _LAST_KERNEL_FUNC:
-        if hasattr(_KERNEL_FFT_CACHE, 'device') and _KERNEL_FFT_CACHE.device == device:
-            return _KERNEL_FFT_CACHE
+    # Branch A: PyTorch
+    if torch is not None and torch.is_tensor(biomass):
+        if _kernel_fft_torch is None: _precompute_custom_kernel(biomass.shape[-2:])
+        
+        B_fft = torch.fft.rfftn(biomass, dim=(-2, -1))
+        conv_fft = B_fft * _kernel_fft_torch
+        return torch.fft.irfftn(conv_fft, s=biomass.shape[-2:], dim=(-2, -1))
 
-    logger.info("Generating FFT Dispersal Kernel...")
-    y = np.fft.fftfreq(Ny, d=1.0).to(device) * Ny
-    x = np.fft.fftfreq(Nx, d=1.0).to(device) * Nx
-    Y, X = np.meshgrid(y, x, indexing='ij')
-    r = np.sqrt(X**2 + Y**2)
-    K = kernel_func(r)
-    total = K.sum()
-    if total > 0: K /= total
-    K_fft = np.fft.rfft2(K)
-    _KERNEL_FFT_CACHE = K_fft
-    _LAST_KERNEL_FUNC = kernel_func
-    return K_fft
-
-def compute_dispersal(B):
-    S = B.shape[0]
-    total_patches = B.shape[1] * B.shape[2]
-
-    if HAS_TORCH and isinstance(B, torch.Tensor):
-        if config.DISPERSAL_KERNEL is not None:
-            Ny, Nx = B.shape[1], B.shape[2]
-            K_fft = _get_spectral_kernel(Ny, Nx, config.DISPERSAL_KERNEL, B.device)
-            B_fft = np.fft.rfft2(B)
-            conv_fft = B_fft * K_fft
-            dispersal_flux = np.fft.irfft2(conv_fft, s=(Ny, Nx))
-            dispersal_flux *= DISPERSAL_RATE
-        else:
-            b_input = B.unsqueeze(1)
-            b_padded = F.pad(b_input, (1, 1, 1, 1), mode='circular')
-            k = _get_direct_conv_kernel(B.device, B.dtype)
-            dispersal_flux = F.conv2d(b_padded, k).squeeze(1)
+    # Branch B: NumPy
     else:
-        # Fallback uses the matrix we just restored
-        B2 = B.reshape((S, -1))
-        dispersal_flux = (LOCAL_DISPERSAL_MATRIX.T @ B2.T).T.reshape(B.shape)
+        if not isinstance(biomass, _real_numpy.ndarray): biomass = _real_numpy.asarray(biomass)
+        
+        B_fft = scipy.fft.rfft2(biomass, axes=(-2, -1))
+        conv_fft = B_fft * _kernel_fft_numpy
+        return scipy.fft.irfft2(conv_fft, s=biomass.shape[-2:], axes=(-2, -1))
 
-    if LONG_DISTANCE_PROB > 0:
-        total_flux_per_species = dispersal_flux.sum(dim=(1, 2)) 
-        ldd_incoming = LONG_DISTANCE_PROB * total_flux_per_species / total_patches
-        incoming_flux = (1 - LONG_DISTANCE_PROB) * dispersal_flux + ldd_incoming.view(S, 1, 1)
+def _apply_nearest_neighbor(biomass):
+    """
+    Calculates average of 4 nearest neighbors (Von Neumann neighborhood).
+    """
+    is_torch = torch is not None and torch.is_tensor(biomass)
+    
+    if is_torch:
+        up    = torch.roll(biomass, shifts=1, dims=-2)
+        down  = torch.roll(biomass, shifts=-1, dims=-2)
+        left  = torch.roll(biomass, shifts=1, dims=-1)
+        right = torch.roll(biomass, shifts=-1, dims=-1)
+        return 0.25 * (up + down + left + right)
     else:
-        incoming_flux = dispersal_flux
+        up    = _real_numpy.roll(biomass, 1, axis=-2)
+        down  = _real_numpy.roll(biomass, -1, axis=-2)
+        left  = _real_numpy.roll(biomass, 1, axis=-1)
+        right = _real_numpy.roll(biomass, -1, axis=-1)
+        return 0.25 * (up + down + left + right)
 
-    if _EXTRA_INVASION is not None:
-        if isinstance(B, torch.Tensor):
-            if not isinstance(_EXTRA_INVASION, torch.Tensor):
-                inv_t = torch.as_tensor(_EXTRA_INVASION, device=B.device, dtype=B.dtype)
+def compute_dispersal(biomass):
+    """
+    Calculates the incoming dispersal flux for every patch.
+    """
+    
+    # CASE 1: Custom Kernel Provided -> FFT Convolution
+    if DISPERSAL_KERNEL is not None:
+        spatial_dist = _apply_fft_convolution(biomass)
+    
+    # CASE 2: No Kernel -> NN + Global Mixing
+    else:
+        local_dist = _apply_nearest_neighbor(biomass)
+        
+        if LONG_DISTANCE_PROB > 0:
+            if torch is not None and torch.is_tensor(biomass):
+                global_mean = biomass.mean(dim=(-2, -1), keepdim=True)
             else:
-                inv_t = _EXTRA_INVASION
-            incoming_flux += inv_t.reshape(B.shape)
+                global_mean = biomass.mean(axis=(-2, -1), keepdims=True)
+            
+            spatial_dist = (1.0 - LONG_DISTANCE_PROB) * local_dist + LONG_DISTANCE_PROB * global_mean
         else:
-            incoming_flux += np.asarray(_EXTRA_INVASION).reshape(B.shape)
+            spatial_dist = local_dist
 
-    return incoming_flux
+    # Apply Rate
+    total_input = spatial_dist * DISPERSAL_RATE
+    
+    if _invasion_pressure is not None:
+        total_input += _invasion_pressure
+        
+    return total_input
