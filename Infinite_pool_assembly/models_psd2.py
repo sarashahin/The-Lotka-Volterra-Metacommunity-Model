@@ -4,7 +4,7 @@
 
 import sys
 import logging
-from accelerator import np, to_cpu # <--- ADDED to_cpu for transfer
+from accelerator import np, to_cpu
 import numpy as _cpu_numpy 
 from typing import Optional
 from euler_simple_safe import Explicit_Problem, EulerSimpleSafe
@@ -27,7 +27,7 @@ class PSD2Model:
                  initial_B=None, initial_wait=None, initial_clock=None,
                  n_new: int = 0, r_field=None, length_scale=None, var_r=None,
                  seed_field=None, tmax=None, record_step=None, 
-                 seed=None, # <--- Default None ensures we use global RNG stream
+                 seed=None, 
                  dispersal_type='propagule', dispersal_away_rate=None):
 
         self.S = len(r)
@@ -40,7 +40,6 @@ class PSD2Model:
         self._cache = {}
 
         if C is None:
-            # Use local RNG if seed provided, else global
             rng = np.random.default_rng(seed) if seed is not None else np.random
             C = np.eye(self.S, dtype=float)
             mask = rng.random((self.S, self.S)) < CONNECTANCE
@@ -98,7 +97,6 @@ class PSD2Model:
         self.nrecords = int(max(1, self.tmax // self.record_step))
         out_shape = (self.nrecords + 1, *self.shape_2d)
         
-        # <--- FIX: Allocate storage on CPU (Host RAM)
         self.trajectory = _cpu_numpy.zeros(out_shape, dtype=_cpu_numpy.float32)
         self.wait_trajectory = _cpu_numpy.zeros(out_shape, dtype=bool)
         self.time_points = _cpu_numpy.zeros(self.nrecords + 1)
@@ -342,15 +340,76 @@ class PSD2Model:
             est_prob = self._get_est_prob(non_self_g)
             inv_rate = inv_flux * est_prob / BODY_MASS
             
-            # <--- FIX: Move to CPU before storing to avoid MPS Index Overflow
             self.trajectory[i] = to_cpu(B).reshape(self.shape_2d)
             self.poisson_clock_traj[i] = to_cpu(pclock).reshape(self.shape_2d)
             self.growth_rate_traj[i] = to_cpu(non_self_g).reshape(self.shape_2d)
             self.invasion_rate_traj[i] = to_cpu(inv_rate).reshape(self.shape_2d)
             self.establishment_prob_traj[i] = to_cpu(est_prob).reshape(self.shape_2d)
             
-            # Calculate bool on GPU then transfer
             self.wait_trajectory[i] = to_cpu(pclock < 0).reshape(self.shape_2d)
+
+        # --- DIAGNOSTICS: Population States ---
+        y_final = solver.y
+        sw_final = solver.sw.reshape(self.S, -1)
+        logB_final = y_final[:total].reshape(self.S, -1)
+        B_final = np.exp(np.minimum(logB_final, LOG_B_CAP))
+        
+        # Get Rates (we need BOTH local and non-self)
+        local_g_final, non_self_g_final = self._compute_local_growth(B_final)
+        
+        # S (Waiting): sw == True
+        mask_S = sw_final
+        
+        # P (Probabilistic/Phantom): sw == False AND non_self_growth < 0
+        mask_active = ~sw_final
+        mask_P = mask_active & (non_self_g_final < 0)
+        
+        # D (Deterministic): sw == False AND non_self_growth >= 0
+        mask_D = mask_active & (non_self_g_final >= 0)
+        
+        count_S = int(np.sum(mask_S))
+        count_P = int(np.sum(mask_P))
+        count_D = int(np.sum(mask_D))
+        count_Total = self.S * self.N_patches
+        
+        logger.info(f"[PSD2 STATS] Total: {count_Total} | S (Wait): {count_S} ({count_S/count_Total:.1%}) | P (Prob): {count_P} ({count_P/count_Total:.1%}) | D (Det): {count_D} ({count_D/count_Total:.1%})")
+
+        # --- DIAGNOSTICS: ASCII Histograms ---
+        # Helper for ASCII Histogram
+        def draw_ascii_hist(data_tensor, bins=15, width=40, title=""):
+            # Ensure CPU numpy
+            data = to_cpu(data_tensor).flatten()
+            if len(data) == 0:
+                return f"{title}\nNo data (Population empty)."
+            
+            # Simple histogram
+            counts, edges = _cpu_numpy.histogram(data, bins=bins)
+            max_count = counts.max()
+            if max_count == 0: max_count = 1
+            
+            out = [f"\n--- {title} (N={len(data)}) ---"]
+            for i in range(bins):
+                bar_len = int((counts[i] / max_count) * width)
+                bar = '#' * bar_len
+                lower = edges[i]
+                upper = edges[i+1]
+                out.append(f"{lower:8.4f} .. {upper:8.4f} | {bar} ({counts[i]})")
+            return "\n".join(out)
+
+        # Filter for P and S populations combined
+        # "P" means active but decaying (Probabilistic)
+        # "S" means Waiting
+        mask_PS = mask_S | mask_P
+        
+        if np.any(mask_PS):
+            # Extract values for P+S subset
+            local_vals_PS = local_g_final[mask_PS]
+            non_self_vals_PS = non_self_g_final[mask_PS]
+            
+            logger.info(draw_ascii_hist(local_vals_PS, title="Local Growth Rates (P + S States)"))
+            logger.info(draw_ascii_hist(non_self_vals_PS, title="Non-Self Growth Rates (P + S States)"))
+        else:
+            logger.info("[PSD2 STATS] No P or S populations found for histogram.")
 
         logger.info("PSD2 simulation completed.")
         return (self.time_points, self.trajectory, self.wait_trajectory, self.poisson_clock_traj, self.growth_rate_traj, self.invasion_rate_traj, self.establishment_prob_traj)
