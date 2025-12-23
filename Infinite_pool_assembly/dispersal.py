@@ -53,6 +53,9 @@ def _precompute_custom_kernel(shape):
     """
     Evaluates the function DISPERSAL_KERNEL(r) on a grid to create
     the 2D convolution kernel, then precomputes its FFT.
+    
+    NOTE: Dispersal to the origin (r=0) is explicitly removed to ensure
+    the kernel represents purely 'away' movement.
     """
     global _kernel_fft_torch, _kernel_fft_numpy
     
@@ -76,12 +79,17 @@ def _precompute_custom_kernel(shape):
         kernel_spatial = _real_numpy.vectorize(DISPERSAL_KERNEL)(r_grid)
         
     kernel_spatial = kernel_spatial.astype(_real_numpy.float32)
-    
-    # 3. Shift Center for FFT
+
+    # 3. Shift Center for FFT and Zero Origin
+    # ifftshift moves the origin (center of grid) to index (0,0)
     kernel_shifted = _real_numpy.fft.ifftshift(kernel_spatial)
-    kernel_shifted[0,0] = 0
+    
+    # Explicitly remove self-dispersal (staying in same patch)
+    kernel_shifted[0, 0] = 0.0
 
     # 4. Normalize
+    # We normalize AFTER zeroing to ensure the total probability of 
+    # leaving biomass landing *somewhere else* sums to 1.0.
     k_sum = kernel_shifted.sum()
     if k_sum > 0:
         kernel_shifted /= k_sum
@@ -97,7 +105,7 @@ def _precompute_custom_kernel(shape):
         k_tensor = torch.from_numpy(kernel_shifted).float().to(current_dev)
         _kernel_fft_torch = torch.fft.rfftn(k_tensor, dim=(-2, -1))
         
-    logger.info(f"Custom DISPERSAL_KERNEL(r) evaluated and precomputed. Shape: {shape}")
+    logger.info(f"Custom DISPERSAL_KERNEL(r) evaluated. Shape: {shape}. Origin dispersal removed.")
 
 def _apply_fft_convolution(biomass):
     """
