@@ -10,7 +10,7 @@ import numpy as _real_numpy
 import os 
 
 from config import NUM_PATCHES_X, NUM_PATCHES_Y, THRESHOLD, BODY_MASS
-from assembly_utils import expand_RC, prune_extinct # Removed draw_interactions
+from assembly_utils import expand_RC, prune_extinct 
 from models_ibm import IBMModel
 from models_psd2 import PSD2Model
 import simulation_utils as sim_utils
@@ -19,7 +19,7 @@ from trait_logic import TraitManager
 log = logging.getLogger(__name__)
 
 class StepwiseAssembler(abc.ABC):
-    def __init__(self, *, base_r=1.0, frac_multi=0.05, F_sat=None, max_rounds=None,
+    def __init__(self, *, base_r=1.0, frac_multi=0.01, F_sat=None, max_rounds=None,
                  max_attempts=None, richness_cap=None, seed_size=1,
                  detection_threshold=None, seed=0, checkpoint_fn=None,
                  init_state=None, init_r=None, init_C=None, 
@@ -30,7 +30,7 @@ class StepwiseAssembler(abc.ABC):
         self.trait_manager = TraitManager(rng=self.rng)
 
         self.base_r = base_r
-        self.frac_multi = frac_multi
+        self.frac_multi = frac_multi # <--- Parameter controlling scaling
         self.F_sat = F_sat
         self.max_rounds = max_rounds
         self.max_attempts = max_attempts
@@ -75,49 +75,45 @@ class StepwiseAssembler(abc.ABC):
 
         for rnd in rounds_iter:
             gamma_current = len(r)
-            n_cand = 1 
+            
+            # <--- RESTORED SCALING LOGIC --->
+            # Calculate candidates based on gamma and frac_multi
+            # e.g., if gamma=100 and frac_multi=0.05, try 5 species this round.
+            n_cand = max(1, int(gamma_current * self.frac_multi))
 
             if (self.max_attempts and attempts >= self.max_attempts) or \
                (self.richness_cap and gamma_current >= self.richness_cap):
                 log.info(f"[{self.engine_name}] Stopping due to attempt/richness cap.")
                 break
 
+            if self.F_sat is not None and attempts >= self.F_sat * gamma_current:
+                log.info(f"[{self.engine_name}] Stopping due to saturation: attempts={attempts} >= {self.F_sat}*γ")
+                break
+
             r_big, C_big, traits_big = r, C, traits
             
             for _ in range(n_cand):
                 # 1. Generate Trait
-                new_trait = self.trait_manager.generate_traits(1) # Shape (1,)
+                new_trait = self.trait_manager.generate_traits(1) 
                 
-                # 2. Get Spatial Growth Rates
+                # 2. Get Spatial Growth Rates (1, P)
                 new_r_val = self.trait_manager.get_growth_rates(new_trait)
+                new_r_val = np.asarray(new_r_val, dtype=np.float32)
                 
-                # 3. Calculate Interactions (Delegating Topology to TraitManager)
+                # 3. Calculate Interactions
                 curr_S = len(r_big)
                 
-                # We construct full vectors comparing New Species vs All Existing Species
-                
-                # --- Row: Effect of Existing (Source) on New (Target) ---
-                # Target is New (repeated S times), Source is Existing (list of S)
-                # Using numpy broadcast logic on CPU for index generation
                 target_traits_row = _real_numpy.broadcast_to(sim_utils.to_host(new_trait), (curr_S,))
                 source_traits_row = sim_utils.to_host(traits_big[:curr_S])
-                
                 row_vector = self.trait_manager.get_interaction_strengths(target_traits_row, source_traits_row)
-                
-                # Filter for non-zeros (Sparsity)
                 row_inds = _real_numpy.nonzero(row_vector)[0]
-                row_vals = row_vector[row_inds]
+                row_vals = np.asarray(row_vector[row_inds], dtype=np.float32)
                 
-                # --- Col: Effect of New (Source) on Existing (Target) ---
-                # Target is Existing, Source is New
                 target_traits_col = sim_utils.to_host(traits_big[:curr_S])
                 source_traits_col = _real_numpy.broadcast_to(sim_utils.to_host(new_trait), (curr_S,))
-                
                 col_vector = self.trait_manager.get_interaction_strengths(target_traits_col, source_traits_col)
-                
-                # Filter for non-zeros
                 col_inds = _real_numpy.nonzero(col_vector)[0]
-                col_vals = col_vector[col_inds]
+                col_vals = np.asarray(col_vector[col_inds], dtype=np.float32)
                 
                 # 4. Expand
                 r_big, C_big = expand_RC(r_big, C_big, new_r_val, row_inds, col_inds, row_vals, col_vals)
@@ -128,6 +124,7 @@ class StepwiseAssembler(abc.ABC):
             attempts += n_cand
             
             presence_matrix = self._get_presence_matrix(final_state)
+            # Check only the last n_cand rows for establishment
             estab_mask = self._check_presence(presence_matrix[-n_cand:])
             
             if estab_mask.any():
@@ -166,11 +163,7 @@ class StepwiseAssembler(abc.ABC):
 
             if self.checkpoint_fn:
                 self.checkpoint_fn(dict(r=r, C=C, state=state, traits=traits, occ=0, attempts=attempts, gamma=gamma_new, round=rnd, thr=self.detection_threshold))
-            
-            if self.F_sat is not None and attempts >= self.F_sat * gamma_new:
-                log.info(f"[{self.engine_name}] Stopping due to saturation: attempts={attempts} >= {self.F_sat}*γ")
-                break
-        
+                    
         return self._package_results(r, C, state, traits)
 
     def _package_results(self, r, C, final_state, traits):
@@ -211,15 +204,13 @@ class IBMAssembler(StepwiseAssembler):
         if os.path.exists("IBM_biomass_value.txt"): os.remove("IBM_biomass_value.txt")
         
         traits = self.trait_manager.generate_traits(1)
-        # r_field is (1, P)
         r_field = self.trait_manager.get_growth_rates(traits)
+        r_field = np.asarray(r_field, dtype=np.float32)
         
-        r = r_field # Store r as matrix
-        C = np.array([[1.0]])
+        r = r_field 
+        C = np.array([[1.0]], dtype=np.float32)
         
-        # Initial N based on local r
         N = np.zeros((1, NUM_PATCHES_Y, NUM_PATCHES_X), dtype=int)
-        
         r_reshaped = r_field[0].reshape(NUM_PATCHES_Y, NUM_PATCHES_X)
         N[0] = np.rint(np.maximum(0, r_reshaped) / BODY_MASS).astype(int)
             
@@ -257,14 +248,15 @@ class PSD2Assembler(StepwiseAssembler):
         if os.path.exists("PSD2_biomass_value.txt"): os.remove("PSD2_biomass_value.txt")
         
         traits = self.trait_manager.generate_traits(1)
-        r_field = self.trait_manager.get_growth_rates(traits) # (1, P)
+        r_field = self.trait_manager.get_growth_rates(traits) 
+        r_field = np.asarray(r_field, dtype=np.float32)
 
         r = r_field
-        C = np.array([[1.0]])
+        C = np.array([[1.0]], dtype=np.float32)
         
         r_reshaped = r_field[0].reshape(NUM_PATCHES_Y, NUM_PATCHES_X)
         B = np.zeros((1, NUM_PATCHES_Y, NUM_PATCHES_X))
-        B[0] = r_reshaped # Init B at K
+        B[0] = r_reshaped 
         
         W = np.zeros((1, NUM_PATCHES_Y, NUM_PATCHES_X), dtype=bool)
         PC = np.ones((1, NUM_PATCHES_Y, NUM_PATCHES_X))
