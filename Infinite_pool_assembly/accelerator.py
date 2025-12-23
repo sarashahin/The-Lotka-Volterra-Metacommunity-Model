@@ -3,39 +3,49 @@
 ############################################
 import os
 import sys
+import numpy as _real_numpy
 
-# <FIX> Define locally to avoid circular import with config.py
+# Configuration
 ENABLE_GPU = True
-# </FIX>
 
 has_cuda = False
 has_mps = False
 backend_name = "CPU"
+torch = None  # <--- FIX: Ensure symbol exists for unconditional import
 
+# Detection
 try:
-    import torch
-    if torch.cuda.is_available():
+    import torch as _torch_lib
+    if _torch_lib.cuda.is_available():
         has_cuda = True
-        backend_name = f"NVIDIA CUDA ({torch.cuda.get_device_name(0)})"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        backend_name = f"NVIDIA CUDA ({_torch_lib.cuda.get_device_name(0)})"
+    elif hasattr(_torch_lib.backends, "mps") and _torch_lib.backends.mps.is_available():
         has_mps = True
         backend_name = "Apple Metal (MPS)"
+    
+    # Only expose torch if we actually found a GPU and ENABLE_GPU is set
+    if ENABLE_GPU and (has_cuda or has_mps):
+        torch = _torch_lib
 except ImportError:
     pass
 
-if ENABLE_GPU and (has_cuda or has_mps):
-    import torch
-    import torch.nn.functional as F
-    import numpy as _real_numpy 
+# --- Helper to map args ---
+def _map_args(kwargs):
+    if 'axis' in kwargs: kwargs['dim'] = kwargs.pop('axis')
+    return kwargs
 
+# =========================================================================
+# GPU BACKEND (PyTorch)
+# =========================================================================
+if torch is not None:
+    import torch.nn.functional as F
+    
     device = "cuda" if has_cuda else "mps"
     torch.set_default_device(device)
 
     def _as_tensor(x, dtype=None):
-        if isinstance(x, _real_numpy.ndarray):
-            return torch.from_numpy(x).to(device)
-        if not isinstance(x, torch.Tensor):
-            return torch.as_tensor(x, device=device)
+        if isinstance(x, _real_numpy.ndarray): return torch.from_numpy(x).to(device)
+        if not isinstance(x, torch.Tensor): return torch.as_tensor(x, device=device)
         return x
 
     def _tensor_astype(self, dtype):
@@ -60,9 +70,22 @@ if ENABLE_GPU and (has_cuda or has_mps):
     torch.Tensor.__array__ = _tensor_array 
     torch.Tensor.flat = _tensor_flat
 
-    def _map_args(kwargs):
-        if 'axis' in kwargs: kwargs['dim'] = kwargs.pop('axis')
-        return kwargs
+    # Internal helper for NumPy compatibility
+    def _sanitize_dtype(dtype):
+        if dtype is None: return None
+        if dtype is float or dtype == 'float' or dtype == _real_numpy.float64: return torch.float32
+        if dtype is int or dtype == 'int' or dtype == _real_numpy.int64: return torch.int64
+        if dtype is bool or dtype == 'bool': return torch.bool
+        return dtype
+        
+    def _to_numpy_dtype(dtype):
+        if dtype == torch.float32 or dtype == torch.float64: return _real_numpy.float64
+        if dtype == torch.float16: return _real_numpy.float16
+        if dtype == torch.int64: return _real_numpy.int64
+        if dtype == torch.int32: return _real_numpy.int32
+        if dtype == torch.int16: return _real_numpy.int16
+        if dtype == torch.bool: return bool
+        return dtype
 
     class RandomShim:
         def seed(self, seed_val):
@@ -92,50 +115,28 @@ if ENABLE_GPU and (has_cuda or has_mps):
             return torch.normal(mean=float(loc), std=float(scale), size=size)
 
         def poisson(self, lam, size=None):
-            """
-            Branchless Poisson for MPS/M4.
-            Computes BOTH Normal Approx and Exact Inverse Transform for ALL elements,
-            then selects the valid one on GPU. Wastes FLOPs to save Latency.
-            """
+            # Branchless Poisson (Normal + Exact + Branchless Selection)
             lam_t = _as_tensor(lam).float()
             if size is not None: lam_t = lam_t.expand(size)
             
-            # 1. Normal Approximation (Always Valid, but inaccurate for small lam)
-            # We use abs() to prevent NaN if lam < 0 during transient states
             sigma = torch.sqrt(torch.abs(lam_t)) 
             res_normal = torch.normal(lam_t, sigma).round().long()
             res_normal = torch.clamp(res_normal, min=0)
 
-            # 2. Exact Inverse Transform Sampling (Vectorized)
-            # We use a fixed expansion of K=128. This covers Lambda up to ~80 safely.
-            # Our threshold is 30, so this is plenty.
             K_MAX = 128
-            
-            # (N, 1)
             lam_flat = lam_t.unsqueeze(-1) 
-            # (1, 128)
             k = torch.arange(K_MAX, device=lam_t.device, dtype=torch.float32).unsqueeze(0)
             
-            # Log PMF: k*ln(lam) - lam - ln(k!)
-            # Add epsilon to lam to avoid log(0)
             log_pmf = (k * torch.log(lam_flat + 1e-30)) - lam_flat - torch.lgamma(k + 1.0)
             cdf = torch.cumsum(torch.exp(log_pmf), dim=-1)
             
-            # Draw uniforms: (N, 1)
             u = torch.rand(lam_flat.shape, device=lam_t.device)
-            # Count how many steps in CDF we passed
             res_exact = (cdf < u).sum(dim=-1).long()
             
-            # 3. Branchless Selection
-            # If Lambda > 30, use Normal. Else use Exact.
-            # No CPU Sync.
             return torch.where(lam_t > 30.0, res_normal, res_exact)
 
         def binomial(self, n, p, size=None):
-            """
-            Branchless Binomial for MPS/M4.
-            Computes Normal, Poisson, and Exact branches for ALL elements.
-            """
+            # Branchless Binomial (Normal + Poisson + Exact)
             n_in = _as_tensor(n)
             p_in = _as_tensor(p)
             
@@ -146,55 +147,30 @@ if ENABLE_GPU and (has_cuda or has_mps):
             n_float = n_in.float()
             p_float = p_in.float()
             
-            # Thresholds
             N_CUTOFF = 30.0
             LAM_CUTOFF = 30.0
             lam = n_float * p_float
             
-            # --- Branch 1: Normal Approx (Large N, Large P) ---
             sigma = torch.sqrt(lam * (1.0 - p_float) + 1e-6)
             res_normal = torch.normal(lam, sigma).round().long()
             res_normal = torch.clamp(res_normal, min=0)
-            res_normal = torch.min(res_normal, n_in) # Cap at N
+            res_normal = torch.min(res_normal, n_in)
 
-            # --- Branch 2: Poisson Approx (Large N, Small P) ---
-            # Reuse our branchless poisson from above
             res_poisson = self.poisson(lam)
             res_poisson = torch.min(res_poisson, n_in)
 
-            # --- Branch 3: Exact Bernoulli (Small N) ---
-            # We simulate 30 coin flips for EVERYONE.
-            # If N > 30, this result is garbage (capped at 30), but masked out later.
             MAX_FLIPS = 30
-            
-            # Expand to (..., 30)
-            # u: Random numbers [0,1]
             u_flips = torch.rand(n_float.shape + (MAX_FLIPS,), device=n_float.device)
-            
-            # Trial indices: (1, 30)
             idx = torch.arange(MAX_FLIPS, device=n_float.device).unsqueeze(0)
-            
-            # Active trials mask: only count flips where trial_index < n
-            # (..., 1)
             n_broad = n_float.unsqueeze(-1)
             p_broad = p_float.unsqueeze(-1)
-            
             active_mask = idx < n_broad
             success_mask = (u_flips < p_broad) & active_mask
             res_exact = success_mask.sum(dim=-1).long()
 
-            # --- Branchless Selection ---
-            # Condition 1: Use Exact if N <= 30
-            # Condition 2: Use Poisson if N > 30 AND Lam <= 30
-            # Condition 3: Otherwise Normal
-            
             is_small_n = n_float <= N_CUTOFF
             is_rare    = (n_float > N_CUTOFF) & (lam <= LAM_CUTOFF)
             
-            # Nested Where: 
-            # If Small N -> Exact
-            # Else If Rare -> Poisson
-            # Else -> Normal
             final = torch.where(
                 is_small_n, 
                 res_exact, 
@@ -239,37 +215,18 @@ if ENABLE_GPU and (has_cuda or has_mps):
             self.r_ = R_Shim()
             self.ndarray = torch.Tensor
 
-        def _sanitize_dtype(self, dtype):
-            if dtype is None: return None
-            if dtype is float or dtype == 'float' or dtype == _real_numpy.float64:
-                return torch.float32
-            if dtype is int or dtype == 'int' or dtype == _real_numpy.int64:
-                return torch.int64
-            if dtype is bool or dtype == 'bool':
-                return torch.bool
-            return dtype
-
-        def _to_numpy_dtype(self, dtype):
-            if dtype == torch.float32 or dtype == torch.float64: return _real_numpy.float64
-            if dtype == torch.float16: return _real_numpy.float16
-            if dtype == torch.int64: return _real_numpy.int64
-            if dtype == torch.int32: return _real_numpy.int32
-            if dtype == torch.int16: return _real_numpy.int16
-            if dtype == torch.bool: return bool
-            return dtype
-
         def _parse_creation_args(self, args, kwargs):
             if len(args) > 1:
                 potential_dtype = args[1]
                 if isinstance(potential_dtype, (type, torch.dtype, str)):
-                    kwargs['dtype'] = self._sanitize_dtype(potential_dtype)
+                    kwargs['dtype'] = _sanitize_dtype(potential_dtype)
                     args = (args[0],) + args[2:]
             if 'dtype' in kwargs:
-                kwargs['dtype'] = self._sanitize_dtype(kwargs['dtype'])
+                kwargs['dtype'] = _sanitize_dtype(kwargs['dtype'])
             return args, kwargs
             
         def array(self, data, dtype=None, **kwargs):
-            dtype = self._sanitize_dtype(dtype)
+            dtype = _sanitize_dtype(dtype)
             if isinstance(data, torch.Tensor): return data.to(dtype) if dtype else data
             return torch.tensor(data, dtype=dtype, **kwargs)
             
@@ -285,11 +242,11 @@ if ENABLE_GPU and (has_cuda or has_mps):
             return torch.ones(*args, **kwargs)
         
         def zeros_like(self, a, dtype=None, **kwargs):
-            dtype = self._sanitize_dtype(dtype)
+            dtype = _sanitize_dtype(dtype)
             return torch.zeros_like(_as_tensor(a), dtype=dtype, **kwargs)
             
         def ones_like(self, a, dtype=None, **kwargs):
-            dtype = self._sanitize_dtype(dtype)
+            dtype = _sanitize_dtype(dtype)
             return torch.ones_like(_as_tensor(a), dtype=dtype, **kwargs)
 
         def empty(self, *args, **kwargs):
@@ -355,18 +312,18 @@ if ENABLE_GPU and (has_cuda or has_mps):
         
         def maximum(self, x, y, dtype=None):
             if isinstance(x, _real_numpy.ndarray) or isinstance(y, _real_numpy.ndarray):
-                np_dtype = self._to_numpy_dtype(dtype) if dtype else None
+                np_dtype = _to_numpy_dtype(dtype) if dtype else None
                 return _real_numpy.maximum(x, y, dtype=np_dtype)
             res = torch.maximum(_as_tensor(x), _as_tensor(y))
-            if dtype is not None: return res.to(self._sanitize_dtype(dtype))
+            if dtype is not None: return res.to(_sanitize_dtype(dtype))
             return res
             
         def minimum(self, x, y, dtype=None):
             if isinstance(x, _real_numpy.ndarray) or isinstance(y, _real_numpy.ndarray):
-                np_dtype = self._to_numpy_dtype(dtype) if dtype else None
+                np_dtype = _to_numpy_dtype(dtype) if dtype else None
                 return _real_numpy.minimum(x, y, dtype=np_dtype)
             res = torch.minimum(_as_tensor(x), _as_tensor(y))
-            if dtype is not None: return res.to(self._sanitize_dtype(dtype))
+            if dtype is not None: return res.to(_sanitize_dtype(dtype))
             return res
             
         def divide(self, x, y): return torch.div(_as_tensor(x), _as_tensor(y))
@@ -439,6 +396,9 @@ if ENABLE_GPU and (has_cuda or has_mps):
         def reshape(self, a, newshape): return _as_tensor(a).reshape(newshape)
         def transpose(self, a, axes=None): return _as_tensor(a).t() if axes is None else _as_tensor(a).permute(axes)
         def fill_diagonal(self, a, val): return _as_tensor(a).fill_diagonal_(val)
+
+        # Added for dispersal.py compatibility
+        def roll(self, a, shift, axis=None): return torch.roll(_as_tensor(a), shifts=shift, dims=axis)
         
         def ix_(self, *args):
             args_t = [_as_tensor(a) for a in args]
@@ -477,6 +437,8 @@ if ENABLE_GPU and (has_cuda or has_mps):
         def rfft2(self, x, s=None, **kwargs): return torch.fft.rfft2(x, s=s, **_map_args(kwargs))
         def fftfreq(self, n, d=1.0): return torch.fft.fftfreq(n, d=d)
         def rfftfreq(self, n, d=1.0): return torch.fft.rfftfreq(n, d=d)
+        def ifftshift(self, x): return torch.fft.ifftshift(x)
+        def fftshift(self, x): return torch.fft.fftshift(x)
     fft = FFTShim()
 
     class LinalgShim:
@@ -496,18 +458,37 @@ if ENABLE_GPU and (has_cuda or has_mps):
         if isinstance(data, torch.Tensor): return data.detach().cpu().numpy()
         return data
 
-    print(f"🔋  Using PyTorch Wrapper on {backend_name}")
+    print(f"🔋  Using PyTorch Wrapper on {backend_name}")
 
+# =========================================================================
+# CPU BACKEND (NumPy / SciPy)
+# =========================================================================
 else:
     import numpy
-    import scipy.fft
+    import scipy.fft as _scipy_fft
     import scipy.linalg
     import scipy.sparse
     np = numpy
-    fft = scipy.fft
+    
+    # Unified FFT wrapper for CPU that mimics the torch API used above
+    class FFTShimCPU:
+        def fft(self, x, n=None, **kwargs): return _scipy_fft.fft(x, n=n, **kwargs)
+        def ifft(self, x, n=None, **kwargs): return _scipy_fft.ifft(x, n=n, **kwargs)
+        def fft2(self, x, s=None, **kwargs): return _scipy_fft.fft2(x, s=s, **kwargs)
+        def ifft2(self, x, s=None, **kwargs): return _scipy_fft.ifft2(x, s=s, **kwargs)
+        def rfft(self, x, n=None, **kwargs): return _scipy_fft.rfft(x, n=n, **kwargs)
+        def irfft(self, x, n=None, **kwargs): return _scipy_fft.irfft(x, n=n, **kwargs)
+        def rfft2(self, x, s=None, **kwargs): return _scipy_fft.rfft2(x, s=s, **kwargs)
+        def irfft2(self, x, s=None, **kwargs): return _scipy_fft.irfft2(x, s=s, **kwargs)
+        def fftfreq(self, n, d=1.0): return _scipy_fft.fftfreq(n, d=d)
+        def rfftfreq(self, n, d=1.0): return _scipy_fft.rfftfreq(n, d=d)
+        def ifftshift(self, x): return _scipy_fft.ifftshift(x)
+        def fftshift(self, x): return _scipy_fft.fftshift(x)
+    fft = FFTShimCPU()
+    
     linalg = scipy.linalg
     sparse = scipy.sparse
     def to_host(data): return data
-    print("🖥️   Using NumPy/SciPy on CPU")
+    print("🖥️   Using NumPy/SciPy on CPU")
 
 def to_cpu(data): return to_host(data)
