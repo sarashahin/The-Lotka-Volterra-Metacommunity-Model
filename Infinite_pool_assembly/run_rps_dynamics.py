@@ -122,7 +122,7 @@ def animate_spatial(traj, title='', filename=None, fps=30, padding=2):
     
     # Sanitize & Normalize
     traj = std_np.nan_to_num(traj, nan=0.0, posinf=0.0, neginf=0.0)
-    v_max = std_np.percentile(traj, 99.9) if traj.max() > 0 else 1.0
+    v_max = 1 # std_np.percentile(traj, 99.9) if traj.max() > 0 else 1.0
     if v_max == 0: v_max = 1.0
     
     cmap = matplotlib.colormaps['viridis']
