@@ -372,7 +372,7 @@ class PSD2Model:
         count_D = int(np.sum(mask_D))
         count_Total = self.S * self.N_patches
         
-        logger.info(f"[PSD2 STATS] Total: {count_Total} | S (Wait): {count_S} ({count_S/count_Total:.1%}) | P (Prob): {count_P} ({count_P/count_Total:.1%}) | D (Det): {count_D} ({count_D/count_Total:.1%})")
+        logger.info(f"[PSD2 STATS] Total: {count_Total} | S (Wait): {count_S} ({count_S/count_Total:.1%}) | P (Prob): {count_P} ({count_P/count_Total:.1%}) | D (Det): {count_D} ({count_D/(self.N_patches*10):.1%})")
 
         # --- DIAGNOSTICS: ASCII Histograms ---
         # Helper for ASCII Histogram
@@ -394,6 +394,12 @@ class PSD2Model:
                 lower = edges[i]
                 upper = edges[i+1]
                 out.append(f"{lower:8.4f} .. {upper:8.4f} | {bar} ({counts[i]})")
+            
+            # Stats (Added per request)
+            mean_val = _cpu_numpy.mean(data)
+            std_val = _cpu_numpy.std(data)
+            out.append(f"Stats: Mean={mean_val:.4f}, StdDev={std_val:.4f}")
+            
             return "\n".join(out)
 
         # Filter for P and S populations combined
