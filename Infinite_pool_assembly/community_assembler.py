@@ -19,7 +19,7 @@ from trait_logic import TraitManager
 log = logging.getLogger(__name__)
 
 class StepwiseAssembler(abc.ABC):
-    def __init__(self, *, base_r=1.0, frac_multi=0.01, F_sat=None, max_rounds=None,
+    def __init__(self, *, base_r=1.0, frac_multi=0.00, F_sat=None, max_rounds=None,
                  max_attempts=None, richness_cap=None, seed_size=1,
                  detection_threshold=None, seed=0, checkpoint_fn=None,
                  init_state=None, init_r=None, init_C=None, 
