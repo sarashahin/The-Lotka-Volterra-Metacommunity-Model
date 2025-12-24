@@ -97,14 +97,15 @@ class PSD2Model:
         self.nrecords = int(max(1, self.tmax // self.record_step))
         out_shape = (self.nrecords + 1, *self.shape_2d)
         
-        self.trajectory = _cpu_numpy.zeros(out_shape, dtype=_cpu_numpy.float32)
-        self.wait_trajectory = _cpu_numpy.zeros(out_shape, dtype=bool)
-        self.time_points = _cpu_numpy.zeros(self.nrecords + 1)
+        # <--- FIX: Allocate on DEVICE (GPU) to avoid syncing during loop
+        self.trajectory = np.zeros(out_shape, dtype=float)
+        self.wait_trajectory = np.zeros(out_shape, dtype=bool)
+        self.time_points = _cpu_numpy.zeros(self.nrecords + 1) # Time is small, keep CPU
 
-        self.poisson_clock_traj = _cpu_numpy.zeros(out_shape, dtype=_cpu_numpy.float32)
-        self.growth_rate_traj = _cpu_numpy.zeros(out_shape, dtype=_cpu_numpy.float32)
-        self.invasion_rate_traj = _cpu_numpy.zeros(out_shape, dtype=_cpu_numpy.float32)
-        self.establishment_prob_traj = _cpu_numpy.zeros(out_shape, dtype=_cpu_numpy.float32)
+        self.poisson_clock_traj = np.zeros(out_shape, dtype=float)
+        self.growth_rate_traj = np.zeros(out_shape, dtype=float)
+        self.invasion_rate_traj = np.zeros(out_shape, dtype=float)
+        self.establishment_prob_traj = np.zeros(out_shape, dtype=float)
 
         logger.info(f"PSD2Model initialized: S={self.S}, Patches={self.N_patches} (Cached + Dense Recompute)")
 
@@ -340,13 +341,14 @@ class PSD2Model:
             est_prob = self._get_est_prob(non_self_g)
             inv_rate = inv_flux * est_prob / BODY_MASS
             
-            self.trajectory[i] = to_cpu(B).reshape(self.shape_2d)
-            self.poisson_clock_traj[i] = to_cpu(pclock).reshape(self.shape_2d)
-            self.growth_rate_traj[i] = to_cpu(non_self_g).reshape(self.shape_2d)
-            self.invasion_rate_traj[i] = to_cpu(inv_rate).reshape(self.shape_2d)
-            self.establishment_prob_traj[i] = to_cpu(est_prob).reshape(self.shape_2d)
+            # <--- FIX: Store on GPU (Non-blocking)
+            self.trajectory[i] = B.reshape(self.shape_2d)
+            self.poisson_clock_traj[i] = pclock.reshape(self.shape_2d)
+            self.growth_rate_traj[i] = non_self_g.reshape(self.shape_2d)
+            self.invasion_rate_traj[i] = inv_rate.reshape(self.shape_2d)
+            self.establishment_prob_traj[i] = est_prob.reshape(self.shape_2d)
             
-            self.wait_trajectory[i] = to_cpu(pclock < 0).reshape(self.shape_2d)
+            self.wait_trajectory[i] = (pclock < 0).reshape(self.shape_2d)
 
         # --- DIAGNOSTICS: Population States ---
         y_final = solver.y
@@ -372,7 +374,7 @@ class PSD2Model:
         count_D = int(np.sum(mask_D))
         count_Total = self.S * self.N_patches
         
-        logger.info(f"[PSD2 STATS] Total: {count_Total} | S (Wait): {count_S} ({count_S/count_Total:.1%}) | P (Prob): {count_P} ({count_P/count_Total:.1%}) | D (Det): {count_D} ({count_D/(self.N_patches*10):.1%})")
+        logger.info(f"[PSD2 STATS] Total: {count_Total} | S (Wait): {count_S} ({count_S/count_Total:.1%}) | P (Prob): {count_P} ({count_P/count_Total:.1%}) | D (Det): {count_D} ({count_D/count_Total:.1%})")
 
         # --- DIAGNOSTICS: ASCII Histograms ---
         # Helper for ASCII Histogram
@@ -418,4 +420,14 @@ class PSD2Model:
             logger.info("[PSD2 STATS] No P or S populations found for histogram.")
 
         logger.info("PSD2 simulation completed.")
-        return (self.time_points, self.trajectory, self.wait_trajectory, self.poisson_clock_traj, self.growth_rate_traj, self.invasion_rate_traj, self.establishment_prob_traj)
+        
+        # <--- FIX: Bulk transfer at the very end
+        return (
+            self.time_points, 
+            to_cpu(self.trajectory), 
+            to_cpu(self.wait_trajectory), 
+            to_cpu(self.poisson_clock_traj), 
+            to_cpu(self.growth_rate_traj), 
+            to_cpu(self.invasion_rate_traj), 
+            to_cpu(self.establishment_prob_traj)
+        )
