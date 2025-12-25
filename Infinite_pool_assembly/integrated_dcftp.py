@@ -4,7 +4,7 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.stats import logser, chi2
+from scipy.stats import logser, chi2, linregress
 from scipy.optimize import brentq
 import hashlib
 import secrets
@@ -30,6 +30,7 @@ class IntegratedDCFTP:
         self.L_y = NUM_PATCHES_Y
         self.L_x = NUM_PATCHES_X
         self.N = self.L_x * self.L_y
+        self.ext_scaling = 1.0  # Default scaling factor
         
         # 1. Load Effective Parameters from CSV
         if not os.path.exists(csv_path):
@@ -54,21 +55,30 @@ class IntegratedDCFTP:
         
         raw_pCol = df[col_pCol].values
         raw_meanB = df[col_meanB].values
-        raw_ext = df[col_ext].values * DISPERSAL_RATE
+        raw_ext = df[col_ext].values
         
         # Broadcast to (Y, X) then flatten to (N,) for simulation logic
         self.pCol_field = np.repeat(raw_pCol[:, np.newaxis], self.L_x, axis=1).flatten()
         self.meanB_field = np.repeat(raw_meanB[:, np.newaxis], self.L_x, axis=1).flatten()
-        self.extRate_field = np.repeat(raw_ext[:, np.newaxis], self.L_x, axis=1).flatten()
+        self.base_extRate_field = np.repeat(raw_ext[:, np.newaxis], self.L_x, axis=1).flatten()
         
-        # Pre-calculate survival probability (exp(-rate)) assuming Step Size 1
-        # Similar to models_ibm.py: survival_prob = np.exp(-mortality * STEP)
-        self.survival_prob = np.exp(-self.extRate_field)
+        # Initialize effective extirpation rate
+        self.set_extirpation_scaling(1.0)
 
         print(f"Initialized IntegratedDCFTP for Species Type {species_type}")
         print(f"  Grid: {self.L_y}x{self.L_x}")
         print(f"  Mean Abundance Range: {self.meanB_field.min():.3f} - {self.meanB_field.max():.3f}")
-        print(f"  Extirpation Rate Range: {self.extRate_field.min():.3f} - {self.extRate_field.max():.3f}")
+        print(f"  Base Extirpation Rate Range: {self.base_extRate_field.min():.3f} - {self.base_extRate_field.max():.3f}")
+
+    def set_extirpation_scaling(self, factor):
+        """
+        Scales the extirpation rates by a factor.
+        Used to tune the system towards criticality.
+        """
+        self.ext_scaling = factor
+        # Recalculate survival probabilities
+        # survival_prob = exp( - rate * factor )
+        self.survival_prob = np.exp(-self.base_extRate_field * self.ext_scaling)
 
     def get_coupled_rng(self, t, master_seed):
         """
@@ -82,12 +92,6 @@ class IntegratedDCFTP:
     def simulation_step(self, current_state, t, master_seed):
         """
         Advances the grid one step.
-        
-        Logic mirrors the Metacommunity Model but uses Effective Fields:
-        1. Effective Biomass = Occupancy * meanAbundance
-        2. Flux = dispersal.compute_dispersal(Effective Biomass)
-        3. Colonization Rate = (Flux / BODY_MASS) * pColonisation
-        4. Extinction = standard Bernoulli based on extirpationRate
         """
         rng = self.get_coupled_rng(t, master_seed)
         
@@ -96,21 +100,14 @@ class IntegratedDCFTP:
         rand_col = rng.random(self.N)
         
         # --- A. Extinction ---
-        # Survive if random > (1 - survival_prob)  <==> random < survival_prob
-        # Using the standard "survivors = state & (rand < prob)" convention
+        # Survive if random < survival_prob (which includes ext_scaling)
         survivors = current_state & (rand_ext < self.survival_prob)
         
         # --- B. Colonization ---
-        
         # 1. Construct Effective Biomass Field
-        # Where species is present (1), biomass is meanAbundance. Where absent (0), biomass is 0.
         eff_biomass_flat = current_state.astype(float) * self.meanB_field
         
         # 2. Compute Dispersal Flux (Using imported dispersal module)
-        # dispersal.compute_dispersal expects shape (S, Y, X) or (Y, X) depending on implementation.
-        # models_ibm calls it with (S, Y, X).
-        # We reshape to (1, Y, X) to be safe and use accelerator types.
-        
         eff_biomass_2d = eff_biomass_flat.reshape(1, self.L_y, self.L_x)
         
         # Move to accelerator (GPU/CPU shim)
@@ -118,22 +115,19 @@ class IntegratedDCFTP:
         b_device = accel_np.asarray(eff_biomass_2d.astype(np.float32))
         
         # Calculate Flux (includes DISPERSAL_RATE from config)
-        flux_device = dispersal.compute_dispersal(b_device)
+        flux_device = dispersal.compute_dispersal(b_device)/(DISPERSAL_RATE/BODY_MASS)
         
         # Move back to Host CPU for CFTP logic
         flux_host = to_cpu(flux_device).flatten()
         
         # 3. Calculate Probability of Establishment
         # Rate = Flux (biomass/time) / BODY_MASS (biomass/ind) * pColonisation (prob/ind)
-        # Note: pColonisation is loaded from CSV
-        
         colonization_rate = (flux_host / BODY_MASS) * self.pCol_field
         
         # Probability of at least one successful colonization event in step dt=1
         prob_colonization = 1.0 - np.exp(-colonization_rate)
         
         # 4. Determine New Colonizations
-        # Can only colonize empty patches
         newly_colonized = (~current_state) & (rand_col < prob_colonization)
         
         return survivors | newly_colonized
@@ -142,6 +136,7 @@ class IntegratedDCFTP:
         """
         Runs the Dominated Coupling From The Past (DCFTP) algorithm
         to generate one perfect sample from the steady state distribution.
+        Returns None if system appears supercritical (explodes).
         """
         # --- PHASE 1: FIND THE HORIZON (Backward) ---
         T_horizon = 1
@@ -159,12 +154,12 @@ class IntegratedDCFTP:
                 break
             else:
                 T_horizon *= 2
-                if T_horizon > 100000: 
+                if T_horizon > 10000: 
                     # System might be supercritical or T is too large
-                    return np.zeros(self.N, dtype=bool)
+                    # Treat this as an "explosion"
+                    return None
 
         # --- PHASE 2: REJECTION SAMPLING (Forward) ---
-        # Batched approach for efficiency
         batch_size = 5
         attempts = 0
         
@@ -178,10 +173,7 @@ class IntegratedDCFTP:
             survivors_in_batch = []
             
             for arrival_t in arrival_times:
-                # Initialize one random patch
-                # Weight by meanAbundance or pColonisation? 
-                # Ideally weight by steady-state likelihood, but uniform is valid for rejection sampling start
-                # Using pCol as a proxy for habitat quality
+                # Initialize one random patch (weighted by pCol)
                 weights = self.pCol_field / self.pCol_field.sum()
                 start_node = meta_rng.choice(self.N, p=weights)
                 
@@ -200,9 +192,134 @@ class IntegratedDCFTP:
                 # Return one survivor randomly
                 return survivors_in_batch[meta_rng.integers(0, len(survivors_in_batch))]
             
-            if attempts > 1000:
-                # Safety valve
+            if attempts > 200: # 1000 attempts * 5 batch size
+                # Likely empty world or very low survival
                 return np.zeros(self.N, dtype=bool)
+
+def tune_extirpation_scaling(model, target_mean_occupancy, max_iter=100, samples_per_iter=4):
+    """
+    Search algorithm to find the scaling factor for extirpation rates
+    that yields the target mean occupancy.
+    
+    Strategy:
+    1. We want to find scaling 's' such that MeanOcc(s) = target.
+    2. Relationship is roughly: 1/MeanOcc ~ A * s + B (near criticality).
+    3. We iteratively sample (s, MeanOcc) points and update a linear fit 
+       of 1/MeanOcc vs s to predict the next best 's'.
+    """
+    print(f"\n--- Tuning Extirpation Scaling (Target Mean Occ: {target_mean_occupancy}) ---")
+    
+    history_s = []
+    history_inv_mu = [] # 1 / MeanOccupancy
+    
+    # Initial bounds / guesses
+    current_s = 6
+    
+    # Safety bounds for scaling factor
+    s_min = current_s * 0.1
+    s_max = current_s * 10
+    
+    # Pre-generate seeds for stability across iterations? 
+    # No, we want to sample the distribution variance, so new seeds each time is fine.
+    
+    for i in range(max_iter):
+        model.set_extirpation_scaling(current_s)
+        
+        # Run batch of simulations
+        occupancies = []
+        seeds = [secrets.randbits(32) for _ in range(samples_per_iter)]
+        
+        n_exploded = 0
+        for s_seed in seeds:
+            res = model.generate_single_survivor(s_seed)
+            if res is None:
+                n_exploded += 1
+            elif np.any(res):
+                occupancies.append(np.sum(res))
+            else:
+                occupancies.append(0) # Should be excluded from "survivor" mean usually?
+                # Actually generate_single_survivor tries hard to find a survivor.
+                # If it returns zeros, it means extinction is certain.
+        
+        # Filter valid occupancies (survivors only)
+        # Note: generate_single_survivor returns zeros if it fails to find survivor in N attempts
+        valid_occ = [x for x in occupancies if x > 0]
+        
+        if n_exploded > samples_per_iter * 0.5:
+            # Too supercritical
+            mean_occ = float('inf')
+            print(f"Iter {i}: s={current_s:.4f} -> EXPLODED (System Supercritical)")
+            # If exploded, we need to INCREASE extirpation (increase s)
+            # Add a 'virtual' point with very small 1/mu
+            history_s.append(current_s)
+            history_inv_mu.append(0.0) # 1/inf
+            
+            # Heuristic jump up
+            current_s = current_s * 1.5
+            current_s = min(current_s, s_max)
+            continue
+            
+        if len(valid_occ) == 0:
+            mean_occ = 0.0 # Effectively
+            print(f"Iter {i}: s={current_s:.4f} -> EXTINCT (No survivors found)")
+            # Need to DECREASE extirpation (decrease s)
+            history_s.append(current_s)
+            # 1/0 is undefined, pick a large number
+            history_inv_mu.append(2.0) # Corresponds to mean=0.5
+            
+            current_s = current_s * 0.6
+            current_s = max(current_s, s_min)
+            continue
+            
+        mean_occ = np.mean(valid_occ)
+        inv_mu = 1.0 / mean_occ
+        
+        history_s.append(current_s)
+        history_inv_mu.append(inv_mu)
+        
+        print(f"Iter {i}: s={current_s:.4f} -> Mean Occ={mean_occ:.2f} (1/mu={inv_mu:.4f})")
+                    
+        # Refine Estimate: Linear Regression on (s, 1/mu)
+        # 1/mu = slope * s + intercept
+        # We want s_next where 1/mu = 1/target
+        
+        if len(history_s) >= 2:
+            # Use only recent points if we want local fit, or all points for robustness?
+            # Weighted least squares might be better, but simple linregress is robust enough for simple monotonic
+            slope, intercept, r_val, _, _ = linregress(history_s, history_inv_mu)
+            
+            target_inv_mu = 1.0 / target_mean_occupancy
+            
+            # Predict s: s = (y - intercept) / slope
+            if abs(slope) < 1e-5:
+                # Flat line (bad fit), do simple bisection-like step
+                if mean_occ < target_mean_occupancy:
+                    s_next = current_s * 0.8 # Decrease s to increase occ
+                else:
+                    s_next = current_s * 1.2
+            else:
+                s_next = (target_inv_mu - intercept) / slope
+            
+            # Dampening / Bounds
+            # Don't jump too far in one step
+            s_next = max(s_min, min(s_max, s_next))
+            
+            # If s_next is too close to current_s but not converged, force a small nudge
+            # Check convergence
+            PREDICTION_ERROR = 3/0.05
+            if PREDICTION_ERROR / target_mean_occupancy < 0.05:
+                print("  -> Converged!")
+                return next_s
+                
+            current_s = s_next
+        else:
+            # Simple heuristic for second step
+            if mean_occ < target_mean_occupancy:
+                current_s *= 0.8
+            else:
+                current_s *= 1.2
+                
+    return current_s
 
 def analyze_and_plot(ax, samples, title, color):
     """Fits Log-Series and plots histogram + GOF"""
@@ -281,26 +398,37 @@ if __name__ == "__main__":
     else:
         print("Using Nearest Neighbor Dispersal")
 
-    num_samples = 100
+    # --- SIMULATE SPECIES TYPE 1 WITH TUNING ---
+    print("\n--- Tuning Species Type 1 ---")
+    model_t1 = IntegratedDCFTP(species_type=1, csv_path='metacommunity_fields.csv')
+    
+    # Example Target: Occupy ~10% of patches? Or a fixed number?
+    # Grid is 20x20=400. Let's aim for mean occupancy of 20 (5%).
+    target_occ = 20.0
+    optimal_s1 = tune_extirpation_scaling(model_t1, target_mean_occupancy=target_occ)
+    print(f"Optimal Scaling for Type 1: {optimal_s1:.4f}")
+    
+    # Run Final Batch with Optimal Scaling
+    num_samples = 400
     seeds = [secrets.randbits(32) for _ in range(num_samples)]
     
-    # --- SIMULATE SPECIES TYPE 1 ---
-    print("\nSimulating Species Type 1...")
-    model_t1 = IntegratedDCFTP(species_type=1, csv_path='metacommunity_fields.csv')
+    print("\nGenerating Final Type 1 Samples...")
     samples_t1 = []
     for i, s in enumerate(seeds):
-        if i % 50 == 0: print(f"  {i}/{num_samples}")
         res = model_t1.generate_single_survivor(s)
-        if np.any(res): samples_t1.append(res)
+        if res is not None and np.any(res): samples_t1.append(res)
         
-    # --- SIMULATE SPECIES TYPE 2 ---
-    print("\nSimulating Species Type 2...")
+    # --- SIMULATE SPECIES TYPE 2 (No tuning, just use same scaling for demo or tune separate) ---
+    print("\n--- Tuning Species Type 2 ---")
     model_t2 = IntegratedDCFTP(species_type=2, csv_path='metacommunity_fields.csv')
+    optimal_s2 = tune_extirpation_scaling(model_t2, target_mean_occupancy=target_occ)
+    print(f"Optimal Scaling for Type 2: {optimal_s2:.4f}")
+    
+    print("\nGenerating Final Type 2 Samples...")
     samples_t2 = []
     for i, s in enumerate(seeds):
-        if i % 50 == 0: print(f"  {i}/{num_samples}")
         res = model_t2.generate_single_survivor(s)
-        if np.any(res): samples_t2.append(res)
+        if res is not None and np.any(res): samples_t2.append(res)
 
     # --- VISUALIZATION ---
     print("\nGenerating Plots...")
@@ -323,7 +451,7 @@ if __name__ == "__main__":
     if len(samples_t1) > 0:
         example = samples_t1[0].reshape(NUM_PATCHES_Y, NUM_PATCHES_X)
         ax[0,1].imshow(example, cmap='Blues', interpolation='nearest')
-        ax[0,1].set_title("Example Range (Type 1)")
+        ax[0,1].set_title(f"Example Range (Type 1)\nScaling: {optimal_s1:.2f}")
     else:
         ax[0,1].text(0.5, 0.5, "No Survivors", ha='center')
 
