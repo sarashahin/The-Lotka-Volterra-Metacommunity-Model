@@ -4,7 +4,7 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.stats import logser, chi2, linregress
+from scipy.stats import logser, chi2, linregress, t
 from scipy.optimize import brentq
 import hashlib
 import secrets
@@ -196,125 +196,140 @@ class IntegratedDCFTP:
                 # Likely empty world or very low survival
                 return np.zeros(self.N, dtype=bool)
 
-def tune_extirpation_scaling(model, target_mean_occupancy, max_iter=100, samples_per_iter=4):
+def tune_combined_extirpation_scaling(models, target_inv_mu, max_iter=100, samples_per_iter=4):
     """
-    Search algorithm to find the scaling factor for extirpation rates
-    that yields the target mean occupancy.
+    Search algorithm to find the single scaling factor for extirpation rates
+    that yields the target mean inverse occupancy across both species types.
     
-    Strategy:
-    1. We want to find scaling 's' such that MeanOcc(s) = target.
-    2. Relationship is roughly: 1/MeanOcc ~ A * s + B (near criticality).
-    3. We iteratively sample (s, MeanOcc) points and update a linear fit 
-       of 1/MeanOcc vs s to predict the next best 's'.
+    Args:
+        models: List of IntegratedDCFTP objects (e.g. [model_t1, model_t2])
+        target_inv_mu: Target value for E[1/N]
     """
-    print(f"\n--- Tuning Extirpation Scaling (Target Mean Occ: {target_mean_occupancy}) ---")
+    print(f"\n--- Tuning Combined Extirpation Scaling (Target Mean 1/N: {target_inv_mu:.4f}) ---")
     
     history_s = []
-    history_inv_mu = [] # 1 / MeanOccupancy
+    history_inv_mu = [] # Observed E[1/N]
     
     # Initial bounds / guesses
-    current_s = 6
+    current_s = 6.0
     
     # Safety bounds for scaling factor
     s_min = current_s * 0.1
     s_max = current_s * 10
     
-    # Pre-generate seeds for stability across iterations? 
-    # No, we want to sample the distribution variance, so new seeds each time is fine.
-    
     for i in range(max_iter):
-        model.set_extirpation_scaling(current_s)
+        # Apply scaling to all models
+        for m in models:
+            m.set_extirpation_scaling(current_s)
         
-        # Run batch of simulations
-        occupancies = []
+        # Run batch of simulations for each model
+        all_occupancies = []
+        n_exploded = 0
+        n_extinct = 0
+        
         seeds = [secrets.randbits(32) for _ in range(samples_per_iter)]
         
-        n_exploded = 0
-        for s_seed in seeds:
-            res = model.generate_single_survivor(s_seed)
-            if res is None:
-                n_exploded += 1
-            elif np.any(res):
-                occupancies.append(np.sum(res))
-            else:
-                occupancies.append(0) # Should be excluded from "survivor" mean usually?
-                # Actually generate_single_survivor tries hard to find a survivor.
-                # If it returns zeros, it means extinction is certain.
+        for m in models:
+            for s_seed in seeds:
+                res = m.generate_single_survivor(s_seed)
+                if res is None:
+                    n_exploded += 1
+                elif np.any(res):
+                    all_occupancies.append(np.sum(res))
+                else:
+                    n_extinct += 1 # Should theoretically not happen if generate_single_survivor works
         
-        # Filter valid occupancies (survivors only)
-        # Note: generate_single_survivor returns zeros if it fails to find survivor in N attempts
-        valid_occ = [x for x in occupancies if x > 0]
+        total_samples = len(models) * samples_per_iter
         
-        if n_exploded > samples_per_iter * 0.5:
+        if n_exploded > total_samples * 0.5:
             # Too supercritical
-            mean_occ = float('inf')
             print(f"Iter {i}: s={current_s:.4f} -> EXPLODED (System Supercritical)")
-            # If exploded, we need to INCREASE extirpation (increase s)
-            # Add a 'virtual' point with very small 1/mu
             history_s.append(current_s)
-            history_inv_mu.append(0.0) # 1/inf
-            
-            # Heuristic jump up
-            current_s = current_s * 1.5
-            current_s = min(current_s, s_max)
+            history_inv_mu.append(0.0) # 1/inf -> 0
+            current_s = min(current_s * 1.5, s_max)
             continue
             
-        if len(valid_occ) == 0:
-            mean_occ = 0.0 # Effectively
+        if len(all_occupancies) == 0:
             print(f"Iter {i}: s={current_s:.4f} -> EXTINCT (No survivors found)")
-            # Need to DECREASE extirpation (decrease s)
             history_s.append(current_s)
-            # 1/0 is undefined, pick a large number
-            history_inv_mu.append(2.0) # Corresponds to mean=0.5
-            
-            current_s = current_s * 0.6
-            current_s = max(current_s, s_min)
+            history_inv_mu.append(1.0) # 1/1 = 1 (Max possible inv_mu)
+            current_s = max(current_s * 0.6, s_min)
             continue
             
-        mean_occ = np.mean(valid_occ)
-        inv_mu = 1.0 / mean_occ
+        # Calculate statistic: Mean Inverse Occupancy
+        # E[1/N]
+        vals = np.array(all_occupancies)
+        inv_vals = 1.0 / vals
+        obs_inv_mu = np.mean(inv_vals)
         
         history_s.append(current_s)
-        history_inv_mu.append(inv_mu)
+        history_inv_mu.append(obs_inv_mu)
         
-        print(f"Iter {i}: s={current_s:.4f} -> Mean Occ={mean_occ:.2f} (1/mu={inv_mu:.4f})")
+        print(f"Iter {i}: s={current_s:.4f} -> Mean 1/N={obs_inv_mu:.4f}")
                     
-        # Refine Estimate: Linear Regression on (s, 1/mu)
-        # 1/mu = slope * s + intercept
-        # We want s_next where 1/mu = 1/target
+        # Refine Estimate: Linear Regression on (s, inv_mu)
+        # We expect 1/N to be roughly proportional to s (extirpation rate)
+        # near criticality. 
+        # inv_mu = slope * s + intercept
         
-        if len(history_s) >= 2:
-            # Use only recent points if we want local fit, or all points for robustness?
-            # Weighted least squares might be better, but simple linregress is robust enough for simple monotonic
-            slope, intercept, r_val, _, _ = linregress(history_s, history_inv_mu)
+        if len(history_s) >= 3:
+            # Linear Regression
+            slope, intercept, r_val, _, stderr = linregress(history_s, history_inv_mu)
             
-            target_inv_mu = 1.0 / target_mean_occupancy
-            
-            # Predict s: s = (y - intercept) / slope
-            if abs(slope) < 1e-5:
-                # Flat line (bad fit), do simple bisection-like step
-                if mean_occ < target_mean_occupancy:
-                    s_next = current_s * 0.8 # Decrease s to increase occ
+            if abs(slope) < 1e-6:
+                # Flat line (bad fit), heuristic step
+                if obs_inv_mu > target_inv_mu: # 1/N too high => N too low => ext too high
+                    s_next = current_s * 0.8 # Decrease s
                 else:
                     s_next = current_s * 1.2
+                prediction_error = float('inf')
             else:
+                # Predict s_next where inv_mu = target_inv_mu
                 s_next = (target_inv_mu - intercept) / slope
-            
+                
+                # --- PREDICTION ERROR CALCULATION ---
+                # Calculate SE of the predicted value y_hat at x = s_next
+                # SE_y_pred = sigma * sqrt(1 + 1/n + (s_next - s_bar)^2 / Sxx)
+                
+                x_arr = np.array(history_s)
+                y_arr = np.array(history_inv_mu)
+                n = len(x_arr)
+                
+                # Residual Standard Error (sigma)
+                y_fit = slope * x_arr + intercept
+                residuals = y_arr - y_fit
+                sse = np.sum(residuals**2)
+                sigma = np.sqrt(sse / (n - 2)) if n > 2 else 1.0
+                
+                # Sxx
+                x_mean = np.mean(x_arr)
+                sxx = np.sum((x_arr - x_mean)**2)
+                
+                if sxx > 1e-9:
+                    term_dist = (s_next - x_mean)**2 / sxx
+                    se_y_pred = sigma * np.sqrt(1 + 1/n + term_dist)
+                else:
+                    se_y_pred = float('inf')
+                
+                prediction_error = se_y_pred
+
             # Dampening / Bounds
-            # Don't jump too far in one step
             s_next = max(s_min, min(s_max, s_next))
             
-            # If s_next is too close to current_s but not converged, force a small nudge
-            # Check convergence
-            PREDICTION_ERROR = 3/0.05
-            if PREDICTION_ERROR / target_mean_occupancy < 0.05:
-                print("  -> Converged!")
-                return next_s
+            # Convergence Check
+            # Error of the prediction (in units of 1/N) relative to the target
+            rel_error = prediction_error / target_inv_mu
+            
+            print(f"  Prediction: s_next={s_next:.4f}, SE(pred)={prediction_error:.4f} (RelErr={rel_error:.2%})")
+            
+            if rel_error < 0.05: # 5% relative error on the outcome variable
+                print(f"  -> Converged! (Relative Prediction Error: {rel_error:.2%})")
+                return s_next
                 
             current_s = s_next
         else:
-            # Simple heuristic for second step
-            if mean_occ < target_mean_occupancy:
+            # Simple heuristic for early steps
+            if obs_inv_mu > target_inv_mu: # N too small -> decrease s
                 current_s *= 0.8
             else:
                 current_s *= 1.2
@@ -398,17 +413,23 @@ if __name__ == "__main__":
     else:
         print("Using Nearest Neighbor Dispersal")
 
-    # --- SIMULATE SPECIES TYPE 1 WITH TUNING ---
-    print("\n--- Tuning Species Type 1 ---")
+    # --- INITIALIZE BOTH MODELS ---
+    print("\nInitializing Models...")
     model_t1 = IntegratedDCFTP(species_type=1, csv_path='metacommunity_fields.csv')
+    model_t2 = IntegratedDCFTP(species_type=2, csv_path='metacommunity_fields.csv')
     
-    # Example Target: Occupy ~10% of patches? Or a fixed number?
-    # Grid is 20x20=400. Let's aim for mean occupancy of 20 (5%).
-    target_occ = 20.0
-    optimal_s1 = tune_extirpation_scaling(model_t1, target_mean_occupancy=target_occ)
-    print(f"Optimal Scaling for Type 1: {optimal_s1:.4f}")
+    # --- COMBINED TUNING ---
+    # Target Mean Inverse Occupancy
+    # E.g. target 1/20 = 0.05
+    target_inv = 0.1
+    optimal_s = tune_combined_extirpation_scaling([model_t1, model_t2], target_inv_mu=target_inv)
+    print(f"Optimal Combined Scaling: {optimal_s:.4f}")
     
-    # Run Final Batch with Optimal Scaling
+    # Set scaling for both
+    model_t1.set_extirpation_scaling(optimal_s)
+    model_t2.set_extirpation_scaling(optimal_s)
+    
+    # --- GENERATE FINAL SAMPLES ---
     num_samples = 400
     seeds = [secrets.randbits(32) for _ in range(num_samples)]
     
@@ -417,12 +438,6 @@ if __name__ == "__main__":
     for i, s in enumerate(seeds):
         res = model_t1.generate_single_survivor(s)
         if res is not None and np.any(res): samples_t1.append(res)
-        
-    # --- SIMULATE SPECIES TYPE 2 (No tuning, just use same scaling for demo or tune separate) ---
-    print("\n--- Tuning Species Type 2 ---")
-    model_t2 = IntegratedDCFTP(species_type=2, csv_path='metacommunity_fields.csv')
-    optimal_s2 = tune_extirpation_scaling(model_t2, target_mean_occupancy=target_occ)
-    print(f"Optimal Scaling for Type 2: {optimal_s2:.4f}")
     
     print("\nGenerating Final Type 2 Samples...")
     samples_t2 = []
@@ -435,7 +450,6 @@ if __name__ == "__main__":
     fig, ax = plt.subplots(2, 2, figsize=(12, 10))
     
     # 1. Parameter Visualization (Environmental Gradient)
-    # Plot meanAbundance for both types across the grid (Row Profile)
     rows = np.arange(NUM_PATCHES_Y)
     ax[0,0].plot(rows, model_t1.meanB_field.reshape(NUM_PATCHES_Y, NUM_PATCHES_X)[:,0], 
                  label='Type 1 MeanB', color='skyblue', marker='o')
@@ -451,7 +465,7 @@ if __name__ == "__main__":
     if len(samples_t1) > 0:
         example = samples_t1[0].reshape(NUM_PATCHES_Y, NUM_PATCHES_X)
         ax[0,1].imshow(example, cmap='Blues', interpolation='nearest')
-        ax[0,1].set_title(f"Example Range (Type 1)\nScaling: {optimal_s1:.2f}")
+        ax[0,1].set_title(f"Example Range (Type 1)\nScaling: {optimal_s:.2f}")
     else:
         ax[0,1].text(0.5, 0.5, "No Survivors", ha='center')
 
