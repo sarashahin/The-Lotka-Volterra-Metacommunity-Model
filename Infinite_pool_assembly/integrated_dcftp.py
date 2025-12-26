@@ -4,6 +4,7 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 from scipy.stats import logser, chi2, linregress, t
 from scipy.optimize import brentq
 from scipy.special import lambertw
@@ -209,7 +210,7 @@ def calculate_p_mle(mean_occupancy):
     # Clamp to safe range (0, 1)
     return max(1e-9, min(1.0 - 1e-9, p_hat))
 
-def tune_combined_extirpation_scaling(models, target_p, max_iter=100, samples_per_iter=50):
+def tune_combined_extirpation_scaling(models, target_p, max_iter=10, samples_per_iter=50):
     """
     Tunes scaling factor 's' to achieve a target Log-Series parameter 'p'.
     """
@@ -290,17 +291,65 @@ def tune_combined_extirpation_scaling(models, target_p, max_iter=100, samples_pe
                 return s_next
             current_s = s_next
         else:
-            # Heuristic for early steps: p increases with s (less extirpation) usually? 
-            # Or decreases? Higher extirpation -> lower occupancy -> lower p.
-            # wait, s scales Extirpation Rate. Higher s -> Higher Extirpation -> Lower p.
-            # So Slope should be negative.
-            # If obs_p > target_p (too critical), we need to INCREASE s (more death).
+            # Heuristic for early steps
             if obs_p > target_p:
                 current_s *= 1.2
             else:
                 current_s *= 0.8
                 
     return current_s
+
+def tile_simulation_grids(sample_grids, rows=None, cols=None, padding=1, pad_value=0.0):
+    """
+    Tiles a list of 2D grids into a single large image array.
+    Used for creating a 'gallery' view of species ranges.
+    
+    Args:
+        sample_grids: List of (Ny, Nx) numpy arrays.
+        rows, cols: Layout geometry. If None, auto-calculated for ~16:9 aspect.
+        padding: Pixels of padding between tiles.
+        pad_value: Value for padding (0=empty/black, NaN=transparent/white depending on plot).
+    
+    Returns:
+        Large 2D array containing the tiled grids.
+    """
+    N = len(sample_grids)
+    if N == 0: return None
+    
+    Ny, Nx = sample_grids[0].shape
+    
+    if cols is None:
+        # Heuristic for ~16:9 aspect ratio
+        aspect = 16/9
+        # solve: (cols * Nx) / (rows * Ny) ~ aspect  AND  rows * cols >= N
+        # cols ~ rows * (Ny/Nx) * aspect
+        # rows^2 * (Ny/Nx) * aspect >= N
+        rows = int(np.sqrt(N / ((Ny/Nx) * aspect)))
+        rows = max(1, rows)
+        cols = int(np.ceil(N / rows))
+    elif rows is None:
+        rows = int(np.ceil(N / cols))
+        
+    # Create canvas
+    H = rows * Ny + (rows - 1) * padding
+    W = cols * Nx + (cols - 1) * padding
+    
+    # Initialize with pad_value
+    # If pad_value is NaN, use float array. If 0, preserve type if possible.
+    dtype = np.float32 if np.isnan(pad_value) else sample_grids[0].dtype
+    canvas = np.full((H, W), pad_value, dtype=dtype)
+    
+    for i, grid in enumerate(sample_grids):
+        if i >= rows * cols: break
+        
+        r, c = divmod(i, cols)
+        
+        y_start = r * (Ny + padding)
+        x_start = c * (Nx + padding)
+        
+        canvas[y_start:y_start+Ny, x_start:x_start+Nx] = grid
+        
+    return canvas
 
 def analyze_and_plot(ax, samples, title, color):
     range_sizes = [np.sum(r) for r in samples]
@@ -356,10 +405,6 @@ if __name__ == "__main__":
     model_t2 = IntegratedDCFTP(species_type=2)
     
     # 2. Tune
-    # Target p = 0.95 (Near Critical)
-    # p=0.9 -> Mean=3.9
-    # p=0.95 -> Mean=6.3
-    # p=0.99 -> Mean=21.5
     target_p = calculate_p_mle(10.3) 
     optimal_s = tune_combined_extirpation_scaling([model_t1, model_t2], target_p)
     print(f"Optimal Combined Scaling: {optimal_s:.4f}")
@@ -382,8 +427,8 @@ if __name__ == "__main__":
         res2 = model_t2.generate_single_survivor(s)
         if res2 is not None and np.any(res2): samples_t2.append(res2)
 
-    # 4. Plot
-    print("\nGenerating Plots...")
+    # 4. Plot Analysis
+    print("\nGenerating Analysis Plots...")
     fig, ax = plt.subplots(2, 2, figsize=(12, 10))
     
     rows = np.arange(NUM_PATCHES_Y)
@@ -398,4 +443,35 @@ if __name__ == "__main__":
     analyze_and_plot(ax[1,0], samples_t1, "Type 1 Occupancy", "skyblue")
     analyze_and_plot(ax[1,1], samples_t2, "Type 2 Occupancy", "salmon")
     
-    plt.tight_layout(); plt.show(); print("Done.")
+    plt.tight_layout(); plt.show()
+    
+    # 5. Movie-Style Tiled Layout
+    print("\nGenerating Tiled Range Visualization...")
+    # Combine and reshape samples
+    all_grids = []
+    # Mix samples to show diversity or just show one type? Let's mix.
+    # Take up to 100 samples total to fit nicely on screen
+    mix_limit = 100
+    
+    for i in range(mix_limit):
+        if i < len(samples_t1): 
+            all_grids.append(samples_t1[i].reshape(NUM_PATCHES_Y, NUM_PATCHES_X))
+        if i < len(samples_t2):
+            all_grids.append(samples_t2[i].reshape(NUM_PATCHES_Y, NUM_PATCHES_X))
+            
+    if all_grids:
+        tiled_img = tile_simulation_grids(all_grids, padding=1, pad_value=np.nan)
+        
+        plt.figure(figsize=(16, 9))
+        # Use a colormap where NaN (padding) is white/transparent and occupied is colored
+        # 'viridis' or 'plasma' are good. Using 'Greens' for a biological feel.
+        current_cmap = cm.get_cmap('viridis').copy()
+        current_cmap.set_bad(color='white')
+        
+        plt.imshow(tiled_img, cmap=current_cmap, interpolation='nearest')
+        plt.axis('off')
+        plt.title(f"Sampled Species Ranges (Combined Types, n={len(all_grids)})")
+        plt.tight_layout()
+        plt.show()
+        
+    print("Done.")

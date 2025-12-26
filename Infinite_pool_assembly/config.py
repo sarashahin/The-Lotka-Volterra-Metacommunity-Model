@@ -12,7 +12,7 @@ from accelerator import np
 # -----------------------------
 BODY_MASS = 1e-4
 INV = 1e-10
-MORTALITY_RATE = 0.2
+MORTALITY_RATE = 0.01  # 0.2
 
 #: Initial number of species to aim for before the main loop
 TARGET_RICHNESS = 300
@@ -50,8 +50,8 @@ THRESHOLD = 10 * BODY_MASS
 # -----------------------------
 # Spatial (Multi-patch) Parameters
 # -----------------------------
-NUM_PATCHES_X = 80
-NUM_PATCHES_Y = 80
+NUM_PATCHES_X = 20
+NUM_PATCHES_Y = 20
 
 # Dispersal rate (diffusion coefficient)
 DISPERSAL_RATE = BODY_MASS * 1e-3 
@@ -72,6 +72,6 @@ LOG_B_CAP        = math.log(ECOLOGICAL_MAX_B)
 # Example (Gaussian): 
 # DISPERSAL_KERNEL = lambda r: np.exp(-r**2 / (2 * 2.0**2))
 DISPERAL_A = 1
-DISPERAL_B = 1.25
-# DISPERSAL_KERNEL = lambda r: (1 + (r/DISPERAL_A)**2)**(-DISPERAL_B)
+DISPERAL_B = 1.5  # 1.25
+DISPERSAL_KERNEL = lambda r: (1 + (r/DISPERAL_A)**2)**(-DISPERAL_B)
 
