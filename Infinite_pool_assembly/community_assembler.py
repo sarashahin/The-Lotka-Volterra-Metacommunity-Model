@@ -80,6 +80,7 @@ class StepwiseAssembler(abc.ABC):
             # Calculate candidates based on gamma and frac_multi
             # e.g., if gamma=100 and frac_multi=0.05, try 5 species this round.
             n_cand = max(1, int(gamma_current * self.frac_multi))
+            n_cand = 10
 
             if (self.max_attempts and attempts >= self.max_attempts) or \
                (self.richness_cap and gamma_current >= self.richness_cap):

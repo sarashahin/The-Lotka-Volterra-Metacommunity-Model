@@ -339,10 +339,10 @@ class PSD2Model:
             max_count = counts.max()
             if max_count == 0: max_count = 1
             out = [f"\n--- {title} (N={len(data)}) ---"]
-            for i in range(bins):
-                bar_len = int((counts[i] / max_count) * width)
-                bar = '#' * bar_len
-                out.append(f"{edges[i]:8.4f} .. {edges[i+1]:8.4f} | {bar} ({counts[i]})")
+            # for i in range(bins):
+            #     bar_len = int((counts[i] / max_count) * width)
+            #     bar = '#' * bar_len
+            #     out.append(f"{edges[i]:8.4f} .. {edges[i+1]:8.4f} | {bar} ({counts[i]})")
             mean_val = _cpu_numpy.mean(data)
             std_val = _cpu_numpy.std(data)
             out.append(f"Stats: Mean={mean_val:.4f}, StdDev={std_val:.4f}")
@@ -351,7 +351,7 @@ class PSD2Model:
         mask_PS = mask_S | mask_P
         if np.any(mask_PS):
             logger.info(draw_ascii_hist(local_g_final[mask_PS], title="Local Growth Rates (P + S States)"))
-            logger.info(draw_ascii_hist(non_self_g_final[mask_PS], title="Non-Self Growth Rates (P + S States)"))
+            # logger.info(draw_ascii_hist(non_self_g_final[mask_PS], title="Non-Self Growth Rates (P + S States)"))
         else:
             logger.info("[PSD2 STATS] No P or S populations found for histogram.")
 
@@ -367,6 +367,41 @@ class PSD2Model:
                     writer.writerow([y+1, f"{occupancy[y]}", f"{mask_type_0[y]+1}"])
             
             logger.info(f"Written occupancy list to {csv_path}")
+            
+        except Exception as e:
+            logger.error(f"Failed to write {csv_path}: {e}")
+
+        csv_path = "richness_by_type.csv"
+        try:
+            mask_type_0 = self.r_flat[:,0] > 0.9
+
+            # Remove non-D biomass:
+            # B_final.flatten()[mask_D.flatten()] = 0
+            
+            # Biomass per site of species of type 0 and 1:
+            site_richness_type_0 = np.sum(mask_D[mask_type_0,:]+0.0, axis=0)
+            site_richness_type_1 = np.sum(mask_D[~mask_type_0,:]+0.0, axis=0)
+            
+            # Make 2D biomass field:
+            array_shape = (NUM_PATCHES_Y, NUM_PATCHES_X)
+            richness_array_type_0 = \
+                site_richness_type_0.reshape(array_shape)
+            richness_array_type_1 = \
+                site_richness_type_1.reshape(array_shape)
+
+            # Mean over X (width) -> (Y,)
+            # We must move to CPU before using standard Python CSV
+            mean_y_0 = to_cpu(np.mean(richness_array_type_0, axis=1))
+            mean_y_1 = to_cpu(np.mean(richness_array_type_1, axis=1))
+            
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["row_y", "mean_richess_0", "mean_richness_1"])
+                for y in range(len(mean_y_0)):
+                    # y+1 for 1-based indexing as requested
+                    writer.writerow([y+1, f"{mean_y_0[y]:.4f}", f"{mean_y_1[y]:.4f}"])
+            
+            logger.info(f"Written row-wise richness stats to {csv_path}")
             
         except Exception as e:
             logger.error(f"Failed to write {csv_path}: {e}")

@@ -32,3 +32,28 @@ B_ibm_history <- read.table("IBM_biomass_value.txt")[,1]
 B_ibm_history <- B_ibm_history[(length(B_ibm_history)/2):length(B_ibm_history)]
 hist(log10(B_ibm_history),probability = T,col=rgb(0,1,0,0.2),add=T,border = "green")
 
+##########################################################################
+
+occupancy <- read.csv("occupancy.csv")
+nrow(occupancy)
+sum(occupancy$type==1)
+mean(occupancy$type==1)
+h <- hist(occupancy$occupancy[occupancy$type==1],breaks = seq(0,400),plot = F)
+plot(h$mids,h$counts+0.1,xlim=c(1,200),log="y")
+mean(occupancy$occupancy[occupancy$type==1])
+
+sum(occupancy$type==2)
+mean(occupancy$type==2)
+h <- hist(occupancy$occupancy[occupancy$type==2],breaks = seq(0,400),plot = F)
+plot(h$mids,h$counts,xlim=c(1,50),log="y")
+mean(occupancy$occupancy[occupancy$type==2])
+
+mean(occupancy$occupancy)
+
+sum(occupancy$occupancy)
+
+mean(occupancy$occupancy[occupancy$type==1])*sum(occupancy$type==1)
+mean(occupancy$occupancy[occupancy$type==2])*sum(occupancy$type==2)
+
+
+###########################################################################

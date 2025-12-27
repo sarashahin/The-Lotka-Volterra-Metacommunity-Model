@@ -26,7 +26,7 @@ class TraitManager:
         
         # Simple vertical split
         # We can map 2D coordinates if needed, but linear split is fine for testing
-        split_idx = n_patches // 2
+        split_idx = n_patches // 4
         self.env_map[split_idx:] = 1 
 
     def generate_traits(self, n_new):

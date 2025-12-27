@@ -11,7 +11,7 @@ from accelerator import np
 # Simulation Constants
 # -----------------------------
 BODY_MASS = 1e-4
-INV = 1e-10
+INV = 0*1e-10
 MORTALITY_RATE = 0.01  # 0.2
 
 #: Initial number of species to aim for before the main loop

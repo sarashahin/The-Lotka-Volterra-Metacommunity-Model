@@ -3,9 +3,11 @@
 ############################################
 import numpy as np
 import pandas as pd
+import csv
+import statsmodels.api as sm   # for lineaer regression
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
-from scipy.stats import logser, chi2, linregress, t
+from scipy.stats import logser, chi2, t
 from scipy.optimize import brentq
 from scipy.special import lambertw
 import hashlib
@@ -133,7 +135,9 @@ class IntegratedDCFTP:
             if not np.any(state): break
             else:
                 t_horizon *= 2
-                if t_horizon > 10000: return None
+                if t_horizon > 100000:
+                    print(f"Explosion to t = {t_horizon}")
+                    return None
         return t_horizon
 
 def calculate_p_mle(mean_occupancy):
@@ -246,11 +250,17 @@ def generate_mixed_survivor(models, fractions, master_seed):
 def tune_combined_extirpation_scaling(models, fractions, target_p, max_iter=100, samples_per_iter=50):
     print(f"\n--- Tuning Combined Extirpation Scaling (Target p: {target_p:.4f}) ---")
     history_s, history_p = [], []
-    current_s = 6.0
+    current_s = 10.0
     s_min = current_s * 0.1
     s_max = current_s * 10
     
     for i in range(max_iter):
+
+        # remove old values that might bias the linear regression:
+        if i % 10 == 9:
+            del history_s[0]
+            del history_p[0]
+        
         for m in models: m.set_extirpation_scaling(current_s)
         
         occupancies = []
@@ -261,10 +271,10 @@ def tune_combined_extirpation_scaling(models, fractions, target_p, max_iter=100,
             grid, _ = generate_mixed_survivor(models, fractions, s_seed)
             if grid is None: 
                 n_exploded += 1
-                if n_exploded > min(10, samples_per_iter * 0.5): break 
+                if n_exploded > min(5, samples_per_iter * 0.5): break 
             elif np.any(grid): occupancies.append(np.sum(grid))
         
-        if n_exploded > min(10, samples_per_iter * 0.5):
+        if n_exploded > min(5, samples_per_iter * 0.5):
             print(f"Iter {i}: s={current_s:.4f} -> EXPLODED")
             history_s.append(current_s); history_p.append(1.0)
             current_s = min(current_s * 1.5, s_max)
@@ -280,10 +290,26 @@ def tune_combined_extirpation_scaling(models, fractions, target_p, max_iter=100,
         history_s.append(current_s); history_p.append(obs_p)
         print(f"Iter {i}: s={current_s:.4f} -> Mean Occ={np.mean(occupancies):.2f}, p_mle={obs_p:.4f}")
         
-        if len(history_s) >= 3:
+        if len(history_s) >= 5:
             # Linear Regression of p vs s
-            slope, intercept, _, _, _ = linregress(history_s, history_p)
-            
+            # 1. Create data frame
+            data = pd.DataFrame({
+                's': history_s,
+                'p': history_p
+                })
+
+            # 2. Add a constant (intercept) to the independent variable
+            # statsmodels requires you to explicitly add the intercept column
+            X = sm.add_constant(data['s'])
+            y = data['p']
+
+            # 3. Fit the model
+            lin_model = sm.OLS(y,X).fit()
+
+            # 3. Access specific values by column name
+            intercept = lin_model.params['const']
+            slope = lin_model.params['s']
+        
             if abs(slope) < 1e-6:
                 s_next = current_s * (0.8 if obs_p < target_p else 1.2)
                 rel_error = float('inf')
@@ -291,38 +317,20 @@ def tune_combined_extirpation_scaling(models, fractions, target_p, max_iter=100,
                 # Predict s_next where p = target_p
                 # p = slope * s + intercept => s = (p - intercept) / slope
                 s_next = (target_p - intercept) / slope
-                
-                # --- PREDICTION ERROR CALCULATION ---
-                # Calculate standard error of the inverse prediction s_next
-                x_arr = np.array(history_s); y_arr = np.array(history_p)
-                n = len(x_arr)
-                y_fit = slope * x_arr + intercept
-                sse = np.sum((y_arr - y_fit)**2)
-                sigma = np.sqrt(sse / (n - 2)) if n > 2 else 1.0
-                
-                x_mean = np.mean(x_arr)
-                sxx = np.sum((x_arr - x_mean)**2)
-                
-                # Formula for SE of inverse prediction x0 from y0:
-                # SE(x0) = (sigma / |slope|) * sqrt(1 + 1/n + (y0 - y_mean)^2 / (slope^2 * Sxx))
-                # Here x0 = s_next, y0 = target_p
-                # Note: (y0 - y_mean) / slope approx (x0 - x_mean)
-                
-                if sxx > 1e-9:
-                    # Inverse prediction error approximation
-                    # Predicting x (s) from y (p)
-                    term_dist = (target_p - np.mean(y_arr))**2 / (slope**2 * sxx)
-                    pred_error_s = (sigma / abs(slope)) * np.sqrt(1 + 1/n + term_dist)
-                else:
-                    pred_error_s = float('inf')
+
+                # 4. Define the point you want to predict (e.g., x = 5.5)
+                # Don't forget to add the constant (1.0) here as well!
+                point_to_predict = pd.DataFrame({'const': [1.0], 's': [s_next]})
+                prediction = lin_model.get_prediction(point_to_predict)
+                pred_error_p = prediction.se_mean[0]
                 
                 # Use relative error on s as convergence metric
-                rel_error = pred_error_s / s_next if s_next > 0 else float('inf')
+                rel_error = pred_error_p / (1-target_p) 
             
             s_next = max(s_min, min(s_max, s_next))
             print(f"  Prediction: s_next={s_next:.4f} (RelErr={rel_error:.2%})")
             
-            if rel_error < 0.01:
+            if rel_error < 0.02:
                 print(f"  -> Converged!")
                 return s_next
             current_s = s_next
@@ -398,7 +406,7 @@ def analyze_and_plot(ax, samples, title, color):
             df = max(1, len(bin_o) - 2)
             p_val = 1 - chi2.cdf(chi2_stat, df)
             
-            stats_txt = f"Mean: {sample_mean:.1f}\nGoF $chi^2$={chi2_stat:.2f}\ndf={df}, p={p_val:.3f}"
+            stats_txt = f"Mean: {sample_mean:.1f}\nGoF $\\chi^2$={chi2_stat:.2f}\ndf={df}, p={p_val:.3f}"
             ax.text(0.5, 0.5, stats_txt, transform=ax.transAxes, 
                     bbox=dict(facecolor='white', alpha=0.8, edgecolor='gray'), fontsize=10)
     except Exception as e:
@@ -418,13 +426,14 @@ if __name__ == "__main__":
     models = [model1, model2]
     fractions = [0.5, 0.5] 
     
-    target_p = calculate_p_mle(10.3) 
-    optimal_s = tune_combined_extirpation_scaling(models, fractions, target_p)
+    target_p = calculate_p_mle(5.69) 
+    # optimal_s = tune_combined_extirpation_scaling(models, fractions, target_p)
+    optimal_s = 4.2276
     print(f"Optimal Scaling: {optimal_s:.4f}")
     for m in models: m.set_extirpation_scaling(optimal_s)
     
     # Generate Samples
-    num_samples = 400
+    num_samples = 1557
     seeds = [secrets.randbits(32) for _ in range(num_samples)]
     
     samples_t1, samples_t2 = [], []
@@ -438,13 +447,32 @@ if __name__ == "__main__":
             if type_idx == 0: samples_t1.append(grid)
             else: samples_t2.append(grid)
             
-            if len(all_grids_for_movie) < 100:
+            if len(all_grids_for_movie) < 200:
                 # Store grid with Type encoded: 1 for Type 1, 2 for Type 2
                 # We multiply the boolean grid by (type_idx + 1)
                 colored_grid = grid.astype(float) * (type_idx + 1)
                 colored_grid[colored_grid == 0] = np.nan # Transparent background
                 all_grids_for_movie.append(colored_grid.reshape(NUM_PATCHES_Y, NUM_PATCHES_X))
 
+    # Output summary stats files
+    all_t1 = np.array(samples_t1).reshape((len(samples_t1), NUM_PATCHES_Y, NUM_PATCHES_X))
+    t1_richness = np.mean(np.sum(all_t1+0.0, axis=0), axis=1)
+    all_t2 = np.array(samples_t2).reshape((len(samples_t2), NUM_PATCHES_Y, NUM_PATCHES_X))
+    t2_richness = np.mean(np.sum(all_t2+0.0, axis=0), axis=1)
+    csv_path = "richness_by_type_dcftp.csv"
+    try:
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["row_y", "mean_richness_1", "mean_richness_2"])
+            for y in range(NUM_PATCHES_Y):
+                writer.writerow([y+1, f"{t1_richness[y]:.4f}", f"{t2_richness[y]:.4f}"])
+                    
+            print(f"Written row-wise richness stats to {csv_path}")
+            
+    except Exception as e:
+        print(f"Failed to write {csv_path}: {e}")
+                
+                
     # Analysis Plots
     fig, ax = plt.subplots(2, 2, figsize=(12, 10))
     rows = np.arange(NUM_PATCHES_Y)
@@ -459,10 +487,11 @@ if __name__ == "__main__":
     analyze_and_plot(ax[1,0], samples_t1, "Type 1 Occupancy", "skyblue")
     analyze_and_plot(ax[1,1], samples_t2, "Type 2 Occupancy", "salmon")
     plt.tight_layout(); plt.show()
-    
+
+
     # Movie Tiled Plot
     if all_grids_for_movie:
-        tiled = tile_simulation_grids(all_grids_for_movie, padding=1, pad_value=np.nan)
+        tiled = tile_simulation_grids(all_grids_for_movie, padding=1, pad_value=0)
         plt.figure(figsize=(16, 9))
         # Custom cmap: 1=Blue, 2=Red. 
         # We can use a discrete colormap. 
@@ -471,7 +500,7 @@ if __name__ == "__main__":
         cmap = cm.get_cmap('coolwarm').copy()
         cmap.set_bad(color='white')
         
-        plt.imshow(tiled, cmap=cmap, interpolation='nearest', vmin=0.5, vmax=2.5)
+        plt.imshow(tiled+1, cmap=cmap, interpolation='nearest', vmin=0.5, vmax=2.5)
         plt.axis('off')
         plt.title(f"Mixed Species Ranges (Blue=Type 1, Red=Type 2)")
         plt.tight_layout()
