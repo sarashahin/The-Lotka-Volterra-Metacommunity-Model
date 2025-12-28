@@ -355,10 +355,30 @@ class PSD2Model:
         else:
             logger.info("[PSD2 STATS] No P or S populations found for histogram.")
 
+        occupancy = np.sum(mask_D,axis = 1)+0.0
+        range_rarity_field = np.sum((mask_D/occupancy[:, None])[occupancy>0], axis = 0)
+        range_rarity_field = range_rarity_field.reshape(NUM_PATCHES_Y, NUM_PATCHES_X)
+        mean_range_rarity = \
+            to_cpu(np.mean(range_rarity_field, axis = 1))
+        csv_path = "range_rarity.csv"
+        try:
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["row_y", "mean_range_rarity"])
+                for y in range(NUM_PATCHES_Y):
+                    # y+1 for 1-based indexing as requested
+                    writer.writerow([y+1, f"{mean_range_rarity[y]:.4f}"])
+            
+            logger.info(f"Written row-wise range_rarity to {csv_path}")
+            
+        except Exception as e:
+            logger.error(f"Failed to write {csv_path}: {e}")
+
+
+        
         # <--- NEW: CSV Output by Row (High vs Low r) --->
         csv_path = "occupancy.csv"
         try:
-            occupancy = np.sum(mask_D,axis = 1)
             with open(csv_path, "w", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow(["speciesID", "occupancy", "type"])
@@ -370,6 +390,8 @@ class PSD2Model:
             
         except Exception as e:
             logger.error(f"Failed to write {csv_path}: {e}")
+
+        
 
         csv_path = "richness_by_type.csv"
         try:
@@ -405,6 +427,18 @@ class PSD2Model:
             
         except Exception as e:
             logger.error(f"Failed to write {csv_path}: {e}")
+
+        # Compute extinctions from destruction of half of type 2 environment.
+        NY, NX = (NUM_PATCHES_Y, NUM_PATCHES_X)
+        remaining_t1 = mask_D.reshape(self.S, NY, NX)[mask_type_0]
+        remaining_t1[:, (NY//4):NY, (NX//2):NX] = 0
+        remaining_t2 = mask_D.reshape(self.S, NY, NX)[~mask_type_0]
+        remaining_t2[:, (NY//4):NY, (NX//2):NX] = 0
+        predicted_extinctions_1 = \
+            np.sum(np.sum(remaining_t1, axis=(1,2))==0)
+        predicted_extinctions_2 = \
+            np.sum(np.sum(remaining_t2, axis=(1,2))==0)
+        print(f"Predicted_extinctions: {predicted_extinctions_1}/{np.sum(mask_type_0)}, {predicted_extinctions_2}/{np.sum(~mask_type_0)}")
 
         csv_path = "biomass_by_type.csv"
         try:

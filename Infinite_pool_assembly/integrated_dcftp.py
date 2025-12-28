@@ -220,15 +220,15 @@ def generate_mixed_survivor(models, fractions, master_seed):
             type_idx = meta_rng.choice(len(models), p=type_probs)
             chosen_model = models[type_idx]
             
-            # B. Sample Location (using chosen model's specific field)
+            # B. Horizon Check
+            if arrival_t < -horizons[type_idx]:
+                continue 
+                
+            # C. Sample Location (using chosen model's specific field)
             # Standard probability proportional to pCol field
             loc_weights = chosen_model.pCol_field / chosen_model.pCol_field.sum()
             start_node = meta_rng.choice(chosen_model.N, p=loc_weights)
             
-            # C. Horizon Check
-            if arrival_t < -horizons[type_idx]:
-                continue 
-                
             # D. Simulate
             current_seed = type_seeds[type_idx]
             species_range = np.zeros(chosen_model.N, dtype=bool)
@@ -244,7 +244,8 @@ def generate_mixed_survivor(models, fractions, master_seed):
         if len(survivors_in_batch) > 0:
             return survivors_in_batch[meta_rng.integers(0, len(survivors_in_batch))]
             
-        if attempts > 200:  # We need a heuristic for choosign this limit on attempts
+        if attempts > 20000:  # We need a heuristic for choosign this limit on attempts
+            print("Attempts exhausted")
             return np.zeros(models[0].N, dtype=bool), -1
 
 def tune_combined_extirpation_scaling(models, fractions, target_p, max_iter=100, samples_per_iter=50):
@@ -271,10 +272,10 @@ def tune_combined_extirpation_scaling(models, fractions, target_p, max_iter=100,
             grid, _ = generate_mixed_survivor(models, fractions, s_seed)
             if grid is None: 
                 n_exploded += 1
-                if n_exploded > min(5, samples_per_iter * 0.5): break 
+                if n_exploded > min(2, samples_per_iter * 0.5): break 
             elif np.any(grid): occupancies.append(np.sum(grid))
         
-        if n_exploded > min(5, samples_per_iter * 0.5):
+        if n_exploded > min(2, samples_per_iter * 0.5):
             print(f"Iter {i}: s={current_s:.4f} -> EXPLODED")
             history_s.append(current_s); history_p.append(1.0)
             current_s = min(current_s * 1.5, s_max)
@@ -330,7 +331,7 @@ def tune_combined_extirpation_scaling(models, fractions, target_p, max_iter=100,
             s_next = max(s_min, min(s_max, s_next))
             print(f"  Prediction: s_next={s_next:.4f} (RelErr={rel_error:.2%})")
             
-            if rel_error < 0.02:
+            if rel_error < 0.05:
                 print(f"  -> Converged!")
                 return s_next
             current_s = s_next
@@ -426,31 +427,54 @@ if __name__ == "__main__":
     models = [model1, model2]
     fractions = [0.5, 0.5] 
     
-    target_p = calculate_p_mle(5.69) 
-    # optimal_s = tune_combined_extirpation_scaling(models, fractions, target_p)
-    optimal_s = 4.2276
-    print(f"Optimal Scaling: {optimal_s:.4f}")
-    for m in models: m.set_extirpation_scaling(optimal_s)
+    target_p1 = calculate_p_mle(3.719178) 
+    # optimal_s1 = tune_combined_extirpation_scaling([model1], [1], target_p1)
+    optimal_s1 = 3.5264
+    print(f"Optimal Scaling: {optimal_s1:.4f}")
+    target_p2 = calculate_p_mle(4.717) 
+    # optimal_s2 = tune_combined_extirpation_scaling([model2], [1], target_p2)
+    optimal_s2 = 3.8139
+    print(f"Optimal Scaling: {optimal_s2:.4f}")
+    
+    model1.set_extirpation_scaling(optimal_s1)
+    model2.set_extirpation_scaling(optimal_s2)
     
     # Generate Samples
-    num_samples = 1557
-    seeds = [secrets.randbits(32) for _ in range(num_samples)]
+    num_samples1 = 584
+    seeds1 = [secrets.randbits(32) for _ in range(num_samples1)]
+    num_samples2 = 1326
+    seeds2 = [secrets.randbits(32) for _ in range(num_samples2)]
     
     samples_t1, samples_t2 = [], []
     all_grids_for_movie = [] # Tuple (grid, type)
-    
+
     print("\nGenerating Final Mixed Samples...")
-    for s in seeds:
-        grid, type_idx = generate_mixed_survivor(models, fractions, s)
-        if grid is not None and np.any(grid):
+    for s in seeds1:
+        grid1, _ = generate_mixed_survivor([model1], [1], s)
+        type_idx = 0
+        if grid1 is not None and np.any(grid1):
             # Store for analysis
-            if type_idx == 0: samples_t1.append(grid)
-            else: samples_t2.append(grid)
+            if type_idx == 0: samples_t1.append(grid1)
+            else: samples_t2.append(grid1)
             
-            if len(all_grids_for_movie) < 200:
+            if len(all_grids_for_movie) < 50:
                 # Store grid with Type encoded: 1 for Type 1, 2 for Type 2
                 # We multiply the boolean grid by (type_idx + 1)
-                colored_grid = grid.astype(float) * (type_idx + 1)
+                colored_grid = grid1.astype(float) * (type_idx + 1)
+                colored_grid[colored_grid == 0] = np.nan # Transparent background
+                all_grids_for_movie.append(colored_grid.reshape(NUM_PATCHES_Y, NUM_PATCHES_X))
+    for s in seeds2:
+        grid2, _ = generate_mixed_survivor([model2], [1], s)
+        type_idx = 1
+        if grid2 is not None and np.any(grid2):
+            # Store for analysis
+            if type_idx == 0: samples_t1.append(grid2)
+            else: samples_t2.append(grid2)
+            
+            if len(all_grids_for_movie) < 100:
+                # Store grid with Type encoded: 1 for Type 1, 2 for Type 2
+                # We multiply the boolean grid by (type_idx + 1)
+                colored_grid = grid2.astype(float) * (type_idx + 1)
                 colored_grid[colored_grid == 0] = np.nan # Transparent background
                 all_grids_for_movie.append(colored_grid.reshape(NUM_PATCHES_Y, NUM_PATCHES_X))
 
@@ -471,8 +495,41 @@ if __name__ == "__main__":
             
     except Exception as e:
         print(f"Failed to write {csv_path}: {e}")
-                
-                
+
+    # Compute extinctions from destruction of half of type 2 environment.
+    NY, NX = (NUM_PATCHES_Y, NUM_PATCHES_X)
+    remaining_t1 = all_t1
+    remaining_t1[:, (NY//4):NY, (NX//2):NX] = 0
+    remaining_t2 = all_t2
+    remaining_t2[:, (NY//4):NY, (NX//2):NX] = 0
+    predicted_extinctions_1 = \
+        np.sum(np.sum(remaining_t1, axis=(1,2))==0)
+    predicted_extinctions_2 = \
+        np.sum(np.sum(remaining_t2, axis=(1,2))==0)
+    print(f"Predicted_extinctions: {predicted_extinctions_1}/{len(samples_t1)}, {predicted_extinctions_2}/{len(samples_t2)}")
+
+    # Compute mean range rarity by row
+    mask_D = np.concatenate((np.array(samples_t1), np.array(samples_t2)), axis = 0)
+    occupancy = np.sum(mask_D,axis = 1)+0.0
+    range_rarity_field = np.sum((mask_D/occupancy[:, None])[occupancy>0], axis = 0)
+    range_rarity_field = range_rarity_field.reshape(NUM_PATCHES_Y, NUM_PATCHES_X)
+    mean_range_rarity = \
+        np.mean(range_rarity_field, axis = 1)
+    csv_path = "range_rarity_DCFTP.csv"
+    try:
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["row_y", "mean_range_rarity"])
+            for y in range(NUM_PATCHES_Y):
+                # y+1 for 1-based indexing as requested
+                writer.writerow([y+1, f"{mean_range_rarity[y]:.4f}"])
+
+        print(f"Written row-wise range_rarity to {csv_path}")
+
+    except Exception as e:
+        print(f"Failed to write {csv_path}: {e}")
+
+        
     # Analysis Plots
     fig, ax = plt.subplots(2, 2, figsize=(12, 10))
     rows = np.arange(NUM_PATCHES_Y)

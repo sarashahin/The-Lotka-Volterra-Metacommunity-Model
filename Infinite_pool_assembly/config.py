@@ -72,6 +72,6 @@ LOG_B_CAP        = math.log(ECOLOGICAL_MAX_B)
 # Example (Gaussian): 
 # DISPERSAL_KERNEL = lambda r: np.exp(-r**2 / (2 * 2.0**2))
 DISPERAL_A = 1
-DISPERAL_B = 1.5  # 1.25
+DISPERAL_B = 2.5  # 1.25
 DISPERSAL_KERNEL = lambda r: (1 + (r/DISPERAL_A)**2)**(-DISPERAL_B)
 
