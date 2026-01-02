@@ -43,11 +43,12 @@ dispersal.fft = FFTShimCPU
 dispersal.to_cpu = lambda x: x
 
 class IntegratedDCFTP:
-    def __init__(self, species_type=1, csv_path='metacommunity_fields.csv'):
+    def __init__(self, species_type=1, csv_path='metacommunity_fields.csv', dt=0.1):
         self.L_y = NUM_PATCHES_Y
         self.L_x = NUM_PATCHES_X
         self.N = self.L_x * self.L_y
         self.ext_scaling = 1.0
+        self.dt = dt
         
         # 1. Load Effective Parameters from CSV
         if not os.path.exists(csv_path):
@@ -85,9 +86,27 @@ class IntegratedDCFTP:
         self.set_extirpation_scaling(1.0)
         self.horizon_cache = None
 
+        # # FOR DEBUGGING:
+        # test_field = np.ones_like(self.pCol_field)
+        # for l in range(2):
+        #     test_total = np.sum(test_field)
+        #     print(test_total)
+        #     test_abundance = test_field * self.meanB_field
+        #     print(test_abundance[0])
+        #     test_abundance_2d = test_abundance.reshape(1, self.L_y, self.L_x)
+        #     print(test_abundance_2d[0,0,0])
+        #     flux_field = dispersal.compute_dispersal(test_abundance_2d) / DISPERSAL_RATE 
+        #     print(f"Incoming: {flux_field[0,0,0]}")
+        #     invasion_field = flux_field.flatten() * self.pCol_field
+        #     print(invasion_field[0])
+        #     test_field += invasion_field - test_field * self.base_extRate_field
+        #     print(test_field[0])
+        #     print(f"change: {np.log(np.sum(test_field)/test_total)}")
+        # endit
+
     def set_extirpation_scaling(self, factor):
         self.ext_scaling = factor
-        self.survival_prob = np.exp(-self.base_extRate_field * self.ext_scaling)
+        self.survival_prob = np.exp(-self.base_extRate_field * (self.ext_scaling * self.dt))
         self.horizon_cache = None # Invalidate horizon cache
 
     def get_coupled_rng(self, t, master_seed):
@@ -112,12 +131,12 @@ class IntegratedDCFTP:
         flux_field = dispersal.compute_dispersal(eff_biomass_2d)
         
         # Normalize flux (if needed by your specific scaling logic)
-        flux_field = flux_field / (DISPERSAL_RATE / BODY_MASS)
+        flux_field = flux_field / (DISPERSAL_RATE)
         flux_host = flux_field.flatten()
         
         # 3. Calculate Probability of Establishment
-        colonization_rate = (flux_host / BODY_MASS) * self.pCol_field
-        prob_colonization = 1.0 - np.exp(-colonization_rate)
+        colonization_rate = flux_host * self.pCol_field
+        prob_colonization = 1.0 - np.exp(-colonization_rate * self.dt)
         
         # 4. Determine New Colonizations
         newly_colonized = (~current_state) & (rand_col < prob_colonization)
@@ -135,8 +154,8 @@ class IntegratedDCFTP:
             if not np.any(state): break
             else:
                 t_horizon *= 2
-                if t_horizon > 100000:
-                    print(f"Explosion to t = {t_horizon}")
+                if t_horizon > 8*100000:
+                    print(f"Explosion to t = {t_horizon}, Occ = {np.sum(state)}")
                     return None
         return t_horizon
 
@@ -149,7 +168,7 @@ def calculate_p_mle(mean_occupancy):
     p_hat = 1 + 1 / ( x_bar * W_(-1)( -exp(-1/x_bar) / x_bar ) )
     
     Where W_(-1) is the lower branch of the Lambert W function.
-    Reference: https://math.stackexchange.com/a/3525752
+    Reference: https://math.stackexchange.com/questions/3525734/maximum-likelihood-estimator-for-logarithmic-distribution
     """
     if mean_occupancy <= 1.0:
         return 1e-9 # Limit p -> 0 as mean -> 1
@@ -242,25 +261,36 @@ def generate_mixed_survivor(models, fractions, master_seed):
                 survivors_in_batch.append((species_range, type_idx))
         
         if len(survivors_in_batch) > 0:
+            print(f"Horizon: {max_horizon}, {attempts}", end="                 \r")
             return survivors_in_batch[meta_rng.integers(0, len(survivors_in_batch))]
             
         if attempts > 20000:  # We need a heuristic for choosign this limit on attempts
             print("Attempts exhausted")
             return np.zeros(models[0].N, dtype=bool), -1
 
-def tune_combined_extirpation_scaling(models, fractions, target_p, max_iter=100, samples_per_iter=50):
+def tune_combined_extirpation_scaling(models, fractions, target_p, max_iter=100, samples_per_iter=30):
     print(f"\n--- Tuning Combined Extirpation Scaling (Target p: {target_p:.4f}) ---")
     history_s, history_p = [], []
-    current_s = 10.0
+    current_s = 1.05
     s_min = current_s * 0.1
     s_max = current_s * 10
+    s_explodes = 0
     
     for i in range(max_iter):
 
         # remove old values that might bias the linear regression:
-        if i % 10 == 9:
+        if i % 10 == 9 and len(history_s) > 0:
             del history_s[0]
             del history_p[0]
+
+        if current_s <= s_explodes:
+            print(f"Iter {i}: s={current_s:.4f} -> EXPLODES")
+            current_s = s_explodes
+            if len(history_s) > 0:
+                current_s = 0.5*(current_s + min(history_s))
+            else:
+                current_s = min(current_s * 1.5, s_max)
+            continue
         
         for m in models: m.set_extirpation_scaling(current_s)
         
@@ -269,29 +299,36 @@ def tune_combined_extirpation_scaling(models, fractions, target_p, max_iter=100,
         seeds = [secrets.randbits(32) for _ in range(samples_per_iter)]
         
         for s_seed in seeds:
+            print(f"{samples_per_iter - len(occupancies)}: ", end="")
             grid, _ = generate_mixed_survivor(models, fractions, s_seed)
             if grid is None: 
                 n_exploded += 1
-                if n_exploded > min(2, samples_per_iter * 0.5): break 
+                if n_exploded > min(1, samples_per_iter * 0.5): break 
             elif np.any(grid): occupancies.append(np.sum(grid))
         
-        if n_exploded > min(2, samples_per_iter * 0.5):
+        if n_exploded > min(1, samples_per_iter * 0.5):
             print(f"Iter {i}: s={current_s:.4f} -> EXPLODED")
-            history_s.append(current_s); history_p.append(1.0)
-            current_s = min(current_s * 1.5, s_max)
+            if current_s > s_explodes:
+                s_explodes = current_s
+            if len(history_s) > 0:
+                current_s = 0.5*(current_s + min(history_s))
+            else:
+                current_s = min(current_s * 1.5, s_max)
             continue
             
         if len(occupancies) == 0:
             print(f"Iter {i}: s={current_s:.4f} -> EXTINCT")
-            history_s.append(current_s); history_p.append(0.0)
-            current_s = max(current_s * 0.6, s_min)
+            current_s = max(current_s * 0.9, s_min)
             continue
             
         obs_p = calculate_p_mle(np.mean(occupancies))
+        # Variance of log-series distribution as reference:
+        theo_variance = -(obs_p**2 + obs_p * np.log(1-obs_p))/ \
+            ( (1-obs_p) * np.log(1-obs_p) )**2
         history_s.append(current_s); history_p.append(obs_p)
-        print(f"Iter {i}: s={current_s:.4f} -> Mean Occ={np.mean(occupancies):.2f}, p_mle={obs_p:.4f}")
+        print(f"Iter {i}: s={current_s:.4f} -> Mean Occ={np.mean(occupancies):.2f}, var_Ex={np.var(occupancies)/theo_variance:.2f}, p_mle={obs_p:.4f}")
         
-        if len(history_s) >= 5:
+        if len(history_s) >= 3:
             # Linear Regression of p vs s
             # 1. Create data frame
             data = pd.DataFrame({
@@ -337,9 +374,16 @@ def tune_combined_extirpation_scaling(models, fractions, target_p, max_iter=100,
             current_s = s_next
         else:
             if obs_p > target_p:
-                current_s *= 1.2
+                current_s *= 1.1
             else:
-                current_s *= 0.8
+                current_s *= 0.9
+                if current_s <= s_explodes:
+                    current_s = s_explodes
+                    if len(history_s) > 0:
+                        current_s = 0.5*(current_s + min(history_s))
+                    else:
+                        current_s = min(current_s * 1.15, s_max)
+                
                 
     return current_s
 
@@ -427,31 +471,32 @@ if __name__ == "__main__":
     models = [model1, model2]
     fractions = [0.5, 0.5] 
     
-    target_p1 = calculate_p_mle(3.719178) 
-    # optimal_s1 = tune_combined_extirpation_scaling([model1], [1], target_p1)
-    optimal_s1 = 3.5264
-    print(f"Optimal Scaling: {optimal_s1:.4f}")
-    target_p2 = calculate_p_mle(4.717) 
-    # optimal_s2 = tune_combined_extirpation_scaling([model2], [1], target_p2)
-    optimal_s2 = 3.8139
-    print(f"Optimal Scaling: {optimal_s2:.4f}")
+    target_p1 = calculate_p_mle(88.02532) 
+    optimal_s1 = tune_combined_extirpation_scaling([model1], [1], target_p1)
+    # optimal_s1 = 0.9745
+    print(f"Optimal Scaling: {optimal_s1:.7f}")
+    target_p2 = calculate_p_mle(151.1307) 
+    optimal_s2 = tune_combined_extirpation_scaling([model2], [1], target_p2)
+    # optimal_s2 = 1.0613
+    print(f"Optimal Scaling: {optimal_s2:.7f}")
     
     model1.set_extirpation_scaling(optimal_s1)
     model2.set_extirpation_scaling(optimal_s2)
     
     # Generate Samples
-    num_samples1 = 584
+    num_samples1 = 158
     seeds1 = [secrets.randbits(32) for _ in range(num_samples1)]
-    num_samples2 = 1326
+    num_samples2 = 283
     seeds2 = [secrets.randbits(32) for _ in range(num_samples2)]
     
     samples_t1, samples_t2 = [], []
     all_grids_for_movie = [] # Tuple (grid, type)
 
     print("\nGenerating Final Mixed Samples...")
-    for s in seeds1:
+    for i, s in zip(range(num_samples1), seeds1):
         grid1, _ = generate_mixed_survivor([model1], [1], s)
         type_idx = 0
+        print(f"Type 1: {num_samples1-i}")
         if grid1 is not None and np.any(grid1):
             # Store for analysis
             if type_idx == 0: samples_t1.append(grid1)
@@ -463,9 +508,10 @@ if __name__ == "__main__":
                 colored_grid = grid1.astype(float) * (type_idx + 1)
                 colored_grid[colored_grid == 0] = np.nan # Transparent background
                 all_grids_for_movie.append(colored_grid.reshape(NUM_PATCHES_Y, NUM_PATCHES_X))
-    for s in seeds2:
+    for i, s in zip(range(num_samples2), seeds2):
         grid2, _ = generate_mixed_survivor([model2], [1], s)
         type_idx = 1
+        print(f"Type 2: {num_samples2-i}")
         if grid2 is not None and np.any(grid2):
             # Store for analysis
             if type_idx == 0: samples_t1.append(grid2)
