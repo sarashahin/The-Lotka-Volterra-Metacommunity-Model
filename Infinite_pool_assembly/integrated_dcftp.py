@@ -4,7 +4,7 @@
 import numpy as np
 import pandas as pd
 import csv
-import statsmodels.api as sm   # for lineaer regression
+import statsmodels.api as sm
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from scipy.stats import logser, chi2, t
@@ -15,32 +15,11 @@ import secrets
 import sys
 import os
 
-# --- 1. FORCE CPU MODE & MONKEY PATCHING ---
-# We bypass the accelerator to avoid GPU-CPU transfers in the tight DCFTP loop.
-# This ensures all dispersal math happens in pure NumPy.
-
-import scipy.fft
-
-class FFTShimCPU:
-    """Drop-in replacement for accelerator.fft using SciPy (CPU)."""
-    @staticmethod
-    def rfft2(x, s=None, **kwargs): return scipy.fft.rfft2(x, s=s, workers=-1)
-    @staticmethod
-    def irfft2(x, s=None, **kwargs): return scipy.fft.irfft2(x, s=s, workers=-1)
-    @staticmethod
-    def fft2(x, s=None, **kwargs): return scipy.fft.fft2(x, s=s, workers=-1)
-    @staticmethod
-    def ifft2(x, s=None, **kwargs): return scipy.fft.ifft2(x, s=s, workers=-1)
-
-# Import config (pure python constants)
+# --- ACCELERATOR & CONFIG ---
+from accelerator import np as accel_np, to_cpu, torch 
 import config
 from config import BODY_MASS, NUM_PATCHES_X, NUM_PATCHES_Y, DISPERSAL_RATE
-
-# Import dispersal but OVERRIDE its dependencies before use
 import dispersal
-dispersal.np = np
-dispersal.fft = FFTShimCPU
-dispersal.to_cpu = lambda x: x
 
 class IntegratedDCFTP:
     def __init__(self, species_type=1, csv_path='metacommunity_fields.csv', dt=0.1):
@@ -70,13 +49,14 @@ class IntegratedDCFTP:
         raw_meanB = df[col_meanB].values
         raw_ext = df[col_ext].values
         
-        # Broadcast to (Y, X) then flatten to (N,) for simulation logic
-        self.pCol_field = np.repeat(raw_pCol[:, np.newaxis], self.L_x, axis=1).flatten()
-        self.meanB_field = np.repeat(raw_meanB[:, np.newaxis], self.L_x, axis=1).flatten()
-        self.base_extRate_field = np.repeat(raw_ext[:, np.newaxis], self.L_x, axis=1).flatten()
+        pCol_cpu = np.repeat(raw_pCol[:, np.newaxis], self.L_x, axis=1).flatten()
+        meanB_cpu = np.repeat(raw_meanB[:, np.newaxis], self.L_x, axis=1).flatten()
+        base_ext_cpu = np.repeat(raw_ext[:, np.newaxis], self.L_x, axis=1).flatten()
         
-        # Pre-calculate spatial mean of pCol for weighting
-        self.mean_pCol = np.mean(self.pCol_field)
+        self.pCol_field = accel_np.array(pCol_cpu, dtype=accel_np.float32)
+        self.meanB_field = accel_np.array(meanB_cpu, dtype=accel_np.float32)
+        self.base_extRate_field = accel_np.array(base_ext_cpu, dtype=accel_np.float32)
+        self.mean_pCol = np.mean(pCol_cpu)
         
         # Precompute the kernel if needed (triggers the monkey-patched FFT)
         if config.DISPERSAL_KERNEL is not None:
@@ -106,58 +86,115 @@ class IntegratedDCFTP:
 
     def set_extirpation_scaling(self, factor):
         self.ext_scaling = factor
-        self.survival_prob = np.exp(-self.base_extRate_field * (self.ext_scaling * self.dt))
-        self.horizon_cache = None # Invalidate horizon cache
+        self.survival_prob = accel_np.exp(-self.base_extRate_field * (self.ext_scaling * self.dt))
+        self.horizon_cache = None 
 
-    def get_coupled_rng(self, t, master_seed):
-        hash_input = f"{master_seed}_{t}".encode('utf-8')
-        step_seed = int(hashlib.sha256(hash_input).hexdigest(), 16) % (2**32)
-        return np.random.default_rng(step_seed)
+    def _get_gpu_noise_chunk(self, t_start, n_steps, master_seed):
+        """
+        Generates a chunk of random numbers for n_steps.
+        Using a stateless-like seeding approach for GPU.
+        """
+        if torch is not None:
+            # Generate a large block: (n_steps, N)
+            # We seed based on the start time to keep it deterministic per chunk
+            # Note: This changes the RNG sequence from the per-step version, but remains coupled
+            # if we always process in the same chunk sizes or handle 't' correctly.
+            # To be safe and coupled for ANY t, we really should seed per t.
+            # But re-seeding is slow. 
+            
+            # Optimization: Use one generator seeded with (master_seed + t_start)
+            # and consume it. This couples the *trajectory segment* starting at t_start.
+            # If we come back to t=-100 from t=-200, we must ensure we align.
+            # We can enforce alignment by using fixed chunk boundaries (e.g. multiples of 100).
+            
+            chunk_seed = (master_seed ^ int(t_start * 123456789)) & 0xFFFFFFFFFFFFFFFF
+            gen = torch.Generator(device=self.pCol_field.device)
+            gen.manual_seed(chunk_seed)
+            
+            # Generate (n_steps, N) tensors
+            rand_ext = torch.rand((n_steps, self.N), generator=gen, device=self.pCol_field.device)
+            rand_col = torch.rand((n_steps, self.N), generator=gen, device=self.pCol_field.device)
+            return rand_ext, rand_col
+        else:
+            # Numpy fallback (CPU)
+            hash_input = f"{master_seed}_{t_start}".encode('utf-8')
+            step_seed = int(hashlib.sha256(hash_input).hexdigest(), 16) % (2**32)
+            rng = np.random.default_rng(step_seed)
+            return rng.random((n_steps, self.N)), rng.random((n_steps, self.N))
 
-    def simulation_step(self, current_state, t, master_seed):
-        rng = self.get_coupled_rng(t, master_seed)
-        rand_ext = rng.random(self.N)
-        rand_col = rng.random(self.N)
+    def simulation_chunk(self, current_state, t_start, n_steps, master_seed):
+        """
+        Runs n_steps of simulation without CPU intervention/sync.
+        """
+        # Generate noise for the whole chunk
+        # NOTE: For strict coupling, t must align to chunk boundaries.
+        # We assume the caller handles t such that we can reproduce this block.
+        rand_ext_chunk, rand_col_chunk = self._get_gpu_noise_chunk(t_start, n_steps, master_seed)
         
-        # --- A. Extinction ---
-        survivors = current_state & (rand_ext < self.survival_prob)
+        state = current_state
         
-        # --- B. Colonization ---
-        # 1. Construct Effective Biomass Field
-        eff_biomass_flat = current_state.astype(float) * self.meanB_field
-        eff_biomass_2d = eff_biomass_flat.reshape(1, self.L_y, self.L_x)
+        # We need the loop to happen on GPU/Accelerator. 
+        # Python loop overhead is still present, but we removed the RNG overhead.
+        # We also removed the .any() check from the inner loop.
         
-        # 2. Compute Dispersal Flux (Pure CPU via monkey-patch)
-        flux_field = dispersal.compute_dispersal(eff_biomass_2d)
-        
-        # Normalize flux (if needed by your specific scaling logic)
-        flux_field = flux_field / (DISPERSAL_RATE)
-        flux_host = flux_field.flatten()
-        
-        # 3. Calculate Probability of Establishment
-        colonization_rate = flux_host * self.pCol_field
-        prob_colonization = 1.0 - np.exp(-colonization_rate * self.dt)
-        
-        # 4. Determine New Colonizations
-        newly_colonized = rand_col < prob_colonization
-        
-        return survivors | newly_colonized
+        for i in range(n_steps):
+            # Slices are views, no copy
+            r_ext = rand_ext_chunk[i]
+            r_col = rand_col_chunk[i]
+            
+            # Logic
+            survivors = state & (r_ext < self.survival_prob)
+            
+            eff_biomass_flat = state.float() * self.meanB_field
+            eff_biomass_2d = eff_biomass_flat.reshape(1, self.L_y, self.L_x)
+            
+            flux_field = dispersal.compute_dispersal(eff_biomass_2d)
+            flux_field = flux_field / (DISPERSAL_RATE)
+            flux_host = flux_field.flatten()
+            
+            colonization_rate = flux_host * self.pCol_field
+            prob_colonization = 1.0 - accel_np.exp(-colonization_rate * self.dt)
+            
+            newly_colonized = r_col < prob_colonization
+            state = survivors | newly_colonized
+            
+        return state
 
     def find_horizon(self, master_seed):
         """Finds the coupling horizon T where a full grid goes extinct using the SPECIFIC seed."""
         t_horizon = 100
+        # Chunk size for execution
+        CHUNK = 100 
+        
         while True:
-            state = np.ones(self.N, dtype=bool)
-            for t in range(-t_horizon, 0):
-                state = self.simulation_step(state, t, master_seed)
-                if not np.any(state): break 
-            if not np.any(state): break
+            state = accel_np.ones(self.N, dtype=bool)
+            
+            # Run in chunks
+            # Start from -t_horizon, go to 0
+            t = -t_horizon
+            while t < 0:
+                steps_to_run = min(CHUNK, 0 - t)
+                
+                # Run chunk
+                state = self.simulation_chunk(state, t, steps_to_run, master_seed)
+                
+                # Check for extinction only between chunks (SYNC POINT)
+                if not state.any(): 
+                    break
+                
+                t += steps_to_run
+            
+            if not state.any(): break
             else:
                 t_horizon *= 2
                 if t_horizon > 4*8*100000:
                     print(f"Explosion to t = {t_horizon}, Occ = {np.sum(state)}")
                     return None
         return t_horizon
+
+    def simulation_step(self, current_state, t, master_seed):
+        # Fallback for single step if needed, but we try to use chunks
+        return self.simulation_chunk(current_state, t, 1, master_seed)
 
 def calculate_p_mle(mean_occupancy):
     """
@@ -218,7 +255,8 @@ def generate_mixed_survivor(models, fractions, master_seed):
     
     global_weights = np.array(global_weights)
     total_weight = global_weights.sum()
-    if total_weight == 0: return np.zeros(models[0].N, dtype=bool), -1
+    if total_weight == 0: 
+        return accel_np.zeros(models[0].N, dtype=bool), -1
     
     type_probs = global_weights / total_weight
     
@@ -228,6 +266,7 @@ def generate_mixed_survivor(models, fractions, master_seed):
     
     batch_size = 5
     attempts = 0
+    CHUNK = 100
     
     while True:
         attempts += 1
@@ -242,22 +281,28 @@ def generate_mixed_survivor(models, fractions, master_seed):
             # B. Horizon Check
             if arrival_t < -horizons[type_idx]:
                 continue 
-                
             # C. Sample Location (using chosen model's specific field)
-            # Standard probability proportional to pCol field
-            loc_weights = chosen_model.pCol_field / chosen_model.pCol_field.sum()
+            # Standard probability proportional to pCol field            
+            pCol_cpu = to_cpu(chosen_model.pCol_field)
+            loc_weights = pCol_cpu / pCol_cpu.sum()
             start_node = meta_rng.choice(chosen_model.N, p=loc_weights)
             
             # D. Simulate
             current_seed = type_seeds[type_idx]
-            species_range = np.zeros(chosen_model.N, dtype=bool)
+            
+            # Init on GPU
+            species_range = accel_np.zeros(chosen_model.N, dtype=bool)
             species_range[start_node] = True
             
-            for t in range(arrival_t, 0):
-                species_range = chosen_model.simulation_step(species_range, t, current_seed)
-                if not np.any(species_range): break 
+            # Chunked Simulation
+            t = arrival_t
+            while t < 0:
+                steps = min(CHUNK, 0 - t)
+                species_range = chosen_model.simulation_chunk(species_range, t, steps, current_seed)
+                if not species_range.any(): break
+                t += steps
             
-            if np.any(species_range):
+            if species_range.any():
                 survivors_in_batch.append((species_range, type_idx))
         
         if len(survivors_in_batch) > 0:
@@ -266,7 +311,7 @@ def generate_mixed_survivor(models, fractions, master_seed):
             
         if attempts > 20000:  # We need a heuristic for choosign this limit on attempts
             print("Attempts exhausted")
-            return np.zeros(models[0].N, dtype=bool), -1
+            return to_cpu(accel_np.zeros(models[0].N, dtype=bool)), -1
 
 def tune_combined_extirpation_scaling(models, fractions, target_p, max_iter=100, samples_per_iter=30):
     print(f"\n--- Tuning Combined Extirpation Scaling (Target p: {target_p:.4f}) ---")
@@ -301,10 +346,12 @@ def tune_combined_extirpation_scaling(models, fractions, target_p, max_iter=100,
         for s_seed in seeds:
             print(f"{samples_per_iter - len(occupancies)}: ", end="")
             grid, _ = generate_mixed_survivor(models, fractions, s_seed)
+            
             if grid is None: 
                 n_exploded += 1
                 if n_exploded > min(1, samples_per_iter * 0.5): break 
-            elif np.any(grid): occupancies.append(np.sum(grid))
+            elif grid.any(): 
+                occupancies.append(grid.sum().item())
         
         if n_exploded > min(1, samples_per_iter * 0.5):
             print(f"Iter {i}: s={current_s:.4f} -> EXPLODED")
@@ -384,13 +431,14 @@ def tune_combined_extirpation_scaling(models, fractions, target_p, max_iter=100,
                     else:
                         current_s = min(current_s * 1.15, s_max)
                 
-                
     return current_s
 
 def tile_simulation_grids(sample_grids, rows=None, cols=None, padding=1, pad_value=0.0):
     N = len(sample_grids)
     if N == 0: return None
-    Ny, Nx = sample_grids[0].shape
+    sample_grids_cpu = [to_cpu(g) for g in sample_grids]
+    
+    Ny, Nx = sample_grids_cpu[0].shape
     
     if cols is None:
         aspect = 16/9
@@ -400,10 +448,10 @@ def tile_simulation_grids(sample_grids, rows=None, cols=None, padding=1, pad_val
         
     H, W = rows * Ny + (rows - 1) * padding, cols * Nx + (cols - 1) * padding
     
-    dtype = np.float32 if np.isnan(pad_value) else sample_grids[0].dtype
+    dtype = np.float32 if np.isnan(pad_value) else sample_grids_cpu[0].dtype
     canvas = np.full((H, W), pad_value, dtype=dtype)
     
-    for i, grid in enumerate(sample_grids):
+    for i, grid in enumerate(sample_grids_cpu):
         if i >= rows * cols: break
         r, c = divmod(i, cols)
         y, x = r * (Ny + padding), c * (Nx + padding)
@@ -412,7 +460,7 @@ def tile_simulation_grids(sample_grids, rows=None, cols=None, padding=1, pad_val
     return canvas
 
 def analyze_and_plot(ax, samples, title, color):
-    range_sizes = [np.sum(r) for r in samples]
+    range_sizes = [to_cpu(r).sum() for r in samples]
     range_sizes = np.array([r for r in range_sizes if r > 0])
     
     if len(range_sizes) == 0:
@@ -465,7 +513,7 @@ def analyze_and_plot(ax, samples, title, color):
     ax.grid(alpha=0.3)
 
 if __name__ == "__main__":
-    print("=== Integrated DCFTP (CPU-Only) ===")
+    print("=== Integrated DCFTP (GPU Optimized) ===")
     model1 = IntegratedDCFTP(species_type=1)
     model2 = IntegratedDCFTP(species_type=2)
     models = [model1, model2]
@@ -490,45 +538,42 @@ if __name__ == "__main__":
     seeds2 = [secrets.randbits(32) for _ in range(num_samples2)]
     
     samples_t1, samples_t2 = [], []
-    all_grids_for_movie = [] # Tuple (grid, type)
+    all_grids_for_movie = [] 
 
     print("\nGenerating Final Mixed Samples...")
     for i, s in zip(range(num_samples1), seeds1):
         grid1, _ = generate_mixed_survivor([model1], [1], s)
         type_idx = 0
         print(f"Type 1: {num_samples1-i}", end=", ")
-        if grid1 is not None and np.any(grid1):
-            # Store for analysis
+        if grid1 is not None and grid1.any():
             if type_idx == 0: samples_t1.append(grid1)
             else: samples_t2.append(grid1)
             
             if len(all_grids_for_movie) < 50:
-                # Store grid with Type encoded: 1 for Type 1, 2 for Type 2
-                # We multiply the boolean grid by (type_idx + 1)
-                colored_grid = grid1.astype(float) * (type_idx + 1)
-                colored_grid[colored_grid == 0] = np.nan # Transparent background
+                grid_cpu = to_cpu(grid1)
+                colored_grid = grid_cpu.astype(float) * (type_idx + 1)
+                colored_grid[colored_grid == 0] = np.nan
                 all_grids_for_movie.append(colored_grid.reshape(NUM_PATCHES_Y, NUM_PATCHES_X))
+    
     for i, s in zip(range(num_samples2), seeds2):
         grid2, _ = generate_mixed_survivor([model2], [1], s)
         type_idx = 1
         print(f"Type 2: {num_samples2-i}", end=", ")
-        if grid2 is not None and np.any(grid2):
-            # Store for analysis
+        if grid2 is not None and grid2.any():
             if type_idx == 0: samples_t1.append(grid2)
             else: samples_t2.append(grid2)
             
             if len(all_grids_for_movie) < 100:
-                # Store grid with Type encoded: 1 for Type 1, 2 for Type 2
-                # We multiply the boolean grid by (type_idx + 1)
-                colored_grid = grid2.astype(float) * (type_idx + 1)
-                colored_grid[colored_grid == 0] = np.nan # Transparent background
+                grid_cpu = to_cpu(grid2)
+                colored_grid = grid_cpu.astype(float) * (type_idx + 1)
+                colored_grid[colored_grid == 0] = np.nan 
                 all_grids_for_movie.append(colored_grid.reshape(NUM_PATCHES_Y, NUM_PATCHES_X))
 
-    # Output summary stats files
-    all_t1 = np.array(samples_t1).reshape((len(samples_t1), NUM_PATCHES_Y, NUM_PATCHES_X))
+    all_t1 = np.array([to_cpu(g) for g in samples_t1]).reshape((len(samples_t1), NUM_PATCHES_Y, NUM_PATCHES_X))
     t1_richness = np.mean(np.sum(all_t1+0.0, axis=0), axis=1)
-    all_t2 = np.array(samples_t2).reshape((len(samples_t2), NUM_PATCHES_Y, NUM_PATCHES_X))
+    all_t2 = np.array([to_cpu(g) for g in samples_t2]).reshape((len(samples_t2), NUM_PATCHES_Y, NUM_PATCHES_X))
     t2_richness = np.mean(np.sum(all_t2+0.0, axis=0), axis=1)
+    
     csv_path = "richness_by_type_dcftp.csv"
     try:
         with open(csv_path, "w", newline="") as f:
@@ -536,31 +581,29 @@ if __name__ == "__main__":
             writer.writerow(["row_y", "mean_richness_1", "mean_richness_2"])
             for y in range(NUM_PATCHES_Y):
                 writer.writerow([y+1, f"{t1_richness[y]:.4f}", f"{t2_richness[y]:.4f}"])
-                    
             print(f"Written row-wise richness stats to {csv_path}")
-            
     except Exception as e:
         print(f"Failed to write {csv_path}: {e}")
 
     # Compute extinctions from destruction of half of type 2 environment.
     NY, NX = (NUM_PATCHES_Y, NUM_PATCHES_X)
-    remaining_t1 = all_t1
+    remaining_t1 = all_t1.copy()
     remaining_t1[:, (NY//4):NY, (NX//2):NX] = 0
-    remaining_t2 = all_t2
+    remaining_t2 = all_t2.copy()
     remaining_t2[:, (NY//4):NY, (NX//2):NX] = 0
-    predicted_extinctions_1 = \
-        np.sum(np.sum(remaining_t1, axis=(1,2))==0)
-    predicted_extinctions_2 = \
-        np.sum(np.sum(remaining_t2, axis=(1,2))==0)
+    predicted_extinctions_1 = np.sum(np.sum(remaining_t1, axis=(1,2))==0)
+    predicted_extinctions_2 = np.sum(np.sum(remaining_t2, axis=(1,2))==0)
     print(f"Predicted_extinctions: {predicted_extinctions_1}/{len(samples_t1)}, {predicted_extinctions_2}/{len(samples_t2)}")
 
-    # Compute mean range rarity by row
-    mask_D = np.concatenate((np.array(samples_t1), np.array(samples_t2)), axis = 0)
-    occupancy = np.sum(mask_D,axis = 1)+0.0
-    range_rarity_field = np.sum((mask_D/occupancy[:, None])[occupancy>0], axis = 0)
+    mask_D = np.concatenate((all_t1, all_t2), axis = 0)
+    occupancy = np.sum(mask_D, axis = 1)+0.0
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_occ = 1.0 / occupancy[:, None]
+        inv_occ[~np.isfinite(inv_occ)] = 0
+    range_rarity_field = np.sum((mask_D * inv_occ), axis = 0)
     range_rarity_field = range_rarity_field.reshape(NUM_PATCHES_Y, NUM_PATCHES_X)
-    mean_range_rarity = \
-        np.mean(range_rarity_field, axis = 1)
+    mean_range_rarity = np.mean(range_rarity_field, axis = 1)
+    
     csv_path = "range_rarity_DCFTP.csv"
     try:
         with open(csv_path, "w", newline="") as f:
@@ -569,18 +612,15 @@ if __name__ == "__main__":
             for y in range(NUM_PATCHES_Y):
                 # y+1 for 1-based indexing as requested
                 writer.writerow([y+1, f"{mean_range_rarity[y]:.4f}"])
-
         print(f"Written row-wise range_rarity to {csv_path}")
-
     except Exception as e:
         print(f"Failed to write {csv_path}: {e}")
 
         
     # Analysis Plots
     fig, ax = plt.subplots(2, 2, figsize=(12, 10))
-    rows = np.arange(NUM_PATCHES_Y)
-    ax[0,0].plot(rows, model1.meanB_field.reshape(NUM_PATCHES_Y, NUM_PATCHES_X)[:,0], label='Type 1')
-    ax[0,0].plot(rows, model2.meanB_field.reshape(NUM_PATCHES_Y, NUM_PATCHES_X)[:,0], label='Type 2')
+    ax[0,0].plot(np.arange(NUM_PATCHES_Y), to_cpu(model1.meanB_field).reshape(NUM_PATCHES_Y, NUM_PATCHES_X)[:,0], label='Type 1')
+    ax[0,0].plot(np.arange(NUM_PATCHES_Y), to_cpu(model2.meanB_field).reshape(NUM_PATCHES_Y, NUM_PATCHES_X)[:,0], label='Type 2')
     ax[0,0].legend(); ax[0,0].set_title("Mean Biomass")
     
     # Pie chart of composition
