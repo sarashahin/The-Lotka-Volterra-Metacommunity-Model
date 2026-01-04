@@ -139,7 +139,7 @@ class IntegratedDCFTP:
         prob_colonization = 1.0 - np.exp(-colonization_rate * self.dt)
         
         # 4. Determine New Colonizations
-        newly_colonized = (~current_state) & (rand_col < prob_colonization)
+        newly_colonized = rand_col < prob_colonization
         
         return survivors | newly_colonized
 
@@ -154,7 +154,7 @@ class IntegratedDCFTP:
             if not np.any(state): break
             else:
                 t_horizon *= 2
-                if t_horizon > 8*100000:
+                if t_horizon > 4*8*100000:
                     print(f"Explosion to t = {t_horizon}, Occ = {np.sum(state)}")
                     return None
         return t_horizon
@@ -264,7 +264,7 @@ def generate_mixed_survivor(models, fractions, master_seed):
             print(f"Horizon: {max_horizon}, {attempts}", end="                 \r")
             return survivors_in_batch[meta_rng.integers(0, len(survivors_in_batch))]
             
-        if attempts > 20000:  # We need a heuristic for choosign this limit on attempts
+        if attempts > 20000:  # We need a heuristic for choosign this limit on attempts
             print("Attempts exhausted")
             return np.zeros(models[0].N, dtype=bool), -1
 
@@ -471,22 +471,22 @@ if __name__ == "__main__":
     models = [model1, model2]
     fractions = [0.5, 0.5] 
     
-    target_p1 = calculate_p_mle(88.02532) 
+    target_p1 = calculate_p_mle(34.83378) 
     optimal_s1 = tune_combined_extirpation_scaling([model1], [1], target_p1)
-    # optimal_s1 = 0.9745
+    # optimal_s1 = 0.8549897
     print(f"Optimal Scaling: {optimal_s1:.7f}")
-    target_p2 = calculate_p_mle(151.1307) 
+    target_p2 = calculate_p_mle(51.84712) 
     optimal_s2 = tune_combined_extirpation_scaling([model2], [1], target_p2)
-    # optimal_s2 = 1.0613
+    # optimal_s2 = 0.9160
     print(f"Optimal Scaling: {optimal_s2:.7f}")
     
     model1.set_extirpation_scaling(optimal_s1)
     model2.set_extirpation_scaling(optimal_s2)
     
     # Generate Samples
-    num_samples1 = 158
+    num_samples1 = 373
     seeds1 = [secrets.randbits(32) for _ in range(num_samples1)]
-    num_samples2 = 283
+    num_samples2 = 798
     seeds2 = [secrets.randbits(32) for _ in range(num_samples2)]
     
     samples_t1, samples_t2 = [], []
@@ -496,7 +496,7 @@ if __name__ == "__main__":
     for i, s in zip(range(num_samples1), seeds1):
         grid1, _ = generate_mixed_survivor([model1], [1], s)
         type_idx = 0
-        print(f"Type 1: {num_samples1-i}")
+        print(f"Type 1: {num_samples1-i}", end=", ")
         if grid1 is not None and np.any(grid1):
             # Store for analysis
             if type_idx == 0: samples_t1.append(grid1)
@@ -511,7 +511,7 @@ if __name__ == "__main__":
     for i, s in zip(range(num_samples2), seeds2):
         grid2, _ = generate_mixed_survivor([model2], [1], s)
         type_idx = 1
-        print(f"Type 2: {num_samples2-i}")
+        print(f"Type 2: {num_samples2-i}", end=", ")
         if grid2 is not None and np.any(grid2):
             # Store for analysis
             if type_idx == 0: samples_t1.append(grid2)
@@ -554,7 +554,7 @@ if __name__ == "__main__":
         np.sum(np.sum(remaining_t2, axis=(1,2))==0)
     print(f"Predicted_extinctions: {predicted_extinctions_1}/{len(samples_t1)}, {predicted_extinctions_2}/{len(samples_t2)}")
 
-    # Compute mean range rarity by row
+    # Compute mean range rarity by row
     mask_D = np.concatenate((np.array(samples_t1), np.array(samples_t2)), axis = 0)
     occupancy = np.sum(mask_D,axis = 1)+0.0
     range_rarity_field = np.sum((mask_D/occupancy[:, None])[occupancy>0], axis = 0)
