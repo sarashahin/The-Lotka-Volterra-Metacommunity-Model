@@ -201,6 +201,8 @@ class PSD2Model:
         return np.concatenate([c['non_self_growth'].flatten(), c['pclock'].flatten()])
 
     def _handle_event_fn(self, solver, event_info):
+
+        ## Abbreviations and reshaping
         total = self.S * self.N_patches
         self._ensure_cache(solver.t, solver.y)
         c = self._cache
@@ -211,34 +213,47 @@ class PSD2Model:
         clock_evts = rootsfound[total:].reshape(self.S, -1)
         state_modified = False
 
+        ## S -> P transitions
         mask_S_to_P = (growth_evts == -1) & sw
         sw = np.where(mask_S_to_P, False, sw)
         pclock = np.where(mask_S_to_P, 1.0, pclock)
 
+        ## P -> S or D transitions
+        # Compute derivatives of non-self growth rate:
         mask_sweep = (growth_evts == 1) & (~sw)
         yd = self._derivatives(solver.t, solver.y, solver.sw)
         dlogB_deriv = yd[:total].reshape(self.S, -1)
+        # Shortcut here to get NON-SELF rate changes,
         prod = B * np.where(mask_sweep, 0.0, dlogB_deriv)
+        # c_vals are rates of change of non-self rate
         c_vals = -(self.C @ prod)
+        # Remove negative sweeps (should not occur)
         valid_sweep = (c_vals > 0) & mask_sweep
         c_safe = np.where(valid_sweep, c_vals, 0.0)
         sqrt_c = np.sqrt(c_safe)
+        # Compute P -> S probabilities:
         const_term = MORTALITY_RATE * np.sqrt(np.pi / 2.0)
         numerator = B * sqrt_c
         denominator = BODY_MASS * (sqrt_c + const_term)
         term = numerator / denominator
         prob_remain_S = np.where(valid_sweep, np.exp(-term), 0.0)
+        # Sample P -> S and P -> D cases
         rnd = np.random.rand(*B.shape)
         failed_sweep = valid_sweep & (rnd <= prob_remain_S)
         successful_sweep = valid_sweep & (rnd > prob_remain_S)
+        # Handle P -> D cases
         offset = -np.log1p(-prob_remain_S)
+        # Should impose a more logical upper bound
         new_logB = np.minimum(0.0, logB + offset)
         logB = np.where(successful_sweep, new_logB, logB)
         if np.any(successful_sweep): state_modified = True
+        # Handle P -> S cases
+        # ??? DOESN'T THIS ALSO MODIFY STATE?
         sw = np.where(failed_sweep, True, sw)
         new_clocks = np.log(np.random.rand(*B.shape))
         pclock = np.where(failed_sweep, new_clocks, pclock)
 
+        ## S -> D transitions
         mask_clock = (clock_evts == 1) & sw
         est_prob = c['est_prob'] 
         valid_est = mask_clock & (est_prob > 0)
@@ -248,16 +263,20 @@ class PSD2Model:
         if np.any(valid_est): state_modified = True
         pclock = np.where(valid_est, 1.0, pclock)
         sw = np.where(valid_est, False, sw)
+        # Rare cases that SHOULD NOT OCCUR:
         invalid_est = mask_clock & (est_prob <= 0)
         pclock = np.where(invalid_est, 1.0, pclock)
         sw = np.where(invalid_est, False, sw)
 
+        ## Write resutls back to solver object
         solver.y[:total] = logB.ravel()
         solver.y[total:] = pclock.ravel()
         solver.sw = sw.ravel()
         
+        # Correct state if modified:
         if state_modified:
-             new_logB = logB 
+             new_logB = logB
+             # THERE ARE TOO MANY DIFFERNT CAPS ON B!?
              logB_clamped = np.minimum(new_logB, LOG_B_CAP)
              B_new = np.exp(logB_clamped)
              local_growth, non_self_growth = self._compute_local_growth(B_new)
