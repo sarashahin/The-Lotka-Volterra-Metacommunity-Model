@@ -8,6 +8,8 @@ environmental location, and demographic parameters (r, C).
 import numpy as np
 from config import INTERACTION_STRENGTH, CONNECTANCE, NUM_PATCHES_X, NUM_PATCHES_Y
 
+TWO_TYPES = False
+
 class TraitManager:
     def __init__(self, rng=None):
         self.rng = rng if rng is not None else np.random.default_rng()
@@ -26,15 +28,19 @@ class TraitManager:
         
         # Simple vertical split
         # We can map 2D coordinates if needed, but linear split is fine for testing
-        split_idx = n_patches // 4
-        self.env_map[split_idx:] = 1 
+        if TWO_TYPES:
+            split_idx = n_patches // 4
+            self.env_map[split_idx:] = 1
 
     def generate_traits(self, n_new):
         """
         Sample abstract traits for n_new new species.
         Current Rule: Integer 0 or 1.
         """
-        return self.rng.integers(0, 2, size=n_new)
+        if TWO_TYPES:
+            return self.rng.integers(0, 2, size=n_new)
+        else:
+            return np.zeros(n_new)
 
     def get_growth_rates(self, traits):
         """
