@@ -26,7 +26,7 @@ CONNECTANCE = 0.4
 # Strength of interaction when non-zero
 INTERACTION_STRENGTH = 0.4
 
-MIN_INVASION_CANDIDATES_PER_ITERATION = 1
+MIN_INVASION_CANDIDATES_PER_ITERATION = 3
 
 
 #: Max simulation time
@@ -41,6 +41,8 @@ N_RECORDS = TMAX // RECORDING_STEP_SIZE
 
 #: Random seed
 RANDOM_SEED = 125
+# Use sophisticated_rng in DCFTP for testing
+USE_SOPHISTICATED_RNG = False
 
 # For ODE/PSD2 solvers
 RTOL = 1e-5

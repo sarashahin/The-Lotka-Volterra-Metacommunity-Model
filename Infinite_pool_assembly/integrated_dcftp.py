@@ -7,32 +7,31 @@ import csv
 import statsmodels.api as sm
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
-from scipy.stats import logser, chi2, t
-from scipy.optimize import brentq
+import matplotlib.colors as colors
+from scipy.stats import logser, chi2
 from scipy.special import lambertw
 import hashlib
 import secrets
-import sys
 import os
 
 # --- ACCELERATOR & CONFIG ---
-from accelerator import np as accel_np, to_cpu, torch 
+from accelerator import np as accel_np, to_cpu, torch
 import config
-from config import BODY_MASS, NUM_PATCHES_X, NUM_PATCHES_Y, DISPERSAL_RATE
+from config import BODY_MASS, NUM_PATCHES_X, NUM_PATCHES_Y, DISPERSAL_RATE, USE_SOPHISTICATED_RNG
 import dispersal
 
 class IntegratedDCFTP:
-    def __init__(self, species_type=1, csv_path='metacommunity_fields.csv', dt=0.1):
+    def __init__(self, species_type=1, csv_path='metacommunity_fields.csv', dt=0.5, sophisticated_rng=False):
         self.L_y = NUM_PATCHES_Y
         self.L_x = NUM_PATCHES_X
         self.N = self.L_x * self.L_y
         self.ext_scaling = 1.0
         self.dt = dt
-        
+        self.sophisticated_rng = sophisticated_rng
+
         # 1. Load Effective Parameters from CSV
         if not os.path.exists(csv_path):
             raise FileNotFoundError(f"Could not find {csv_path}")
-            
         df = pd.read_csv(csv_path)
         
         # Extract columns based on species type
@@ -87,12 +86,13 @@ class IntegratedDCFTP:
     def set_extirpation_scaling(self, factor):
         self.ext_scaling = factor
         self.survival_prob = accel_np.exp(-self.base_extRate_field * (self.ext_scaling * self.dt))
-        self.horizon_cache = None 
+        self.horizon_cache = None
 
     def _get_gpu_noise_chunk(self, t_start, n_steps, master_seed):
         """
-        Generates a chunk of random numbers for n_steps.
-        Using a stateless-like seeding approach for GPU.
+        Generates a chunk of random numbers.
+        Fast mode: One seed per chunk.
+        Sophisticated mode: Not used (logic handled in per-step generation).
         """
         if torch is not None:
             # Generate a large block: (n_steps, N)
@@ -122,43 +122,65 @@ class IntegratedDCFTP:
             rng = np.random.default_rng(step_seed)
             return rng.random((n_steps, self.N)), rng.random((n_steps, self.N))
 
+    def _get_gpu_noise_step(self, t, master_seed):
+        """
+        Generates noise for a single step with high-quality seeding.
+        Used when sophisticated_rng=True.
+        """
+        # Strict per-step seeding for maximum quality
+        if torch is not None:
+            # Combine master_seed and t into a unique hash
+            step_seed = (master_seed ^ int(t * 987654321)) & 0xFFFFFFFFFFFFFFFF
+            
+            gen = torch.Generator(device=self.pCol_field.device)
+            gen.manual_seed(step_seed)
+            
+            rand_ext = torch.rand(self.N, generator=gen, device=self.pCol_field.device)
+            rand_col = torch.rand(self.N, generator=gen, device=self.pCol_field.device)
+            return rand_ext, rand_col
+        else:
+            hash_input = f"{master_seed}_{t}_step".encode('utf-8')
+            step_seed = int(hashlib.sha256(hash_input).hexdigest(), 16) % (2**32)
+            rng = np.random.default_rng(step_seed)
+            return rng.random(self.N), rng.random(self.N)
+
     def simulation_chunk(self, current_state, t_start, n_steps, master_seed):
         """
-        Runs n_steps of simulation without CPU intervention/sync.
+        Runs n_steps of simulation.
+        Handles dispatch to fast or sophisticated RNG.
         """
-        # Generate noise for the whole chunk
-        # NOTE: For strict coupling, t must align to chunk boundaries.
-        # We assume the caller handles t such that we can reproduce this block.
-        rand_ext_chunk, rand_col_chunk = self._get_gpu_noise_chunk(t_start, n_steps, master_seed)
-        
         state = current_state
         
-        # We need the loop to happen on GPU/Accelerator. 
-        # Python loop overhead is still present, but we removed the RNG overhead.
-        # We also removed the .any() check from the inner loop.
-        
-        for i in range(n_steps):
-            # Slices are views, no copy
-            r_ext = rand_ext_chunk[i]
-            r_col = rand_col_chunk[i]
-            
-            # Logic
-            survivors = state & (r_ext < self.survival_prob)
-            
-            eff_biomass_flat = state.float() * self.meanB_field
-            eff_biomass_2d = eff_biomass_flat.reshape(1, self.L_y, self.L_x)
-            
-            flux_field = dispersal.compute_dispersal(eff_biomass_2d)
-            flux_field = flux_field / (DISPERSAL_RATE)
-            flux_host = flux_field.flatten()
-            
-            colonization_rate = flux_host * self.pCol_field
-            prob_colonization = 1.0 - accel_np.exp(-colonization_rate * self.dt)
-            
-            newly_colonized = r_col < prob_colonization
-            state = survivors | newly_colonized
+        if self.sophisticated_rng:
+            # SLOW PATH: Loop and re-seed every step
+            for i in range(n_steps):
+                t_current = t_start + i
+                r_ext, r_col = self._get_gpu_noise_step(t_current, master_seed)
+                state = self._core_step_logic(state, r_ext, r_col)
+        else:
+            # FAST PATH: Pre-generate chunk
+            rand_ext_chunk, rand_col_chunk = self._get_gpu_noise_chunk(t_start, n_steps, master_seed)
+            for i in range(n_steps):
+                state = self._core_step_logic(state, rand_ext_chunk[i], rand_col_chunk[i])
             
         return state
+
+    def _core_step_logic(self, state, r_ext, r_col):
+        """Inner physics logic, agnostic to RNG source."""
+        survivors = state & (r_ext < self.survival_prob)
+        
+        eff_biomass_flat = state.float() * self.meanB_field
+        eff_biomass_2d = eff_biomass_flat.reshape(1, self.L_y, self.L_x)
+        
+        flux_field = dispersal.compute_dispersal(eff_biomass_2d)
+        flux_field = flux_field / (DISPERSAL_RATE)
+        flux_host = flux_field.flatten()
+        
+        colonization_rate = flux_host * self.pCol_field
+        prob_colonization = 1.0 - accel_np.exp(-colonization_rate * self.dt)
+        
+        newly_colonized = r_col < prob_colonization
+        return survivors | newly_colonized
 
     def find_horizon(self, master_seed):
         """Finds the coupling horizon T where a full grid goes extinct using the SPECIFIC seed."""
@@ -187,13 +209,14 @@ class IntegratedDCFTP:
             if not state.any(): break
             else:
                 t_horizon *= 2
-                if t_horizon > 4*8*100000:
-                    print(f"Explosion to t = {t_horizon}, Occ = {np.sum(state)}")
+                if t_horizon > 4*100000:
+                    # FIX: Use .sum().item() for tensor scalar access
+                    print(f"Explosion to t = {t_horizon}, Occ = {state.sum().item()}")
                     return None
         return t_horizon
 
     def simulation_step(self, current_state, t, master_seed):
-        # Fallback for single step if needed, but we try to use chunks
+        # Fallback for single step if needed
         return self.simulation_chunk(current_state, t, 1, master_seed)
 
 def calculate_p_mle(mean_occupancy):
@@ -227,6 +250,7 @@ def calculate_p_mle(mean_occupancy):
     
     # Clamp to safe range (0, 1)
     return max(1e-9, min(1.0 - 1e-9, p_hat))
+
 
 def generate_mixed_survivor(models, fractions, master_seed):
     """
@@ -313,6 +337,7 @@ def generate_mixed_survivor(models, fractions, master_seed):
             print("Attempts exhausted")
             return to_cpu(accel_np.zeros(models[0].N, dtype=bool)), -1
 
+        
 def tune_combined_extirpation_scaling(models, fractions, target_p, max_iter=100, samples_per_iter=30):
     print(f"\n--- Tuning Combined Extirpation Scaling (Target p: {target_p:.4f}) ---")
     history_s, history_p = [], []
@@ -329,7 +354,7 @@ def tune_combined_extirpation_scaling(models, fractions, target_p, max_iter=100,
             del history_p[0]
 
         if current_s <= s_explodes:
-            print(f"Iter {i}: s={current_s:.4f} -> EXPLODES")
+            print(f"Iter {i}: s={current_s:.4f} -> predicted SUPERCRITICAL")
             current_s = s_explodes
             if len(history_s) > 0:
                 current_s = 0.5*(current_s + min(history_s))
@@ -342,6 +367,8 @@ def tune_combined_extirpation_scaling(models, fractions, target_p, max_iter=100,
         occupancies = []
         n_exploded = 0
         seeds = [secrets.randbits(32) for _ in range(samples_per_iter)]
+
+        explodes = False
         
         for s_seed in seeds:
             print(f"{samples_per_iter - len(occupancies)}: ", end="")
@@ -349,11 +376,25 @@ def tune_combined_extirpation_scaling(models, fractions, target_p, max_iter=100,
             
             if grid is None: 
                 n_exploded += 1
-                if n_exploded > min(1, samples_per_iter * 0.5): break 
+                if n_exploded > min(1, samples_per_iter * 0.5):
+                    explodes = True
+                    break 
             elif grid.any(): 
                 occupancies.append(grid.sum().item())
+
+        obs_p = calculate_p_mle(np.mean(occupancies))
+        # Variance of log-series distribution as reference:
+        theo_variance = -(obs_p**2 + obs_p * np.log(1-obs_p))/ \
+            ( (1-obs_p) * np.log(1-obs_p) )**2
+        if ~explodes:
+            var_Ex = np.var(occupancies)/theo_variance
+            if var_Ex < 0.1:
+                explodes = True
+                print(f"Supercritical with var_EX={var_Ex:.2f}")
+        else:
+            var_Ex = 0
         
-        if n_exploded > min(1, samples_per_iter * 0.5):
+        if explodes:
             print(f"Iter {i}: s={current_s:.4f} -> EXPLODED")
             if current_s > s_explodes:
                 s_explodes = current_s
@@ -368,10 +409,6 @@ def tune_combined_extirpation_scaling(models, fractions, target_p, max_iter=100,
             current_s = max(current_s * 0.9, s_min)
             continue
             
-        obs_p = calculate_p_mle(np.mean(occupancies))
-        # Variance of log-series distribution as reference:
-        theo_variance = -(obs_p**2 + obs_p * np.log(1-obs_p))/ \
-            ( (1-obs_p) * np.log(1-obs_p) )**2
         history_s.append(current_s); history_p.append(obs_p)
         print(f"Iter {i}: s={current_s:.4f} -> Mean Occ={np.mean(occupancies):.2f}, var_Ex={np.var(occupancies)/theo_variance:.2f}, p_mle={obs_p:.4f}")
         
@@ -433,7 +470,7 @@ def tune_combined_extirpation_scaling(models, fractions, target_p, max_iter=100,
                 
     return current_s
 
-def tile_simulation_grids(sample_grids, rows=None, cols=None, padding=1, pad_value=0.0):
+def tile_simulation_grids(sample_grids, rows=None, cols=None, padding=2, pad_value=0.0):
     N = len(sample_grids)
     if N == 0: return None
     sample_grids_cpu = [to_cpu(g) for g in sample_grids]
@@ -512,20 +549,22 @@ def analyze_and_plot(ax, samples, title, color):
     ax.set_ylabel("Count")
     ax.grid(alpha=0.3)
 
+    
 if __name__ == "__main__":
     print("=== Integrated DCFTP (GPU Optimized) ===")
-    model1 = IntegratedDCFTP(species_type=1)
-    model2 = IntegratedDCFTP(species_type=2)
+    
+    print(f"RNG Mode: {'Sophisticated (Step-seeded)' if USE_SOPHISTICATED_RNG else 'Fast (Chunk-seeded)'}")
+    
+    model1 = IntegratedDCFTP(species_type=1, sophisticated_rng=USE_SOPHISTICATED_RNG)
+    model2 = IntegratedDCFTP(species_type=2, sophisticated_rng=USE_SOPHISTICATED_RNG)
     models = [model1, model2]
     fractions = [0.5, 0.5] 
     
     target_p1 = calculate_p_mle(34.83378) 
     optimal_s1 = tune_combined_extirpation_scaling([model1], [1], target_p1)
-    # optimal_s1 = 0.8549897
     print(f"Optimal Scaling: {optimal_s1:.7f}")
     target_p2 = calculate_p_mle(51.84712) 
     optimal_s2 = tune_combined_extirpation_scaling([model2], [1], target_p2)
-    # optimal_s2 = 0.9160
     print(f"Optimal Scaling: {optimal_s2:.7f}")
     
     model1.set_extirpation_scaling(optimal_s1)
@@ -546,10 +585,12 @@ if __name__ == "__main__":
         type_idx = 0
         print(f"Type 1: {num_samples1-i}", end=", ")
         if grid1 is not None and grid1.any():
-            if type_idx == 0: samples_t1.append(grid1)
-            else: samples_t2.append(grid1)
+            if type_idx == 0:
+                samples_t1.append(grid1)
+            else:
+                samples_t2.append(grid1)
             
-            if len(all_grids_for_movie) < 50:
+            if len(all_grids_for_movie) < 30:
                 grid_cpu = to_cpu(grid1)
                 colored_grid = grid_cpu.astype(float) * (type_idx + 1)
                 colored_grid[colored_grid == 0] = np.nan
@@ -560,10 +601,12 @@ if __name__ == "__main__":
         type_idx = 1
         print(f"Type 2: {num_samples2-i}", end=", ")
         if grid2 is not None and grid2.any():
-            if type_idx == 0: samples_t1.append(grid2)
-            else: samples_t2.append(grid2)
+            if type_idx == 0:
+                samples_t1.append(grid2)
+            else:
+                samples_t2.append(grid2)
             
-            if len(all_grids_for_movie) < 100:
+            if len(all_grids_for_movie) < 60:
                 grid_cpu = to_cpu(grid2)
                 colored_grid = grid_cpu.astype(float) * (type_idx + 1)
                 colored_grid[colored_grid == 0] = np.nan 
@@ -618,7 +661,7 @@ if __name__ == "__main__":
 
         
     # Analysis Plots
-    fig, ax = plt.subplots(2, 2, figsize=(12, 10))
+    fig, ax = plt.subplots(2, 2, figsize=(10, 6))
     ax[0,0].plot(np.arange(NUM_PATCHES_Y), to_cpu(model1.meanB_field).reshape(NUM_PATCHES_Y, NUM_PATCHES_X)[:,0], label='Type 1')
     ax[0,0].plot(np.arange(NUM_PATCHES_Y), to_cpu(model2.meanB_field).reshape(NUM_PATCHES_Y, NUM_PATCHES_X)[:,0], label='Type 2')
     ax[0,0].legend(); ax[0,0].set_title("Mean Biomass")
@@ -634,16 +677,16 @@ if __name__ == "__main__":
 
     # Movie Tiled Plot
     if all_grids_for_movie:
-        tiled = tile_simulation_grids(all_grids_for_movie, padding=1, pad_value=0)
+        tiled = tile_simulation_grids(all_grids_for_movie, padding=2, pad_value=0)
         plt.figure(figsize=(16, 9))
         # Custom cmap: 1=Blue, 2=Red. 
         # We can use a discrete colormap. 
         # Matplotlib's 'coolwarm' maps low to blue, high to red.
         # nan is white.
-        cmap = cm.get_cmap('coolwarm').copy()
-        cmap.set_bad(color='white')
+        cmap = colors.LinearSegmentedColormap.from_list("", ["white","red","blue"])
+        cmap.set_bad(color='black')
         
-        plt.imshow(tiled+1, cmap=cmap, interpolation='nearest', vmin=0.5, vmax=2.5)
+        plt.imshow(tiled+1, cmap=cmap, interpolation='nearest', vmin=0, vmax=2.5)
         plt.axis('off')
         plt.title(f"Mixed Species Ranges (Blue=Type 1, Red=Type 2)")
         plt.tight_layout()
