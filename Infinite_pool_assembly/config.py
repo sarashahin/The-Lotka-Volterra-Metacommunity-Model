@@ -26,6 +26,9 @@ CONNECTANCE = 0.4
 # Strength of interaction when non-zero
 INTERACTION_STRENGTH = 0.4
 
+MIN_INVASION_CANDIDATES_PER_ITERATION = 1
+
+
 #: Max simulation time
 TMAX = 200000 
 

@@ -9,7 +9,7 @@ from accelerator import np
 import numpy as _real_numpy
 import os 
 
-from config import NUM_PATCHES_X, NUM_PATCHES_Y, THRESHOLD, BODY_MASS
+from config import NUM_PATCHES_X, NUM_PATCHES_Y, THRESHOLD, BODY_MASS, MIN_INVASION_CANDIDATES_PER_ITERATION
 from assembly_utils import expand_RC, prune_extinct 
 from models_ibm import IBMModel
 from models_psd2 import PSD2Model
@@ -79,8 +79,7 @@ class StepwiseAssembler(abc.ABC):
             # <--- RESTORED SCALING LOGIC --->
             # Calculate candidates based on gamma and frac_multi
             # e.g., if gamma=100 and frac_multi=0.05, try 5 species this round.
-            n_cand = max(1, int(gamma_current * self.frac_multi))
-            n_cand = 10
+            n_cand = max(MIN_INVASION_CANDIDATES_PER_ITERATION, int(gamma_current * self.frac_multi))
 
             if (self.max_attempts and attempts >= self.max_attempts) or \
                (self.richness_cap and gamma_current >= self.richness_cap):
