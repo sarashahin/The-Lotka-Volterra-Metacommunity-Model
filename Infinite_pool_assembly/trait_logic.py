@@ -40,7 +40,7 @@ class TraitManager:
         if TWO_TYPES:
             return self.rng.integers(0, 2, size=n_new)
         else:
-            return np.zeros(n_new)
+            return np.zeros(n_new, dtype=int)
 
     def get_growth_rates(self, traits):
         """
