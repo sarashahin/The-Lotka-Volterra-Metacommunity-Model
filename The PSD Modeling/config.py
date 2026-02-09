@@ -33,7 +33,7 @@ TARGET_RICHNESS = 300
 T_RELAX = 300
 
 #: Max simulation time
-TMAX =  200000  # (like 200000 in R)
+TMAX =  20000  # (like 200000 in R)
 
 #: Step size per iteration in the simpler discrete loops
 STEP_SIZE = 1
