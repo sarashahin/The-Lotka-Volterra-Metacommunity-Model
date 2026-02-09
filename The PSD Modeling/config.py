@@ -15,7 +15,7 @@ import numpy as np
 BODY_MASS = 1e-4 # << large body mass
 # BODY_MASS = 1e-11 # << small body mass 
 
-INV = 1e-10          # << tiny immigration 101
+INV = 1e-8          # << tiny immigration 101
 
 # Mortality rate (for large negative growth offsets)
 MORTALITY_RATE = 0.2
@@ -27,7 +27,7 @@ CONNECTANCE = 0.4
 INTERACTION_STRENGTH = 0.4
 
 #: Initial number of species to aim for before the main loop
-TARGET_RICHNESS = 500
+TARGET_RICHNESS = 300
 
 #: Number of time steps for "relaxation" or "settling" in certain procedures
 T_RELAX = 300
@@ -39,7 +39,7 @@ TMAX =  200000  # (like 200000 in R)
 STEP_SIZE = 1
 
 #: Recording step size
-RECORDING_STEP_SIZE = 200  # e.g., 500
+RECORDING_STEP_SIZE = 10  # e.g., 500
 
 #: Number of records to keep
 N_RECORDS = TMAX // RECORDING_STEP_SIZE
