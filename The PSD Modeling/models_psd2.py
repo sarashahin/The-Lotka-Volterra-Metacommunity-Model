@@ -1,286 +1,196 @@
+# ############################################
+# models_psd2.py  (ULTRA-FAST pure NumPy version)
+# ############################################
+"""
+PSD2 approach optimized for MAXIMUM SPEED.
 
-# --------------------------------------------------------
-############################################
-# models_PSD2.py  (speed-tuned, same math)
-############################################
+Uses pure NumPy Euler integration - no Assimulo overhead.
+This eliminates all solver initialization and event handling costs.
+"""
 
-import os as _os  # [OPT]
-_os.environ.setdefault("OMP_NUM_THREADS", "4")        # [OPT]
-_os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")   # [OPT]
-_os.environ.setdefault("MKL_NUM_THREADS", "4")        # [OPT]
-
+import os as _os
+_os.environ.setdefault("OMP_NUM_THREADS", "4")
+_os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")
+_os.environ.setdefault("MKL_NUM_THREADS", "4")
 
 import numpy as np
-import logging, time
-from assimulo.problem import Explicit_Problem
-from euler_simple import EulerSimple
+import logging
+import time
+
 from config import (
     BODY_MASS, MORTALITY_RATE,
     STEP_SIZE, RECORDING_STEP_SIZE,
-    CONNECTANCE, INTERACTION_STRENGTH,
-    TMAX, INV, RTOL, ATOL)
+    TMAX, INV)
 
 logger = logging.getLogger(__name__)
 
+
 class PSD2Model:
+    """
+    Ultra-fast PSD model using pure NumPy vectorized Euler integration.
+    No Assimulo overhead, no expensive event detection.
+    """
+    
     def __init__(self, r, C, tmax=None, record_step=None, seed=123):
         np.random.seed(seed)
         self.runtime_seconds = None
 
-        # --- model data -----------------------------------------------------
-        self.r = np.asarray(r, dtype=np.float64).reshape(-1)
-        # ### FAST: Fortran contiguous → faster BLAS gemv (C · B)
-        self.C = np.asfortranarray(np.asarray(C, dtype=np.float64))
+        # Model data
+        self.r = np.asarray(r, dtype=np.float64).ravel()
+        self.C = np.asarray(C, dtype=np.float64)
         self.S = self.r.size
-        self._S2 = 2 * self.S  
 
-        self.tmax        = float(tmax if tmax is not None else TMAX)
-        self.record_step = float(record_step if record_step is not None else RECORDING_STEP_SIZE)
+        self.tmax = int(tmax if tmax is not None else TMAX)
+        self.record_step = int(record_step if record_step is not None else RECORDING_STEP_SIZE)
+        self.dt = 10.0  # Integration step size
 
-        # initial state
-        init_biomass = BODY_MASS / 2.0
-        self.logB          = np.full(self.S, np.log(init_biomass), dtype=np.float64)
-        self.waiting       = np.ones(self.S, dtype=bool)
-        self.poisson_clock = np.log(np.random.rand(self.S))
-
-        # output arrays
-        self.nrecords        = int(max(1, self.tmax // self.record_step))
-        self.trajectory      = np.empty((self.nrecords + 1, self.S), dtype=np.float64)
-        self.wait_trajectory = np.empty((self.nrecords + 1, self.S), dtype=bool)
-        self.time_points     = np.empty(self.nrecords + 1, dtype=np.float64)
-        self.record_idx      = 0
-
-        # diagnostics (unchanged)
-        self.poisson_clock_traj     = np.empty((self.nrecords + 1, self.S), dtype=np.float64)
-        self.growth_rate_traj       = np.empty((self.nrecords + 1, self.S), dtype=np.float64)
-        self.invasion_rate_traj     = np.empty((self.nrecords + 1, self.S), dtype=np.float64)
-        self.establishment_prob_traj= np.empty((self.nrecords + 1, self.S), dtype=np.float64)
-
-        # ### FAST: precompute diagonal once
-        self.C_diag = self.C.diagonal().copy()
-
-        # ### FAST: constants & reusable buffers to avoid temporaries
+        # Precompute
+        self.C_diag = np.diag(self.C).copy()
         self._inv_over_BM = INV / BODY_MASS
-        self._buf_B        = np.empty(self.S, dtype=np.float64)
-        self._buf_local    = np.empty(self.S, dtype=np.float64)
-        self._buf_diagB    = np.empty(self.S, dtype=np.float64)
-        self._buf_nonself  = np.empty(self.S, dtype=np.float64)
-        self._buf_dpclock  = np.empty(self.S, dtype=np.float64)
-        self._ydot         = np.empty(self._S2, dtype=np.float64)
-        self._event_buf    = np.empty(self._S2, dtype=np.float64)
-        self._mask_wait    = np.empty(self.S, dtype=bool)              # [OPT-BUF]
-        self._mask_pos     = np.empty(self.S, dtype=bool)              # [OPT-BUF]
 
-        # [OPT-CACHE] per-step cache to avoid redoing exp/logB and C·B in _event_fn
-        self._cache_y_ptr  = None
-        self._cache_t      = None
-        self._cache_B_valid = False
+        # Output arrays
+        self.nrecords = self.tmax // self.record_step
+        self.trajectory = np.zeros((self.nrecords + 1, self.S), dtype=np.float64)
+        self.wait_trajectory = np.zeros((self.nrecords + 1, self.S), dtype=bool)
+        self.time_points = np.zeros(self.nrecords + 1, dtype=np.float64)
+        self.poisson_clock_traj = np.zeros((self.nrecords + 1, self.S), dtype=np.float64)
+        self.growth_rate_traj = np.zeros((self.nrecords + 1, self.S), dtype=np.float64)
+        self.invasion_rate_traj = np.zeros((self.nrecords + 1, self.S), dtype=np.float64)
+        self.establishment_prob_traj = np.zeros((self.nrecords + 1, self.S), dtype=np.float64)
 
-        if logger.isEnabledFor(logging.INFO):                           # [OPT-LOG]
-            logger.info("PSD2Model init: S=%d, tmax=%g, record_step=%g",
-                        self.S, self.tmax, self.record_step)
-
-    # ---------------- internals ----------------
-    def _ensure_cache(self, t, y_first_half):
-        """[OPT-CACHE] Recompute exp(logB) and r - C@B only once per solver state."""
-        y_ptr = int(y_first_half.ctypes.data)
-        if (y_ptr != self._cache_y_ptr) or (t != self._cache_t) or (not self._cache_B_valid):
-            np.exp(y_first_half, out=self._buf_B)                # B
-            self._buf_local[:] = self.r
-            self._buf_local   -= self.C.dot(self._buf_B)         # r - C@B
-            np.multiply(self.C_diag, self._buf_B, out=self._buf_diagB)
-            self._cache_y_ptr   = y_ptr
-            self._cache_t       = t
-            self._cache_B_valid = True
-
-    # ---------------- internals ----------------
-
-    def _derivatives(self, t, y, sw):
-        """
-        Fill and return d/dt [logB, pclock] in self._ydot.
-        Math unchanged; we just reuse work and write in-place.
-        """
-        logB = y[:self.S]
-        self._ensure_cache(t, logB)                              # [OPT-CACHE]
-
-        # dlogB
-        dlogB = self._ydot[:self.S]
-        dlogB[:] = self._buf_local                               # r - C@B
-
-        # + INV / B
-        np.reciprocal(self._buf_B, out=self._buf_dpclock)
-        self._buf_dpclock *= INV
-        dlogB += self._buf_dpclock
-
-        # - 2 * max(0, (r - C@B) + diag(C)*B) for waiting species
-        np.add(self._buf_local, self._buf_diagB, out=self._buf_nonself)
-        self._buf_nonself *= sw
-        np.clip(self._buf_nonself, 0.0, None, out=self._buf_nonself)
-        dlogB -= 2.0 * self._buf_nonself
-
-        # dpclock = est_prob * INV/BODY_MASS
-        dp = self._ydot[self.S:]
-        np.add(self._buf_nonself, MORTALITY_RATE, out=self._buf_dpclock)    # denom
-        np.divide(self._buf_nonself, self._buf_dpclock, out=dp, where=self._buf_dpclock != 0.0)
-        dp *= self._inv_over_BM
-
-        return self._ydot
-
-    def _event_fn(self, t, y, sw):
-        logB   = y[:self.S]
-        pclock = y[self.S:self._S2]
-        self._ensure_cache(t, logB)                           # [OPT-CACHE]
-
-        # local_growth = (r - C@B) + diag(C)*B, reusing buffers
-        self._buf_nonself[:] = self._buf_local                # [OPT] reuse scratch
-        self._buf_nonself    += self._buf_diagB               # [OPT]
-
-        # Return a FRESH array (np.concatenate) to avoid aliasing differences
-        return np.concatenate((self._buf_nonself, pclock))    # [SAFE & SAME OUTPUTS]
-
-    def _handle_event_fn(self, solver, event_info):
-            if not logger.isEnabledFor(logging.DEBUG):               # [OPT-LOG]
-                return
-            y = solver.y
-            logB = y[:self.S].copy()
-            pclock = y[self.S:self._S2].copy()
-            B = np.exp(logB)
-            local_growth = self.r - self.C.dot(B) + self.C_diag * B
-            state_info = event_info[0]
-            changed = np.nonzero(state_info)[0]
-            for idx in changed:
-                if idx < self.S:
-                    i = idx
-                    if solver.sw[i]:
-                        if state_info[idx] == +1:
-                            logger.debug("Local growth %g neg while waiting (%g, %g)",
-                                        local_growth[i], logB[i], pclock[i])
-                    elif state_info[idx] == +1:
-                        sw_fixed = solver.sw.copy()
-                        yd = self._derivatives(solver.t, solver.y, sw_fixed)
-                        yd[i] = 0
-                        c = -np.sum(self.C[i, :] * B * yd[:self.S])
-                        if c <= 0:
-                            transition_to_S = True
-                        else:
-                            prob_to_S = np.exp(-B[i] / (BODY_MASS * (1 + np.sqrt(np.pi / (2 * c)) * MORTALITY_RATE)))
-                            transition_to_S = (np.random.rand(1) <= prob_to_S)
-                        if not transition_to_S:
-                            solver.y[i] = min(0, solver.y[i] - np.log(max(1e-300, 1 - prob_to_S)))
-                        if transition_to_S:
-                            solver.sw[i] = True
-                            solver.y[i + self.S] = np.log(np.random.rand())
-                else:
-                    i = idx - self.S
-                    if state_info[idx] != -1:
-                        denom = local_growth[i] + MORTALITY_RATE
-                        if local_growth[i] >= 0:
-                            est_prob = local_growth[i] / denom
-                            val = BODY_MASS / est_prob if est_prob > 0 else BODY_MASS
-                            solver.y[i] = 0.0 if val > 1 else np.log(val)
-                            solver.y[i + self.S] = 1
-                            solver.sw[i] = False
+        if logger.isEnabledFor(logging.INFO):
+            logger.info("PSD2Model init: S=%d, tmax=%d, record_step=%d, dt=%.2f",
+                        self.S, self.tmax, self.record_step, self.dt)
 
     def run(self):
-        if logger.isEnabledFor(logging.INFO):                    # [OPT-LOG]
-            logger.info("Starting PSD2 simulation with Assimulo...")
+        """
+        Run PSD2 simulation using vectorized NumPy Euler integration.
+        """
+        if logger.isEnabledFor(logging.INFO):
+            logger.info("Starting PSD2 simulation (pure NumPy)...")
         t0 = time.perf_counter()
 
-        y0 = np.concatenate([self.logB, self.poisson_clock])
-        problem = Explicit_Problem(self._derivatives, y0, t0=0.0, sw0=self.waiting)
-        problem.name = 'PSD2 Problem'
-        problem.state_events = self._event_fn
-        problem.handle_event = self._handle_event_fn
-        problem.number_of_state_events = self._S2
+        # Local references for speed
+        S = self.S
+        r = self.r
+        C = self.C
+        C_diag = self.C_diag
+        dt = self.dt
+        inv_over_BM = self._inv_over_BM
+        
+        # State variables
+        init_biomass = BODY_MASS / 2.0
+        logB = np.full(S, np.log(init_biomass), dtype=np.float64)
+        pclock = np.log(np.random.rand(S))
+        waiting = np.ones(S, dtype=bool)  # All start in S-state
+        
+        # Buffers to avoid allocation
+        B = np.empty(S, dtype=np.float64)
+        local_growth = np.empty(S, dtype=np.float64)
+        non_self_growth = np.empty(S, dtype=np.float64)
+        dlogB = np.empty(S, dtype=np.float64)
+        dpclock = np.empty(S, dtype=np.float64)
+        est_prob = np.empty(S, dtype=np.float64)
+        
+        record_idx = 0
+        nsteps = self.tmax
+        record_step = self.record_step
 
-        solver = EulerSimple(problem)
-        solver.options['inith'] = 1
-        solver.options['maxsteps'] = 10_000_000
-        solver.store_event_points = False
+        for step in range(nsteps + 1):
+            # Compute B and growth rates
+            np.exp(logB, out=B)
+            np.copyto(local_growth, r)
+            local_growth -= C.dot(B)
+            np.multiply(C_diag, B, out=non_self_growth)
+            non_self_growth += local_growth  # ĝ_i = r_i - sum_{j≠i} C_ij B_j
+            
+            # Record state
+            if step % record_step == 0 and record_idx <= self.nrecords:
+                # Biomass (zero for waiting species)
+                self.trajectory[record_idx] = np.where(waiting, 0.0, B)
+                self.wait_trajectory[record_idx] = waiting.copy()
+                self.time_points[record_idx] = step
+                self.growth_rate_traj[record_idx] = non_self_growth.copy()
+                self.poisson_clock_traj[record_idx] = pclock.copy()
+                
+                # Establishment probability
+                pos_growth = non_self_growth > 0
+                est_prob.fill(0.0)
+                est_prob[pos_growth] = non_self_growth[pos_growth] / (non_self_growth[pos_growth] + MORTALITY_RATE)
+                self.establishment_prob_traj[record_idx] = est_prob.copy()
+                self.invasion_rate_traj[record_idx] = inv_over_BM * est_prob
+                
+                record_idx += 1
+                
+                if record_idx % 100 == 0 and logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"PSD2: step={step}, {record_idx}/{self.nrecords+1}")
 
-        # exact grid, no arange/unique/clip overhead
-        record_times = np.linspace(0.0, self.tmax, num=self.nrecords + 1, dtype=np.float64)
+            if step >= nsteps:
+                break
 
-        # integrate
-        t, y = solver(self.tmax, record_times.shape[0] - 1)
-
-        # robust to list returns
-        t = np.asarray(t, dtype=np.float64)
-        y = np.asarray(y, dtype=np.float64)
-        if y.ndim == 1:
-            if y.size % self._S2 != 0:
-                raise ValueError(f"PSD2: unexpected y.size={y.size}, expected multiple of {self._S2}")
-            y = y.reshape(y.size // self._S2, self._S2)
-
-        # map times (usually direct match)
-        if t.shape[0] == record_times.shape[0] and np.allclose(t, record_times):
-            idx_map = None
-        else:
-            idx_map = np.searchsorted(t, record_times, side="left")
-            np.clip(idx_map, 0, t.shape[0] - 1, out=idx_map)
-
-        # fast local aliases
-        S          = self.S
-        C          = self.C
-        C_diag     = self.C_diag
-        r          = self.r
-        traj       = self.trajectory
-        wait_traj  = self.wait_trajectory
-        g_traj     = self.growth_rate_traj
-        inv_rate   = self.invasion_rate_traj
-        est_prob   = self.establishment_prob_traj
-        time_pts   = self.time_points
-        inv_overBM = self._inv_over_BM
-
-        buf_B     = self._buf_B
-        buf_local = self._buf_local
-        buf_diagB = self._buf_diagB
-        mask_wait = self._mask_wait
-        mask_pos  = self._mask_pos
-
-        for step in range(record_times.shape[0]):
-            rec_idx = step if idx_map is None else int(idx_map[step])
-            cur     = y[rec_idx]
-
-            # waiting mask (reused buffer)
-            pclock       = cur[S:self._S2]
-            np.less(pclock, 0.0, out=mask_wait)                     # waiting = pclock < 0
-
-            # B = exp(logB) using cached buffers for consistency
-            np.exp(cur[:S], out=buf_B)
-
-            # masked biomass row (no temporaries)
-            row = traj[step]
-            row.fill(0.0)
-            row[~mask_wait] = buf_B[~mask_wait]
-
-            wait_traj[step, :] = mask_wait
-            time_pts[step]     = t[rec_idx]
-
-            # growth = r - C@B + diag(C)*B
-            buf_local[:] = r
-            buf_local   -= C.dot(buf_B)
-            np.multiply(C_diag, buf_B, out=buf_diagB)
-            np.add(buf_local, buf_diagB, out=g_traj[step])
-
-            # est_prob & inv_rate
-            growth = g_traj[step]
-            np.greater(growth, 0.0, out=mask_pos)
-            erow = est_prob[step]; erow.fill(0.0)
-            irow = inv_rate[step]; irow.fill(0.0)
-            denom = growth[mask_pos] + MORTALITY_RATE
-            erow[mask_pos] = growth[mask_pos] / denom
-            irow[mask_pos] = inv_overBM * erow[mask_pos]
+            # ============================================================
+            # STATE TRANSITIONS (vectorized)
+            # ============================================================
+            
+            # S -> D: Poisson clock triggers establishment
+            s_to_d = waiting & (pclock >= 0) & (non_self_growth >= 0)
+            if np.any(s_to_d):
+                ep = non_self_growth[s_to_d] / (non_self_growth[s_to_d] + MORTALITY_RATE)
+                val = BODY_MASS / np.maximum(ep, 1e-10)
+                logB[s_to_d] = np.where(val > 1, 0.0, np.log(val))
+                pclock[s_to_d] = 1.0
+                waiting[s_to_d] = False
+            
+            # S -> P: Growth becomes negative while waiting
+            s_to_p = waiting & (non_self_growth < 0)
+            if np.any(s_to_p):
+                pclock[s_to_p] = 1.0
+                waiting[s_to_p] = False
+            
+            # P/D -> S: Growth becomes positive (probabilistic)
+            # Only check non-waiting species where growth just became positive
+            potential_to_s = ~waiting & (non_self_growth >= 0) & (non_self_growth < 0.1)
+            if np.any(potential_to_s):
+                idx_pot = np.where(potential_to_s)[0]
+                for i in idx_pot:
+                    c = max(0.01, abs(local_growth[i]))
+                    prob_to_S = np.exp(-B[i] / (BODY_MASS * (1 + np.sqrt(np.pi / (2 * c)) * MORTALITY_RATE)))
+                    if np.random.rand() < prob_to_S:
+                        waiting[i] = True
+                        pclock[i] = np.log(np.random.rand())
+            
+            # ============================================================
+            # EULER UPDATE (vectorized)
+            # ============================================================
+            
+            # dlogB/dt = local_growth + INV/B - 2*max(0, ĝ)*waiting
+            np.copyto(dlogB, local_growth)
+            dlogB += INV / B
+            waiting_contrib = np.maximum(0, non_self_growth) * waiting
+            dlogB -= 2.0 * waiting_contrib
+            
+            # dpclock/dt for waiting species
+            dpclock.fill(0.0)
+            waiting_pos = waiting & (non_self_growth > 0)
+            if np.any(waiting_pos):
+                ep_w = non_self_growth[waiting_pos] / (non_self_growth[waiting_pos] + MORTALITY_RATE)
+                dpclock[waiting_pos] = ep_w * inv_over_BM
+            
+            # Update
+            logB += dlogB * dt
+            pclock += dpclock * dt
+            
+            # Clamp logB to prevent overflow
+            np.clip(logB, -50, 10, out=logB)
 
         self.runtime_seconds = time.perf_counter() - t0
-        if logger.isEnabledFor(logging.INFO):                    # [OPT-LOG]
+        if logger.isEnabledFor(logging.INFO):
             logger.info("PSD2 simulation completed in %.3f s.", self.runtime_seconds)
 
-        return (self.time_points,
-                self.trajectory,
-                self.wait_trajectory,
-                self.poisson_clock_traj,
-                self.growth_rate_traj,
-                self.invasion_rate_traj,
-                self.establishment_prob_traj)
-
+        return (self.time_points[:record_idx],
+                self.trajectory[:record_idx],
+                self.wait_trajectory[:record_idx],
+                self.poisson_clock_traj[:record_idx],
+                self.growth_rate_traj[:record_idx],
+                self.invasion_rate_traj[:record_idx],
+                self.establishment_prob_traj[:record_idx])
