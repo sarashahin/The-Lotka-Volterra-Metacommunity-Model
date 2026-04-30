@@ -55,7 +55,7 @@ conda install -c conda-forge assimulo sundials numpy scipy matplotlib statsmodel
 
 ```bash
 cd single_patch
-python run.py config.py
+python main.py config.py
 ```
 
 This integrates IBM, ODE and PSD models for `TMAX = 10000` time units
