@@ -38,7 +38,8 @@ class ODEModel:
         self.tmax = tmax if tmax is not None else TMAX
         self.record_step = record_step if record_step is not None else RECORDING_STEP_SIZE
 
-        init_biomass = BODY_MASS/10
+        # init_biomass = BODY_MASS/10
+        init_biomass = 1e-11
         # Initialize logB with a small positive value
         self.logB = np.full(self.S, np.log(init_biomass))
 
