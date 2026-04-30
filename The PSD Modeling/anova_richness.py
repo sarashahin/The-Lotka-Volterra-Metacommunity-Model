@@ -103,4 +103,3 @@ df       = pd.DataFrame({"value": np.concatenate([rich_ibm, rich_ode, rich_psd])
                          "group": np.repeat(["IBM","ODE","PSD"], [len(rich_ibm), len(rich_ode), len(rich_psd)])})
 tukey    = pairwise_tukeyhsd(df["value"], df["group"])
 print(tukey.summary())
-
