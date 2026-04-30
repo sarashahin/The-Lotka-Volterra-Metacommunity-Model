@@ -27,16 +27,19 @@ def predicted_period_axel_pdf(D_source, body_mass, r, b, mu):
 def _ensure_dir(path):
     p = pathlib.Path(path); p.mkdir(parents=True, exist_ok=True); return p
 
-def _plot_timeseries(times, mean_ts, title, out_png):
-    plt.figure(figsize=(8,5))
+def _plot_timeseries(times, mean_ts, out_png):
+    plt.figure(figsize=(8,4))
     for s in range(mean_ts.shape[1]):
         plt.plot(times, mean_ts[:, s], label=f"Species {s+1}")
-    plt.xlabel("time")
-    plt.ylabel("spatial mean biomass per patch")
-    plt.title(title)
+    plt.xlabel("Time")
+    plt.ylabel("Spatial mean biomass per patch")
+    # plt.title(title)
     plt.legend()
     plt.tight_layout()
     plt.savefig(out_png, dpi=300)
+    # Save PDF version
+    out_pdf = str(out_png).replace('.png', '.pdf')
+    plt.savefig(out_pdf, dpi=300)
     plt.close()
 
 # ---------- common RPS params ----------
@@ -51,7 +54,7 @@ Ny, Nx = NUM_PATCHES_Y, NUM_PATCHES_X
 
 # run lengths chosen to show several cycles:
 # small-amplitude T(full) ~ 2902; T(half) ~ 5804  -> simulate 18–20k time units
-TMAX = 20000.0
+TMAX = 2000.0
 RECORD = 10
 N_STEPS_IBM = int(TMAX / STEP_SIZE)
 REC_STEP_IBM = 10  # record every 10 IBM steps
@@ -61,17 +64,17 @@ rng = np.random.default_rng(42)
 flat_idx = np.arange(Ny * Nx)
 chosen = rng.choice(flat_idx, size=(Ny*Nx)//2, replace=False)
 
-# def init_ode_psd():
-#     B0 = np.zeros((S, Ny, Nx), float)
-#     B0[:] = 2 * BODY_MASS
-#     B0[0].flat[chosen] += BODY_MASS
-#     return B0
+def init_ode_psd():
+    B0 = np.zeros((S, Ny, Nx), float)
+    B0[:] = 2 * BODY_MASS
+    B0[0].flat[chosen] += BODY_MASS
+    return B0
 
-# def init_ibm():
-#     # counts -> will convert to biomass by * BODY_MASS before plotting
-#     N0 = np.full((S, Ny, Nx), 2, dtype=int)
-#     N0[0].flat[chosen] += 1
-#     return N0
+def init_ibm():
+    # counts -> will convert to biomass by * BODY_MASS before plotting
+    N0 = np.full((S, Ny, Nx), 2, dtype=int)
+    N0[0].flat[chosen] += 1
+    return N0
 
 # ---------- per-model runners ----------
 def run_ode(D_source, out_png):
@@ -84,8 +87,9 @@ def run_ode(D_source, out_png):
     t, traj = model.run()  # (nrec, S, Ny, Nx)
     mean_ts = traj.mean(axis=(2,3))
     Tpred = predicted_period_axel_pdf(D_source, BODY_MASS, r0, b, MORTALITY_RATE)
-    title = f"ODE • 100% LDD • D_source={D_source:g}  |  T_pred≈{Tpred:.0f}"
-    _plot_timeseries(t, mean_ts, title, out_png)
+    # title = f"ODE • 100% LDD • D_source={D_source:g}  |  T_pred≈{Tpred:.0f}"
+    # title = f"ODE "
+    _plot_timeseries(t, mean_ts, out_png)
     config.DISPERSAL_RATE = base
 
 def run_psd(D_source, out_png):
@@ -97,8 +101,8 @@ def run_psd(D_source, out_png):
     t, traj, *_ = model.run()  # traj (nrec, S, Ny, Nx)
     mean_ts = traj.mean(axis=(2,3))
     Tpred = predicted_period_axel_pdf(D_source, BODY_MASS, r0, b, MORTALITY_RATE)
-    title = f"PSD • 100% LDD • D_source={D_source:g}  |  T_pred≈{Tpred:.0f}"
-    _plot_timeseries(t, mean_ts, title, out_png)
+    # title = f"PSD"
+    _plot_timeseries(t, mean_ts, out_png)
     config.DISPERSAL_RATE = base
 
 def run_ibm(D_source, out_png):
@@ -113,24 +117,10 @@ def run_ibm(D_source, out_png):
     mean_ts = traj_biomass.mean(axis=(2,3))
     t = np.arange(traj.shape[0]) * (REC_STEP_IBM * STEP_SIZE)
     Tpred = predicted_period_axel_pdf(D_source, BODY_MASS, r0, b, MORTALITY_RATE)
-    title = f"IBM • 100% LDD • D_source={D_source:g}  |  T_pred≈{Tpred:.0f}"
-    _plot_timeseries(t, mean_ts, title, out_png)
+    # title = f"IBM"
+    _plot_timeseries(t, mean_ts, out_png)
     config.DISPERSAL_RATE = base
 
-# ---------- combined mosaic for each D ----------
-def make_mosaic(full_or_half, out_dir, files):
-    fig, axes = plt.subplots(1, 3, figsize=(13,4), sharex=True, sharey=True)
-    titles = ["ODE", "IBM", "PSD"]
-    for ax, fn, ttl in zip(axes, files, titles):
-        img = plt.imread(str(out_dir / fn))
-        ax.imshow(img)
-        ax.axis("off")
-        ax.set_title(ttl, fontsize=11)
-    fig.suptitle(f"Nonlocal RPS • {full_or_half}", fontsize=12)
-    plt.tight_layout(rect=[0,0,1,0.95])
-    out_png = out_dir / f"nonlocal_rps_{full_or_half}_mosaic.png"
-    plt.savefig(out_png, dpi=200)
-    plt.close()
 
 def main():
     out_dir = _ensure_dir("figures/multipatch/nonlocal")
@@ -144,9 +134,8 @@ def main():
     run_ode(D_full, out_dir / ode_full)
     run_ibm(D_full, out_dir / ibm_full)
     run_psd(D_full, out_dir / psd_full)
-    make_mosaic("fullD", out_dir, [ode_full, ibm_full, psd_full])
 
-    # half D: D_source = BODY_MASS * 0.0025 -> ~5804
+    half D: D_source = BODY_MASS * 0.0025 -> ~5804
     D_half = BODY_MASS * 0.0025
     print(f"Running HALF D (D_source={D_half:g}) …")
     ode_half = "ode_timeseries_half.png"
@@ -155,17 +144,16 @@ def main():
     run_ode(D_half, out_dir / ode_half)
     run_ibm(D_half, out_dir / ibm_half)
     run_psd(D_half, out_dir / psd_half)
-    make_mosaic("halfD", out_dir, [ode_half, ibm_half, psd_half])
 
     print("\nDone. Wrote:")
     print(f"  {out_dir/ode_full}")
     print(f"  {out_dir/ibm_full}")
     print(f"  {out_dir/psd_full}")
-    print(f"  {out_dir/'nonlocal_rps_fullD_mosaic.png'}")
+    
+    print("\nDone. Wrote:")
     print(f"  {out_dir/ode_half}")
-    print(f"  {out_dir/ibm_half}")
-    print(f"  {out_dir/psd_half}")
-    print(f"  {out_dir/'nonlocal_rps_halfD_mosaic.png'}")
+    # print(f"  {out_dir/ibm_half}")
+    # print(f"  {out_dir/psd_half}")
 
 if __name__ == "__main__":
     main()
