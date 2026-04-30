@@ -187,10 +187,14 @@ def main():
     np.random.seed(RANDOM_SEED)
 
     # Create intrinsic growth rates and competition matrix
-    r = np.random.normal(loc=1.0, scale=0.1, size=S)
+    # r = np.random.normal(loc=1.0, scale=0.1, size=S)
+    
+    # NEW (exactly 1.0, no variance): # r = 1 for all species (no variance)
+    r = np.ones(S)
     adjacency = (np.random.rand(S, S) < CONNECTANCE).astype(float)
+    
     C = INTERACTION_STRENGTH * adjacency
-    np.fill_diagonal(C, 1.0)
+    np.fill_diagonal(C, 1.0)   # C_ii = 1 for all i
 
     logger.info(f"Initial growth rates (r) and competition matrix (C) set for S={S} species.")
     
