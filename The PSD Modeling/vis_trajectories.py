@@ -1,11 +1,22 @@
 
 
+# ---------------------------------------------------
+
 #!/usr/bin/env python3
+"""
+UPDATED: Biomass trajectories figure for PSD paper
+Changes from original:
+1. FLIPPED column order: low body-mass (LEFT), high body-mass (RIGHT) - to match Fig 2
+2. FIXED notation: m_0 instead of M for body mass (M is mortality in the paper)
+"""
 import os, numpy as np, matplotlib.pyplot as plt
 
+# ── recording step size (must match config.py used during simulation) ────
+RECORDING_STEP_SIZE = 1
+
 # ── paths ────────────────────────────────────────────────────────────────
-NPZ_HIGH = "/Users/sarashahin/Documents/The PSD ModelingNew/body-mass 1e-4 --inv 1e-10 --S 500 --seeds456/model_outputs.npz"
-NPZ_LOW  = "/Users/sarashahin/Documents/The PSD ModelingNew/body-mass 1e-11 --inv 1e-10 --S 500/model_outputs.npz"
+NPZ_HIGH = "model_outputs_trajec_254_1e4.npz"
+NPZ_LOW  = "model_outputs.npz"
 OUTDIR   = "/Users/sarashahin/Documents/The PSD ModelingNew/viz"; os.makedirs(OUTDIR, exist_ok=True)
 
 # ── typography: match main text ─────────────────────────────────────────
@@ -20,9 +31,9 @@ plt.rcParams.update({
 # ── plotting knobs ──────────────────────────────────────────────────────
 FIGSIZE       = (14, 10)
 GLOBAL_YMIN   = 0.0
-GLOBAL_YMAX   = 1.0                     # global y-axis limits
+GLOBAL_YMAX   = 1.05                     # global y-axis limits
 YTICK_COUNT   = 6                               # evenly spaced ticks
-SMOOTH_WIN    = 13                              # odd
+SMOOTH_WIN    = 7                             # odd
 HIGHLIGHT_N   = 4                             # number of highlighted species per panel
 FG_LW, FG_A   = 1.2, 0.9                # foreground line width and alpha
 BG_LW, BG_A   = 0.3, 0.70                # background line width and alpha
@@ -73,15 +84,17 @@ def choose_highlights_mixed(rawY, smY, k=4,
     bg = np.setdiff1d(np.arange(S), keep)
     return keep, bg
 
-def plot_all_colored(ax, traj, lw=None, alpha=None):
-    ax.plot(traj, lw=(lw or LINE_LW), alpha=(alpha or L_A), solid_capstyle="round")
+def plot_all_colored(ax, traj, lw=None, alpha=None, rec_step=None):
+    x = np.arange(traj.shape[0]) * (rec_step or 1)
+    ax.plot(x, traj, lw=(lw or LINE_LW), alpha=(alpha or L_A), solid_capstyle="round")
 
-def plot_with_highlight(ax, traj, keep_idx, bg_idx, colors=None):
+def plot_with_highlight(ax, traj, keep_idx, bg_idx, colors=None, rec_step=None):
+    x = np.arange(traj.shape[0]) * (rec_step or 1)
     if bg_idx.size:
-        ax.plot(traj[:, bg_idx], color=BG_COLOR, lw=BG_LW, alpha=BG_A, zorder=1, solid_capstyle="round")
+        ax.plot(x, traj[:, bg_idx], color=BG_COLOR, lw=BG_LW, alpha=BG_A, zorder=1, solid_capstyle="round")
     for j, sp in enumerate(keep_idx):
         kw = {} if colors is None else {"color": colors[j % len(colors)]}
-        ax.plot(traj[:, sp], lw=FG_LW, alpha=FG_A, zorder=3, solid_capstyle="round", **kw)
+        ax.plot(x, traj[:, sp], lw=FG_LW, alpha=FG_A, zorder=3, solid_capstyle="round", **kw)
 
 # ── load & pre-smooth (edge-safe) ───────────────────────────────────────
 H = load_traj(NPZ_HIGH); L = load_traj(NPZ_LOW)
@@ -92,11 +105,20 @@ H_sm , L_sm  = {m: movavg_time_edge_safe(H_raw[m], SMOOTH_WIN) for m in H_raw}, 
 keep_low, _ = choose_highlights_mixed(L_raw["ODE"], L_sm["ODE"], k=HIGHLIGHT_N)
 
 # ── figure ──────────────────────────────────────────────────────────────
-fig, axes = plt.subplots(3, 2, figsize=FIGSIZE, sharex=True, sharey=True, constrained_layout=True)
-titles     = {"high": r"$M = 10^{-4}$", "low": r"$M = 10^{-11}$"}   # ⑤ no subscript b
+fig, axes = plt.subplots(3, 2, figsize=FIGSIZE, sharey=True, constrained_layout=True)
+for col in range(2):
+    for row in range(1, 3):
+        axes[row, col].sharex(axes[0, col])
+
+# ============================================================================
+# CHANGE 1: Flipped column order - LOW mass on LEFT, HIGH mass on RIGHT
+# CHANGE 2: Fixed notation - use m_0 (body mass) not M (which is mortality)
+# ============================================================================
+titles = {"low": r"$m_0 = 10^{-11}$", "high": r"$m_0 = 10^{-4}$"}
 model_rows = ("ODE","IBM","PSD2")
 
-for col, regime in enumerate(("high","low")):
+# FLIPPED: column 0 = low, column 1 = high (was: column 0 = high, column 1 = low)
+for col, regime in enumerate(("low", "high")):  # <-- FLIPPED ORDER
     for row, model in enumerate(model_rows):
         ax = axes[row, col]
 
@@ -104,29 +126,32 @@ for col, regime in enumerate(("high","low")):
             traj = L_sm[model]
             S = traj.shape[1]
             bg = np.setdiff1d(np.arange(S), keep_low)
-            plot_with_highlight(ax, traj, keep_low, bg, colors=HILITE_COLORS)
+            plot_with_highlight(ax, traj, keep_low, bg, colors=HILITE_COLORS, rec_step=RECORDING_STEP_SIZE)
 
         elif regime == "high" and model == "ODE":
             keep, bg = choose_highlights_mixed(H_raw["ODE"], H_sm["ODE"], k=HIGHLIGHT_N)
-            plot_with_highlight(ax, H_sm["ODE"], keep, bg)
+            plot_with_highlight(ax, H_sm["ODE"], keep, bg, rec_step=RECORDING_STEP_SIZE)
 
         elif regime == "high" and model in ("IBM","PSD2"):
-            plot_all_colored(ax, H_sm[model], lw=HIGH_BOLD_LW, alpha=HIGH_BOLD_A)
+            plot_all_colored(ax, H_sm[model], lw=HIGH_BOLD_LW, alpha=HIGH_BOLD_A, rec_step=RECORDING_STEP_SIZE)
 
         # axes cosmetics
         ax.set_ylim(GLOBAL_YMIN, GLOBAL_YMAX)
-        ax.set_yticks(np.linspace(GLOBAL_YMIN, GLOBAL_YMAX, YTICK_COUNT))  # ③ evenly spaced
+        YTICKS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+        ax.set_yticks(YTICKS)
         if row == 0: ax.set_title(titles[regime], pad=6)
-        if row == 2: ax.set_xlabel("Time")                                 # ① label = Time
+        if row == 2: ax.set_xlabel("Time")
         if col == 0: ax.set_ylabel("Biomass")
         ax.text(0.02, 0.92, "PSD" if model=="PSD2" else model, transform=ax.transAxes,
                 fontsize=12, fontweight="bold")
 
 out_png = os.path.join(OUTDIR, "trajectories_3x2_prlstyle.png")
-fig.savefig(out_png, dpi=300); plt.close(fig)
+out_pdf = os.path.join(OUTDIR, "trajectories_3x2_prlstyle.pdf")
+fig.savefig(out_png, dpi=300)
+fig.savefig(out_pdf)  # PDF for LaTeX
+plt.close(fig)
 print("Saved →", out_png)
-
-
+print("Saved →", out_pdf)
 
 
 
