@@ -18,7 +18,7 @@ BODY_MASS = 1e-4
 
 # Invasion rate
 # INV = 1e-10
-INV = 0
+INV = 1e-8
 # Mortality rate (for large negative growth offsets)
 MORTALITY_RATE = 0.2
 
