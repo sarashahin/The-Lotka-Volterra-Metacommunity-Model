@@ -1,0 +1,5 @@
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+assimulo>=3.5
+statsmodels>=0.14
