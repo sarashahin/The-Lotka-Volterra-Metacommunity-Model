@@ -12,10 +12,13 @@ import numpy as np
 # -----------------------------
 
 # Biomass unit
-BODY_MASS = 1e-4 # << large body mass
-# BODY_MASS = 1e-11 # << small body mass 
+# BODY_MASS = 1e-4 # << large body mass
+BODY_MASS = 1e-11 # << small body mass 
+# BODY_MASS = 2.5e-8 # << intermediate body mass for chosing ANOVA STATic table only
 
-INV = 1e-8          # << tiny immigration 101
+
+INV = 1e-8       # << tiny immigration
+
 
 # Mortality rate (for large negative growth offsets)
 MORTALITY_RATE = 0.2
@@ -33,20 +36,25 @@ TARGET_RICHNESS = 300
 T_RELAX = 300
 
 #: Max simulation time
-TMAX =  20000  # (like 200000 in R)
+TMAX =  10000  # (like 200000 in R)
 
 #: Step size per iteration in the simpler discrete loops
 STEP_SIZE = 1
 
 #: Recording step size
-RECORDING_STEP_SIZE = 10  # e.g., 500
+# RECORDING_STEP_SIZE = 1  # e.g., 500, 200 real work
+RECORDING_STEP_SIZE = 10 # e.g., 500, 200 only for faster
 
 #: Number of records to keep
 N_RECORDS = TMAX // RECORDING_STEP_SIZE
 
 #: We can store random seed for reproducibility
-RANDOM_SEED = 456 # << large body mass
-# RANDOM_SEED = 123 # << small body mass
+# RANDOM_SEED = 456 # << large body mass le-4
+RANDOM_SEED = 789 # << small body mass le-11 for chosing trajectories
+# RANDOM_SEED = 123 # << small body mass le-11
+
+# RANDOM_SEED = 254 # << high body mass le-4 for chosing trajectories
+
 
 
 # For PSD2 or ODE solver
