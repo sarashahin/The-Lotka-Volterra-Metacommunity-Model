@@ -77,7 +77,7 @@ manuscript's pseudocode.
 
 ```bash
 cd metacommunity
-python run.py
+python run_all_rps.py
 ```
 
 This runs the three-species rock-paper-scissors (RPS) metacommunity on
